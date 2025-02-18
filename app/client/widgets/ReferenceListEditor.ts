@@ -1,14 +1,14 @@
 import { createGroup } from 'app/client/components/commands';
-import { ACItem, ACResults, HighlightFunc } from 'app/client/lib/ACIndex';
+import { ACItem, ACResults, HighlightFunc, normalizeText } from 'app/client/lib/ACIndex';
 import { IAutocompleteOptions } from 'app/client/lib/autocomplete';
 import { IToken, TokenField, tokenFieldStyles } from 'app/client/lib/TokenField';
 import { reportError } from 'app/client/models/errors';
-import { colors, testId } from 'app/client/ui2018/cssVars';
+import { colors, testId, theme } from 'app/client/ui2018/cssVars';
 import { menuCssClass } from 'app/client/ui2018/menus';
 import { cssChoiceToken } from 'app/client/widgets/ChoiceToken';
 import { createMobileButtons, getButtonMargins } from 'app/client/widgets/EditorButtons';
 import { EditorPlacement } from 'app/client/widgets/EditorPlacement';
-import { NewBaseEditor, Options } from 'app/client/widgets/NewBaseEditor';
+import { FieldOptions, NewBaseEditor } from 'app/client/widgets/NewBaseEditor';
 import { cssRefList, renderACItem } from 'app/client/widgets/ReferenceEditor';
 import { ReferenceUtils } from 'app/client/lib/ReferenceUtils';
 import { csvEncodeRow } from 'app/common/csvFormat';
@@ -26,7 +26,7 @@ class ReferenceItem implements IToken, ACItem {
    * similar to getItemText() from IAutocompleteOptions.
    */
   public label: string = typeof this.rowId === 'number' ? String(this.rowId) : this.text;
-  public cleanText: string = this.text.trim().toLowerCase();
+  public cleanText: string = normalizeText(this.text);
 
   constructor(
     public text: string,
@@ -46,23 +46,29 @@ export class ReferenceListEditor extends NewBaseEditor {
   private _tokenField: TokenField<ReferenceItem>;
   private _textInput: HTMLInputElement;
   private _dom: HTMLElement;
-  private _editorPlacement: EditorPlacement;
+  private _editorPlacement!: EditorPlacement;
   private _contentSizer: HTMLElement;   // Invisible element to size the editor with all the tokens
-  private _inputSizer: HTMLElement;     // Part of _contentSizer to size the text input
+  private _inputSizer!: HTMLElement;     // Part of _contentSizer to size the text input
   private _alignment: string;
   private _utils: ReferenceUtils;
 
-  constructor(options: Options) {
+  constructor(protected options: FieldOptions) {
     super(options);
 
-    const docData = options.gristDoc.docData;
-    this._utils = new ReferenceUtils(options.field, docData);
+    const gristDoc = options.gristDoc;
+    this._utils = new ReferenceUtils(options.field, gristDoc);
 
     const vcol = this._utils.visibleColModel;
-    this._enableAddNew = vcol && !vcol.isRealFormula() && !!vcol.colId();
+    this._enableAddNew = (
+      vcol &&
+      !vcol.isRealFormula() &&
+      !!vcol.colId() &&
+      !this._utils.hasDropdownCondition
+    );
 
     const acOptions: IAutocompleteOptions<ReferenceItem> = {
-      menuCssClass: `${menuCssClass} ${cssRefList.className}`,
+      menuCssClass: `${menuCssClass} ${cssRefList.className} test-autocomplete`,
+      buildNoItemsMessage: () => this._utils.buildNoItemsMessage(),
       search: this._doSearch.bind(this),
       renderItem: this._renderItem.bind(this),
       getItemText: (item) => item.text,
@@ -73,7 +79,7 @@ export class ReferenceListEditor extends NewBaseEditor {
 
     // If starting to edit by typing in a string, ignore previous tokens.
     const cellValue = decodeObject(options.cellValue);
-    const startRowIds: unknown[] = options.editValue || !Array.isArray(cellValue) ? [] : cellValue;
+    const startRowIds: unknown[] = options.editValue !== undefined || !Array.isArray(cellValue) ? [] : cellValue;
 
     // If referenced table hasn't loaded yet, hold off on initializing tokens.
     const needReload = (options.editValue === undefined && !this._utils.tableData.isLoaded);
@@ -124,7 +130,7 @@ export class ReferenceListEditor extends NewBaseEditor {
 
     // The referenced table has probably already been fetched (because there must already be a
     // Reference widget instantiated), but it's better to avoid this assumption.
-    docData.fetchTable(this._utils.refTableId).then(() => {
+    gristDoc.docData.fetchTable(this._utils.refTableId).then(() => {
       if (this.isDisposed()) { return; }
       if (needReload) {
         this._tokenField.setTokens(
@@ -166,12 +172,14 @@ export class ReferenceListEditor extends NewBaseEditor {
   }
 
   public getCellValue(): CellValue {
-    const rowIds = this._tokenField.tokensObs.get().map(t => typeof t.rowId === 'number' ? t.rowId : t.text);
+    const rowIds = this._tokenField.tokensObs.get()
+      .map(token => typeof token.rowId === 'number' ? token.rowId : token.text);
     return encodeObject(rowIds);
   }
 
   public getTextValue(): string {
-    const rowIds = this._tokenField.tokensObs.get().map(t => typeof t.rowId === 'number' ? String(t.rowId) : t.text);
+    const rowIds = this._tokenField.tokensObs.get()
+      .map(token => typeof token.rowId === 'number' ? String(token.rowId) : token.text);
     return csvEncodeRow(rowIds, {prettier: true});
   }
 
@@ -184,19 +192,19 @@ export class ReferenceListEditor extends NewBaseEditor {
    */
   public async prepForSave() {
     const tokens = this._tokenField.tokensObs.get();
-    const newValues = tokens.filter(t => t.rowId === 'new');
+    const newValues = tokens.filter(({rowId})=> rowId === 'new');
     if (newValues.length === 0) { return; }
 
     // Add the new items to the referenced table.
-    const colInfo = {[this._utils.visibleColId]: newValues.map(t => t.text)};
+    const colInfo = {[this._utils.visibleColId]: newValues.map(({text}) => text)};
     const rowIds = await this._utils.tableData.sendTableAction(
       ["BulkAddRecord", new Array(newValues.length).fill(null), colInfo]
     );
 
     // Update the TokenField tokens with the returned row ids.
     let i = 0;
-    const newTokens = tokens.map(t => {
-      return t.rowId === 'new' ? new ReferenceItem(t.text, rowIds[i++]) : t;
+    const newTokens = tokens.map(token => {
+      return token.rowId === 'new' ? new ReferenceItem(token.text, rowIds[i++]) : token;
     });
     this._tokenField.setTokens(newTokens);
   }
@@ -254,22 +262,23 @@ export class ReferenceListEditor extends NewBaseEditor {
    * Also see: prepForSave.
    */
    private async _doSearch(text: string): Promise<ACResults<ReferenceItem>> {
-    const {items, selectIndex, highlightFunc} = this._utils.autocompleteSearch(text);
+    const {items, selectIndex, highlightFunc} = this._utils.autocompleteSearch(text, this.options.rowId);
     const result: ACResults<ReferenceItem> = {
       selectIndex,
       highlightFunc,
-      items: items.map(i => new ReferenceItem(i.text, i.rowId))
+      items: items.map(i => new ReferenceItem(i.text, i.rowId)),
+      extraItems: [],
     };
 
     this._showAddNew = false;
     if (!this._enableAddNew || !text) { return result; }
 
-    const cleanText = text.trim().toLowerCase();
+    const cleanText = normalizeText(text);
     if (result.items.find((item) => item.cleanText === cleanText)) {
       return result;
     }
 
-    result.items.push(new ReferenceItem(text, 'new'));
+    result.extraItems.push(new ReferenceItem(text, 'new'));
     this._showAddNew = true;
 
     return result;
@@ -286,7 +295,7 @@ export class ReferenceListEditor extends NewBaseEditor {
 }
 
 const cssCellEditor = styled('div', `
-  background-color: white;
+  background-color: ${theme.cellEditorBg};
   font-family: var(--grist-font-family-data);
   font-size: var(--grist-medium-font-size);
 `);
@@ -298,7 +307,6 @@ const cssTokenField = styled(tokenFieldStyles.cssTokenField, `
   padding: 0 3px;
   height: min-content;
   min-height: 22px;
-  color: black;
   flex-wrap: wrap;
 `);
 
@@ -307,13 +315,14 @@ const cssToken = styled(tokenFieldStyles.cssToken, `
   margin: 2px;
   line-height: 16px;
   white-space: pre;
+  color: ${theme.choiceTokenFg};
 
   &.selected {
-    box-shadow: inset 0 0 0 1px ${colors.lightGreen};
+    box-shadow: inset 0 0 0 1px ${theme.choiceTokenSelectedBorder};
   }
 
   &-blank {
-    color: ${colors.slate};
+    color: ${theme.lightText};
   }
 `);
 

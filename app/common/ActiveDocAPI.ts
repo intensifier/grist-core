@@ -1,24 +1,34 @@
 import {ActionGroup} from 'app/common/ActionGroup';
-import {CellValue, TableDataAction, UserAction} from 'app/common/DocActions';
-import {FormulaProperties} from 'app/common/GranularAccessClause';
+import {BulkAddRecord, CellValue, TableDataAction, UserAction} from 'app/common/DocActions';
+import {PredicateFormulaProperties} from 'app/common/PredicateFormula';
 import {FetchUrlOptions, UploadResult} from 'app/common/uploads';
 import {DocStateComparison, PermissionData, UserAccessData} from 'app/common/UserAPI';
 import {ParseOptions} from 'app/plugin/FileParserAPI';
-import {AccessTokenOptions, AccessTokenResult} from 'app/plugin/GristAPI';
+import {AccessTokenOptions, AccessTokenResult, UIRowId} from 'app/plugin/GristAPI';
 import {IMessage} from 'grain-rpc';
 
 export interface ApplyUAOptions {
   desc?: string;      // Overrides the description of the action.
   otherId?: number;   // For undo/redo; the actionNum of the original action to which it applies.
   linkId?: number;    // For bundled actions, actionNum of the previous action in the bundle.
-  bestEffort?: boolean; // If set, action may be applied in part if it cannot be applied completely.
   parseStrings?: boolean;  // If true, parses string values in some actions based on the column
 }
 
+export interface ApplyUAExtendedOptions extends ApplyUAOptions {
+  bestEffort?: boolean; // If set, action may be applied in part if it cannot be applied completely.
+  fromOwnHistory?: boolean; // If set, action is confirmed to be a redo/undo taken from history, from
+                            // an action marked as being by the current user.
+  oldestSource?: number;  // If set, gives the timestamp of the oldest source the undo/redo
+                          // action was built from, expressed as number of milliseconds
+                          // elapsed since January 1, 1970 00:00:00 UTC
+  attachment?: boolean;   // If set, allow actions on attachments.
+}
+
 export interface ApplyUAResult {
-  actionNum: number;      // number of the action that got recorded.
-  retValues: any[];       // array of return values, one for each of the passed-in user actions.
-  isModification: boolean; // true if document was modified.
+  actionNum: number;         // number of the action that got recorded.
+  actionHash: string | null; // hash of the action that got recorded.
+  retValues: any[];          // array of return values, one for each of the passed-in user actions.
+  isModification: boolean;   // true if document was modified.
 }
 
 export interface DataSourceTransformed {
@@ -35,26 +45,61 @@ export interface TransformRuleMap {
 
 // Special values for import destinations; null means "new table", "" means skip table.
 // Both special options exposed as consts.
-export type DestId = string | null;
 export const NEW_TABLE = null;
 export const SKIP_TABLE = "";
+export type DestId = string | typeof NEW_TABLE | typeof SKIP_TABLE;
 
+/**
+ * How to import data into an existing table or a new one.
+ */
 export interface TransformRule {
+  /**
+   * The destination table for the transformed data. If null, the data is imported into a new table.
+   */
   destTableId: DestId;
+  /**
+   * The list of columns to update (existing or new columns).
+   */
   destCols: TransformColumn[];
+  /**
+   * The list of columns to read from the source table (just the headers name).
+   */
   sourceCols: string[];
 }
 
+/**
+ * Existing or new column to update. It is created based on the temporary table that was imported.
+ */
 export interface TransformColumn {
+  /**
+   * Label of the column to update. For new table it is the same name as the source column.
+   */
   label: string;
+  /**
+   * Column id to update (null for a new table).
+   */
   colId: string|null;
+  /**
+   * Type of the column (important for new columns).
+   */
   type: string;
+  /**
+   * Formula to apply to the target column.
+   */
   formula: string;
+  /**
+   * Widget options when we need to create a column (copied from the source).
+   */
   widgetOptions: string;
 }
 
+export interface ImportParseOptions extends ParseOptions {
+  delimiter?: string;
+  encoding?: string;
+}
+
 export interface ImportResult {
-  options: ParseOptions;
+  options: ImportParseOptions;
   tables: ImportTableResult[];
 }
 
@@ -67,7 +112,7 @@ export interface ImportTableResult {
 }
 
 export interface ImportOptions {
-  parseOptions?: ParseOptions;         // Options for parsing the source file.
+  parseOptions?: ImportParseOptions;   // Options for parsing the source file.
   mergeOptionMaps?: MergeOptionsMap[]; // Options for merging fields, indexed by uploadFileIndex.
 }
 
@@ -106,12 +151,23 @@ export interface ClientQuery extends BaseQuery {
   };
 }
 
+export type FilterColValues = Pick<ClientQuery, "filters" | "operations">;
+
 /**
  * Query intended to be sent to a server.
  */
 export interface ServerQuery extends BaseQuery {
   // Queries to server for onDemand tables will set a limit to avoid bringing down the browser.
   limit?: number;
+
+  // A SQL where clause, for advanced filters. Combines with 'filters' using AND. It is only used
+  // when the query is fetched from the SQLite database, and ignored by the Python data engine,
+  // and is only constructed within server code. It is not safe to let users specify their own
+  // where clause.
+  where?: {
+    clause: string;
+    params: unknown[];      // There should be one parameter for each '?' placeholder in clause.
+  }
 }
 
 /**
@@ -128,13 +184,29 @@ export interface QueryFilters {
 export type QueryOperation = "in" | "intersects" | "empty";
 
 /**
+ * Results of fetching a table. Includes the table data you would
+ * expect. May now also include attachment metadata referred to in the table
+ * data. Attachment data is expressed as a BulkAddRecord, since it is
+ * not a complete table, just selected rows. Attachment data is
+ * currently included in fetches when (1) granular access control is
+ * in effect, and (2) the user is neither an owner nor someone with
+ * read access to the entire document, and (3) there is an attachment
+ * column in the fetched table. This is exactly what the standard
+ * Grist client needs, but in future it might be desirable to give
+ * more control over this behavior.
+ */
+export interface TableFetchResult {
+  tableData: TableDataAction;
+  attachments?: BulkAddRecord;
+}
+
+/**
  * Response from useQuerySet(). A query returns data AND creates a subscription to receive
  * DocActions that affect this data. The querySubId field identifies this subscription, and must
  * be used in a disposeQuerySet() call to unsubscribe.
  */
-export interface QueryResult {
+export interface QueryResult extends TableFetchResult {
   querySubId: number;     // ID of the subscription, to use with disposeQuerySet.
-  tableData: TableDataAction;
 }
 
 /**
@@ -143,6 +215,7 @@ export interface QueryResult {
  * docId of XXXXX~FORKID[~USERID] and a urlId of UUUUU~FORKID[~USERID].
  */
 export interface ForkResult {
+  forkId: string;
   docId: string;
   urlId: string;
 }
@@ -166,6 +239,26 @@ export interface AclTableDescription {
   groupByColLabels: string[] | null;  // Labels of groupby columns for summary tables, or null.
 }
 
+export interface AclResources {
+  tables: {[tableId: string]: AclTableDescription};
+  problems: AclRuleProblem[];
+}
+
+export interface AclRuleProblem {
+  tables?: {
+    tableIds: string[],
+  };
+  columns?: {
+    tableId: string,
+    colIds: string[],
+  };
+  userAttributes?: {
+    invalidUAColumns: string[],
+    names: string[],
+  }
+  comment: string;
+}
+
 export function getTableTitle(table: AclTableDescription): string {
   let {title} = table;
   if (table.groupByColLabels) {
@@ -178,6 +271,76 @@ export function summaryGroupByDescription(groupByColumnLabels: string[]): string
   return `[${groupByColumnLabels.length ? 'by ' + groupByColumnLabels.join(", ") : "Totals"}]`;
 }
 
+//// Types for autocomplete suggestions
+
+// Suggestion may be a string, or a tuple [funcname, argSpec, isGrist], where:
+//  - funcname (e.g. "DATEADD") will be auto-completed with "(", AND linked to Grist
+//    documentation.
+//  - argSpec (e.g. "(start_date, days=0, ...)") is to be shown as autocomplete caption.
+//  - isGrist is no longer used
+type ISuggestion = string | [string, string, boolean];
+
+// Suggestion paired with an optional example value to show on the right
+export type ISuggestionWithValue = [ISuggestion, string | null];
+
+/**
+ * Share information from a Grist document.
+ */
+export interface ShareInfo {
+  linkId: string;
+  options: string;
+}
+
+/**
+ * Share information from the Grist home database.
+ */
+export interface RemoteShareInfo {
+  key: string;
+}
+
+/**
+ * Metrics gathered during formula calculations.
+ */
+export interface TimingInfo {
+  /**
+   * Total time spend evaluating a formula.
+   */
+  sum: number;
+  /**
+   * Number of times the formula was evaluated (for all rows).
+   */
+  count: number;
+  average: number;
+  max: number;
+}
+
+/**
+ * Metrics attached to a particular column in a table. Contains also marks if they were gathered.
+ * Currently we only mark the `OrderError` exception (so when formula calculation was restarted due to
+ * order dependency).
+ */
+export interface FormulaTimingInfo extends TimingInfo {
+  tableId: string;
+  colId: string;
+  marks?: Array<TimingInfo & {name: string}>;
+}
+
+/*
+ * Status of timing info collection. Contains intermediate results if engine is not busy at the moment.
+ */
+export interface TimingStatus {
+  /**
+   * If disabled then 'disabled', else 'active' or 'pending'. Pending means that the engine is busy
+   * and can't respond to confirm the status (but it used to be active before that).
+   */
+  status: 'active'|'pending'|'disabled';
+  /**
+   * Will be undefined if we can't get the timing info (e.g. if the document is locked by other call).
+   * Otherwise, contains the intermediate results gathered so far.
+   */
+  timing?: FormulaTimingInfo[];
+}
+
 export interface ActiveDocAPI {
   /**
    * Closes a document, and unsubscribes from its userAction events.
@@ -187,7 +350,7 @@ export interface ActiveDocAPI {
   /**
    * Fetches a particular table from the data engine to return to the client.
    */
-  fetchTable(tableId: string): Promise<TableDataAction>;
+  fetchTable(tableId: string): Promise<TableFetchResult>;
 
   /**
    * Fetches the generated Python code for this document. (TODO rename this misnomer.)
@@ -223,7 +386,7 @@ export interface ActiveDocAPI {
    * Imports files, removes previously created temporary hidden tables and creates the new ones.
    */
   importFiles(dataSource: DataSourceTransformed,
-              parseOptions: ParseOptions, prevTableIds: string[]): Promise<ImportResult>;
+              parseOptions: ImportParseOptions, prevTableIds: string[]): Promise<ImportResult>;
 
   /**
    * Finishes import files, creates the new tables, and cleans up temporary hidden tables and uploads.
@@ -240,7 +403,7 @@ export interface ActiveDocAPI {
    * Returns a diff of changes that will be applied to the destination table from `transformRule`
    * if the data from `hiddenTableId` is imported with the specified `mergeOptions`.
    */
-   generateImportDiff(hiddenTableId: string, transformRule: TransformRule,
+  generateImportDiff(hiddenTableId: string, transformRule: TransformRule,
                       mergeOptions: MergeOptions): Promise<DocStateComparison>;
 
   /**
@@ -269,12 +432,7 @@ export interface ActiveDocAPI {
    * Find and return a list of auto-complete suggestions that start with `txt`, when editing a
    * formula in table `tableId` and column `columnId`.
    */
-  autocomplete(txt: string, tableId: string, columnId: string): Promise<string[]>;
-
-  /**
-   * Removes the current instance from the doc.
-   */
-  removeInstanceFromDoc(): Promise<void>;
+  autocomplete(txt: string, tableId: string, columnId: string, rowId: UIRowId | null): Promise<ISuggestionWithValue[]>;
 
   /**
    * Get recent actions in ActionGroup format with summaries included.
@@ -315,7 +473,7 @@ export interface ActiveDocAPI {
   /**
    * Check if an ACL formula is valid. If not, will throw an error with an explanation.
    */
-  checkAclFormula(text: string): Promise<FormulaProperties>;
+  checkAclFormula(text: string): Promise<PredicateFormulaProperties>;
 
   /**
    * Get a token for out-of-band access to the document.
@@ -327,7 +485,7 @@ export interface ActiveDocAPI {
    * for editing ACLs. It is only available to users who can edit ACLs, and lists all resources
    * regardless of rules that may block access to them.
    */
-  getAclResources(): Promise<{[tableId: string]: AclTableDescription}>;
+  getAclResources(): Promise<AclResources>;
 
   /**
    * Wait for document to finish initializing.
@@ -338,4 +496,19 @@ export interface ActiveDocAPI {
    * Get users that are worth proposing to "View As" for access control purposes.
    */
   getUsersForViewAs(): Promise<PermissionDataWithExtraUsers>;
+
+  /**
+   * Get a share info associated with the document.
+   */
+  getShare(linkId: string): Promise<RemoteShareInfo|null>;
+
+  /**
+   * Starts collecting timing information from formula evaluations.
+   */
+  startTiming(): Promise<void>;
+
+  /**
+   * Stops collecting timing information and returns the collected data.
+   */
+  stopTiming(): Promise<TimingInfo[]>;
 }

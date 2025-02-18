@@ -1,16 +1,16 @@
+# pylint:disable=too-many-lines
 """
 Test of Summary tables. This has many test cases, so to keep files smaller, it's split into two
 files: test_summary.py and test_summary2.py.
 """
+import logging
 import actions
-import logger
 import test_engine
+from test_engine import Table, Column, View, Section, Field
 import test_summary
 import testutil
 
-from test_engine import Table, Column, View, Section, Field
-
-log = logger.Logger(__name__, logger.INFO)
+log = logging.getLogger(__name__)
 
 
 class TestSummary2(test_engine.EngineTestCase):
@@ -19,6 +19,7 @@ class TestSummary2(test_engine.EngineTestCase):
   starting_table_data = test_summary.TestSummary.starting_table_data
 
 
+  @test_engine.test_undo
   def test_add_summary_formula(self):
     # Verify that we can add a summary formula; that new sections automatically get columns
     # matching the source table, and not other columns. Check that group-by columns override
@@ -162,6 +163,7 @@ class TestSummary2(test_engine.EngineTestCase):
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_summary_col_rename(self):
     # Verify that renaming a column in a source table causes appropriate renames in the summary
     # tables, and that renames of group-by columns in summary tables are disallowed.
@@ -328,6 +330,7 @@ class TestSummary2(test_engine.EngineTestCase):
       [21,   'foo3',    True,         'WidgetOptions2'],
     ], rows=lambda r: r.colId in ('foo2', 'foo3'))
 
+  @test_engine.test_undo
   def test_summary_col_rename_conflict(self):
     sample = testutil.parse_test_sample({
       "SCHEMA": [
@@ -418,6 +421,7 @@ class TestSummary2(test_engine.EngineTestCase):
     tables = [table1, fake_summary, summary_by_a_and_b, summary_by_a]
     self.assertTables(tables)
 
+  @test_engine.test_undo
   def test_source_table_rename_conflict(self):
     sample = testutil.parse_test_sample({
       "SCHEMA": [
@@ -469,6 +473,7 @@ class TestSummary2(test_engine.EngineTestCase):
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_restrictions(self):
     # Verify various restrictions on summary tables
     # (1) no adding/removing/renaming non-formula columns.
@@ -553,6 +558,7 @@ class TestSummary2(test_engine.EngineTestCase):
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_update_summary_section(self):
     # Verify that we can change the group-by for a view section, and that unused tables get
     # removed.
@@ -876,6 +882,7 @@ class TestSummary2(test_engine.EngineTestCase):
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_update_groupby_override(self):
     # Verify that if we add a group-by column that conflicts with a formula, group-by column wins.
 
@@ -939,6 +946,7 @@ class TestSummary2(test_engine.EngineTestCase):
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_cleanup_on_view_remove(self):
     # Verify that if we remove a view, that unused summary tables get cleaned up.
 
@@ -1067,6 +1075,7 @@ class TestSummary2(test_engine.EngineTestCase):
     ])
 
   #----------------------------------------------------------------------
+  @test_engine.test_undo
   def test_detach_summary_section(self):
     # Verify that "DetachSummaryViewSection" useraction works correctly.
 
@@ -1185,6 +1194,7 @@ class TestSummary2(test_engine.EngineTestCase):
     ])
 
   #----------------------------------------------------------------------
+  @test_engine.test_undo
   def test_summary_of_detached(self):
     # Verify that we can make a summary table of a detached table. This is mainly to ensure that
     # we handle well the presence of columns like 'group' and 'count' in the source table.
@@ -1236,4 +1246,68 @@ class TestSummary2(test_engine.EngineTestCase):
       [ 2,    "WA",     [3],          1,        3.               ],
       [ 3,    "IL",     [4],          1,        4.               ],
       [ 4,    "MA",     [5,8],        2,        5.+9             ],
+    ])
+
+  #----------------------------------------------------------------------
+  @test_engine.test_undo
+  def test_update_summary_with_suffixed_colId(self):
+    # Verifies that summary update correctly when one of the formula
+    # columns has a suffixed colId
+
+    self.load_sample(self.sample)
+
+    # Let's create two summary table, one with totals (no grouped by columns) and one grouped by
+    # "city".
+    self.apply_user_action(["CreateViewSection", 1, 0, "record", [], None])
+    self.apply_user_action(["CreateViewSection", 1, 0, "record", [11], None])
+
+    # Change type of Amount columns to "Any" only for table Address_summary_city. User actions keep
+    # types consistent across same-named columns for all summary tables with the same source table,
+    # but here we want to test for the case where types are inconsistent. Hence we bypass user
+    # actions and directly use doc actions.
+    self.engine.apply_doc_action(actions.UpdateRecord("_grist_Tables_column", 20, {'type': 'Any'}))
+    self.engine.apply_doc_action(actions.ModifyColumn("Address_summary_city", "amount", {'type':
+                                                                                         'Any'}))
+    self.engine.assert_schema_consistent()
+
+    self.assertTables([
+      self.starting_table,
+      Table(2, "Address_summary", primaryViewId=0, summarySourceTable=1, columns=[
+        Column(14, "group", "RefList:Address", isFormula=True, summarySourceCol=0,
+               formula="table.getSummarySourceGroup(rec)"),
+        Column(15, "count", "Int", isFormula=True, summarySourceCol=0,
+               formula="len($group)"),
+        # This column has type Numeric
+        Column(16, "amount", "Numeric", isFormula=True, summarySourceCol=0,
+               formula="SUM($group.amount)"),
+      ]),
+      Table(3, "Address_summary_city", primaryViewId=0, summarySourceTable=1, columns=[
+        Column(17, "city", "Text", isFormula=False, summarySourceCol=11,
+               formula=""),
+        Column(18, "group", "RefList:Address", isFormula=True, summarySourceCol=0,
+               formula="table.getSummarySourceGroup(rec)"),
+        Column(19, "count", "Int", isFormula=True, summarySourceCol=0,
+               formula="len($group)"),
+        # This column has type Any
+        Column(20, "amount", "Any", isFormula=True, summarySourceCol=0,
+               formula="SUM($group.amount)"),
+      ]),
+    ])
+
+    # Now let's add "city" to the summary table with no grouped by column
+    self.apply_user_action(["UpdateSummaryViewSection", 2, [11]])
+
+    # Check that summary table now has one column Amount of type Any.
+    self.assertTables([
+      self.starting_table,
+      Table(3, "Address_summary_city", primaryViewId=0, summarySourceTable=1, columns=[
+        Column(17, "city", "Text", isFormula=False, summarySourceCol=11,
+               formula=""),
+        Column(18, "group", "RefList:Address", isFormula=True, summarySourceCol=0,
+               formula="table.getSummarySourceGroup(rec)"),
+        Column(19, "count", "Int", isFormula=True, summarySourceCol=0,
+               formula="len($group)"),
+        Column(20, "amount", "Any", isFormula=True, summarySourceCol=0,
+               formula="SUM($group.amount)"),
+      ])
     ])

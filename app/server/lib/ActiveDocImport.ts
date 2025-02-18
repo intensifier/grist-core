@@ -5,12 +5,14 @@ import * as _ from 'underscore';
 
 import {ColumnDelta, createEmptyActionSummary} from 'app/common/ActionSummary';
 import {ApplyUAResult, DataSourceTransformed, ImportOptions, ImportResult, ImportTableResult,
-        MergeOptions, MergeOptionsMap, MergeStrategy, SKIP_TABLE, TransformColumn,
+        MergeOptions, MergeOptionsMap, MergeStrategy, SKIP_TABLE,
         TransformRule,
         TransformRuleMap} from 'app/common/ActiveDocAPI';
 import {ApiError} from 'app/common/ApiError';
-import {BulkColValues, CellValue, fromTableDataAction, TableRecordValue, UserAction} from 'app/common/DocActions';
+import {BulkColValues, CellValue, fromTableDataAction, UserAction} from 'app/common/DocActions';
+import {isBlankValue} from 'app/common/gristTypes';
 import * as gutil from 'app/common/gutil';
+import {localTimestampToUTC} from 'app/common/RelativeDates';
 import {DocStateComparison} from 'app/common/UserAPI';
 import {guessColInfoForImports} from 'app/common/ValueGuesser';
 import {ParseFileResult, ParseOptions} from 'app/plugin/FileParserAPI';
@@ -43,7 +45,7 @@ interface ReferenceDescription {
   refTableId: string;
 }
 
-interface FileImportOptions {
+export interface FileImportOptions {
   // Suggested name of the import file. It is sometimes used as a suggested table name, e.g. for csv imports.
   originalFilename: string;
   // Containing parseOptions as serialized JSON to pass to the import plugin.
@@ -226,71 +228,14 @@ export class ActiveDocImport {
   }
 
   /**
-   * Imports all files as new tables, using the given transform rules and import options.
-   * The isHidden flag indicates whether to create temporary hidden tables, or final ones.
+   * Import data resulting from parsing a file into a new table.
+   * In normal circumstances this is only used internally.
+   * It's exposed publicly for use by grist-static which doesn't use the plugin system.
    */
-  private async _importFiles(docSession: OptDocSession, upload: UploadInfo, transforms: TransformRuleMap[],
-                             {parseOptions = {}, mergeOptionMaps = []}: ImportOptions,
-                             isHidden: boolean): Promise<ImportResult> {
-
-    // Check that upload size is within the configured limits.
-    const limit = (Number(process.env.GRIST_MAX_UPLOAD_IMPORT_MB) * 1024 * 1024) || Infinity;
-    const totalSize = upload.files.reduce((acc, f) => acc + f.size, 0);
-    if (totalSize > limit) {
-      throw new ApiError(`Imported files must not exceed ${gutil.byteString(limit)}`, 413);
-    }
-
-    // The upload must be within the plugin-accessible directory. Once moved, subsequent calls to
-    // moveUpload() will return without having to do anything.
-    if (!this._activeDoc.docPluginManager) { throw new Error('no plugin manager available'); }
-    await moveUpload(upload, this._activeDoc.docPluginManager.tmpDir());
-
-    const importResult: ImportResult = {options: parseOptions, tables: []};
-    for (const [index, file] of upload.files.entries()) {
-      // If we have a better guess for the file's extension, replace it in origName, to ensure
-      // that DocPluginManager has access to it to guess the best parser type.
-      let origName: string = file.origName;
-      if (file.ext) {
-        origName = path.basename(origName, path.extname(origName)) + file.ext;
-      }
-      const res = await this._importFileAsNewTable(docSession, file.absPath, {
-        parseOptions,
-        mergeOptionsMap: mergeOptionMaps[index] || {},
-        isHidden,
-        originalFilename: origName,
-        uploadFileIndex: index,
-        transformRuleMap: transforms[index] || {}
-      });
-      if (index === 0) {
-        // Returned parse options from the first file should be used for all files in one upload.
-        importResult.options = parseOptions = res.options;
-      }
-      importResult.tables.push(...res.tables);
-    }
-    return importResult;
-  }
-
-  /**
-   * Imports the data stored at tmpPath.
-   *
-   * Currently it starts a python parser as a child process
-   * outside the sandbox, and supports xlsx, csv, and perhaps some other formats. It may
-   * result in the import of multiple tables, in case of e.g. Excel formats.
-   * @param {OptDocSession} docSession: Session instance to use for importing.
-   * @param {String} tmpPath: The path from of the original file.
-   * @param {FileImportOptions} importOptions: File import options.
-   * @returns {Promise<ImportResult>} with `options` property containing parseOptions as serialized JSON as adjusted
-   * or guessed by the plugin, and `tables`, which is which is a list of objects with information about
-   * tables, such as `hiddenTableId`, `uploadFileIndex`, `origTableName`, `transformSectionRef`, `destTableId`.
-   */
-  private async _importFileAsNewTable(docSession: OptDocSession, tmpPath: string,
-                                      importOptions: FileImportOptions): Promise<ImportResult> {
-    const {originalFilename, parseOptions, mergeOptionsMap, isHidden, uploadFileIndex,
-           transformRuleMap} = importOptions;
-    log.info("ActiveDoc._importFileAsNewTable(%s, %s)", tmpPath, originalFilename);
-    if (!this._activeDoc.docPluginManager) { throw new Error('no plugin manager available'); }
-    const optionsAndData: ParseFileResult =
-      await this._activeDoc.docPluginManager.parseFile(tmpPath, originalFilename, parseOptions);
+  public async importParsedFileAsNewTable(
+    docSession: OptDocSession, optionsAndData: ParseFileResult, importOptions: FileImportOptions
+  ): Promise<ImportResult> {
+    const {originalFilename, mergeOptionsMap, isHidden, uploadFileIndex, transformRuleMap} = importOptions;
     const options = optionsAndData.parseOptions;
 
     const parsedTables = optionsAndData.tables;
@@ -339,9 +284,9 @@ export class ActiveDocImport {
       if (isHidden) {
         // Generate formula columns, view sections, etc
         const results: ApplyUAResult = await this._activeDoc.applyUserActions(docSession,
-          [['GenImporterView', hiddenTableId, destTableId, ruleCanBeApplied ? transformRule : null]]);
+          [['GenImporterView', hiddenTableId, destTableId, ruleCanBeApplied ? transformRule : null, null]]);
 
-        transformSectionRef = results.retValues[0];
+        transformSectionRef = results.retValues[0].viewSectionRef;
         createdTableId = hiddenTableId;
 
       } else {
@@ -374,6 +319,85 @@ export class ActiveDocImport {
   }
 
   /**
+   * Imports all files as new tables, using the given transform rules and import options.
+   * The isHidden flag indicates whether to create temporary hidden tables, or final ones.
+   */
+  private async _importFiles(docSession: OptDocSession, upload: UploadInfo, transforms: TransformRuleMap[],
+                             {parseOptions = {}, mergeOptionMaps = []}: ImportOptions,
+                             isHidden: boolean): Promise<ImportResult> {
+
+    // Check that upload size is within the configured limits.
+    const limit = (Number(process.env.GRIST_MAX_UPLOAD_IMPORT_MB) * 1024 * 1024) || Infinity;
+    const totalSize = upload.files.reduce((acc, f) => acc + f.size, 0);
+    if (totalSize > limit) {
+      throw new ApiError(`Imported files must not exceed ${gutil.byteString(limit)}`, 413);
+    }
+
+    // The upload must be within the plugin-accessible directory. Once moved, subsequent calls to
+    // moveUpload() will return without having to do anything.
+    if (!this._activeDoc.docPluginManager) { throw new Error('no plugin manager available'); }
+    await moveUpload(upload, this._activeDoc.docPluginManager.tmpDir());
+
+    const importResult: ImportResult = {options: parseOptions, tables: []};
+    for (const [index, file] of upload.files.entries()) {
+      // If we have a better guess for the file's extension, replace it in origName, to ensure
+      // that DocPluginManager has access to it to guess the best parser type.
+      let origName: string = file.origName;
+      if (file.ext) {
+        origName = path.basename(origName, path.extname(origName)) + file.ext;
+      }
+      const fileParseOptions = {...parseOptions};
+      if (file.ext === '.dsv') {
+        if (!fileParseOptions.delimiter) {
+          fileParseOptions.delimiter = '💩';
+        }
+        if (!fileParseOptions.encoding) {
+          fileParseOptions.encoding = 'utf-8';
+        }
+      }
+      const res = await this._importFileAsNewTable(docSession, file.absPath, {
+        parseOptions: fileParseOptions,
+        mergeOptionsMap: mergeOptionMaps[index] || {},
+        isHidden,
+        originalFilename: origName,
+        uploadFileIndex: index,
+        transformRuleMap: transforms[index] || {}
+      });
+      if (index === 0) {
+        // Returned parse options from the first file should be used for all files in one upload.
+        importResult.options = parseOptions = res.options;
+      }
+      importResult.tables.push(...res.tables);
+    }
+    return importResult;
+  }
+
+  /**
+   * Imports the data stored at tmpPath.
+   *
+   * Currently it starts a python parser as a child process
+   * outside the sandbox, and supports xlsx, csv, and perhaps some other formats. It may
+   * result in the import of multiple tables, in case of e.g. Excel formats.
+   * @param {OptDocSession} docSession: Session instance to use for importing.
+   * @param {String} tmpPath: The path from of the original file.
+   * @param {FileImportOptions} importOptions: File import options.
+   * @returns {Promise<ImportResult>} with `options` property containing parseOptions as serialized JSON as adjusted
+   * or guessed by the plugin, and `tables`, which is a list of objects with information about
+   * tables, such as `hiddenTableId`, `uploadFileIndex`, `origTableName`, `transformSectionRef`, `destTableId`.
+   */
+  private async _importFileAsNewTable(docSession: OptDocSession, tmpPath: string,
+                                      importOptions: FileImportOptions): Promise<ImportResult> {
+    const {originalFilename, parseOptions} = importOptions;
+    log.info("ActiveDoc._importFileAsNewTable(%s, %s)", tmpPath, originalFilename);
+    if (!this._activeDoc.docPluginManager) {
+      throw new Error('no plugin manager available');
+    }
+    const optionsAndData: ParseFileResult =
+      await this._activeDoc.docPluginManager.parseFile(tmpPath, originalFilename, parseOptions);
+    return this.importParsedFileAsNewTable(docSession, optionsAndData, importOptions);
+  }
+
+  /**
    * Imports records from `hiddenTableId` into `destTableId`, transforming the column
    * values from `hiddenTableId` according to the `transformRule`. Finalizes import when done.
    *
@@ -391,36 +415,21 @@ export class ActiveDocImport {
    * the source and destination table.
    * @returns {string} The table id of the new or updated destination table.
    */
-  private async _transformAndFinishImport(docSession: OptDocSession,
-                                          hiddenTableId: string, destTableId: string,
-                                          intoNewTable: boolean, transformRule: TransformRule|null,
-                                          mergeOptions: MergeOptions|null): Promise<string> {
+  private async _transformAndFinishImport(
+    docSession: OptDocSession,
+    hiddenTableId: string, destTableId: string,
+    intoNewTable: boolean, transformRule: TransformRule|null,
+    mergeOptions: MergeOptions|null
+  ): Promise<string> {
     log.info("ActiveDocImport._transformAndFinishImport(%s, %s, %s, %s, %s)",
       hiddenTableId, destTableId, intoNewTable, transformRule, mergeOptions);
-    const srcCols = await this._activeDoc.getTableCols(docSession, hiddenTableId);
 
-    // Use a default transform rule if one was not provided by the client.
-    if (!transformRule) {
-      const transformDest = intoNewTable ? null : destTableId;
-      transformRule = await this._makeDefaultTransformRule(docSession, srcCols, transformDest);
-    }
-
-    // Transform rules from client may have prefixed column ids, so we need to strip them.
-    stripRulePrefixes(transformRule);
-
-    if (intoNewTable) {
-      // Transform rules for new tables don't have filled in destination column ids.
-      const result = await this._activeDoc.applyUserActions(docSession, [['FillTransformRuleColIds', transformRule]]);
-      transformRule = result.retValues[0] as TransformRule;
-
-      // Encode Refs as Ints, to avoid table dependency issues. We'll convert back to Ref at the end.
-      encodeRuleReferences(transformRule);
-    } else if (transformRule.destCols.some(c => c.colId === null)) {
-      throw new Error('Column ids in transform rule must be filled when importing into an existing table');
-    }
-
-    await this._activeDoc.applyUserActions(docSession,
-      [['MakeImportTransformColumns', hiddenTableId, transformRule, false]]);
+    const transformDestTableId = intoNewTable ? null : destTableId;
+    const result = await this._activeDoc.applyUserActions(docSession, [[
+      'GenImporterView', hiddenTableId, transformDestTableId, transformRule,
+      {createViewSection: false, genAll: false, refsAsInts: true},
+    ]]);
+    transformRule = result.retValues[0].transformRule as TransformRule;
 
     if (!intoNewTable && mergeOptions && mergeOptions.mergeCols.length > 0) {
       await this._mergeAndFinishImport(docSession, hiddenTableId, destTableId, transformRule, mergeOptions);
@@ -430,6 +439,8 @@ export class ActiveDocImport {
     const hiddenTableData = fromTableDataAction(await this._activeDoc.fetchTable(docSession, hiddenTableId, true));
     const columnData: BulkColValues = {};
 
+    const srcCols = await this._activeDoc.getTableCols(docSession, hiddenTableId);
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
     const srcColIds = srcCols.map(c => c.id as string);
 
     // Only include destination columns that weren't skipped.
@@ -592,40 +603,6 @@ export class ActiveDocImport {
   }
 
   /**
-   * Returns a default TransformRule using column definitions from `destTableId`. If `destTableId`
-   * is null (in the case when the import destination is a new table), the `srcCols` are used instead.
-   *
-   * @param {TableRecordValue[]} srcCols Source column definitions.
-   * @param {string|null} destTableId The destination table id. If null, the destination is assumed
-   * to be a new table, and `srcCols` are used to build the transform rule.
-   * @returns {Promise<TransformRule>} The constructed transform rule.
-   */
-  private async _makeDefaultTransformRule(docSession: OptDocSession, srcCols: TableRecordValue[],
-                                          destTableId: string|null): Promise<TransformRule> {
-    const targetCols = destTableId ? await this._activeDoc.getTableCols(docSession, destTableId) : srcCols;
-    const destCols: TransformColumn[] = [];
-    const srcColIds = srcCols.map(c => c.id as string);
-
-    for (const {id, fields} of targetCols) {
-      if (fields.isFormula === true || fields.formula !== '') { continue; }
-
-      destCols.push({
-        colId: destTableId ? id as string : null,
-        label: fields.label as string,
-        type: fields.type as string,
-        widgetOptions: fields.widgetOptions as string,
-        formula: srcColIds.includes(id as string) ? `$${id}` :  ''
-      });
-    }
-
-    return {
-      destTableId,
-      destCols,
-      sourceCols: srcColIds
-    };
-  }
-
-  /**
    * This function removes temporary hidden tables which were created during the import process
    *
    * @param {Array[String]} hiddenTableIds: Array of hidden table ids
@@ -691,38 +668,6 @@ export class ActiveDocImport {
   }
 }
 
-// Helper function that returns true if a given cell is blank (i.e. null or empty).
-function isBlank(value: CellValue): boolean {
-  return value === null || (typeof value === 'string' && value.trim().length === 0);
-}
-
-/**
- * Changes every Ref column to an Int column in `destCols`.
- *
- * Encoding references as ints can be useful when finishing imports to avoid
- * issues such as importing linked tables in the wrong order. When encoding references,
- * ActiveDocImport._fixReferences should be called at the end of importing to
- * decode Ints back to Refs.
- */
-function encodeRuleReferences({destCols}: TransformRule): void {
-  for (const col of destCols) {
-    const refTableId = gutil.removePrefix(col.type, "Ref:");
-    if (refTableId) {
-      col.type = 'Int';
-    }
-  }
-}
-
-// Helper function that strips import prefixes from columns in transform rules (if ids are present).
-function stripRulePrefixes({destCols}: TransformRule): void {
-  for (const col of destCols) {
-    const colId = col.colId;
-    if (colId && colId.startsWith(IMPORT_TRANSFORM_COLUMN_PREFIX)) {
-      col.colId = colId.slice(IMPORT_TRANSFORM_COLUMN_PREFIX.length);
-    }
-  }
-}
-
 // Helper function that returns new `colIds` with import prefixes stripped.
 function stripPrefixes(colIds: string[]): string[] {
   return colIds.map(id => id.startsWith(IMPORT_TRANSFORM_COLUMN_PREFIX) ?
@@ -741,13 +686,13 @@ type MergeFunction = (srcVal: CellValue, destVal: CellValue) => CellValue;
 function getMergeFunction({type}: MergeStrategy): MergeFunction {
   switch (type) {
     case 'replace-with-nonblank-source': {
-      return (srcVal, destVal) => isBlank(srcVal) ? destVal : srcVal;
+      return (srcVal, destVal) => isBlankValue(srcVal) ? destVal : srcVal;
     }
     case 'replace-all-fields': {
       return (srcVal, _destVal) => srcVal;
     }
     case 'replace-blank-fields-only': {
-      return (srcVal, destVal) => isBlank(destVal) ? srcVal : destVal;
+      return (srcVal, destVal) => isBlankValue(destVal) ? srcVal : destVal;
     }
     default: {
       // Normally, we should never arrive here. If we somehow do, throw an error.
@@ -763,6 +708,7 @@ function getMergeFunction({type}: MergeStrategy): MergeFunction {
  * columns using the values set for the column ids.
  * For columns of type Any, guess the type and parse data according to it, or mark as empty
  * formula columns when they should be empty.
+ * For columns of type DateTime, add the document timezone to the type.
  */
 function cleanColumnMetadata(columns: GristColumn[], tableData: unknown[][], activeDoc: ActiveDoc) {
   return columns.map((c, index) => {
@@ -778,6 +724,15 @@ function cleanColumnMetadata(columns: GristColumn[], tableData: unknown[][], act
       tableData[index] = values;
       if (colMetadata) {
         Object.assign(newCol, colMetadata);
+      }
+    }
+    const timezone = activeDoc.docData!.docInfo().timezone;
+    if (c.type === "DateTime" && timezone) {
+      newCol.type = `DateTime:${timezone}`;
+      for (const [i, localTimestamp] of tableData[index].entries()) {
+        if (typeof localTimestamp !== 'number') { continue; }
+
+        tableData[index][i] = localTimestampToUTC(localTimestamp, timezone);
       }
     }
     return newCol;

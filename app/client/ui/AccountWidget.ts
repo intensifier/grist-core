@@ -1,25 +1,38 @@
-import {loadGristDoc} from 'app/client/lib/imports';
 import {AppModel} from 'app/client/models/AppModel';
 import {DocPageModel} from 'app/client/models/DocPageModel';
-import {getLoginOrSignupUrl, getLoginUrl, getLogoutUrl, urlState} from 'app/client/models/gristUrlState';
+import {getLoginOrSignupUrl, getLoginUrl, getLogoutUrl, getSignupUrl, urlState} from 'app/client/models/gristUrlState';
+import {getAdminPanelName} from 'app/client/ui/AdminPanelName';
 import {manageTeamUsers} from 'app/client/ui/OpenUserManager';
 import {createUserImage} from 'app/client/ui/UserImage';
 import * as viewport from 'app/client/ui/viewport';
-import {primaryButton} from 'app/client/ui2018/buttons';
-import {colors, mediaDeviceNotSmall, testId, vars} from 'app/client/ui2018/cssVars';
+import {bigPrimaryButtonLink, primaryButtonLink} from 'app/client/ui2018/buttons';
+import {mediaDeviceNotSmall, testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
-import {menu, menuDivider, menuItem, menuItemLink, menuSubHeader} from 'app/client/ui2018/menus';
-import {commonUrls, shouldHideUiElement} from 'app/common/gristUrls';
+import {
+  menu,
+  menuDivider,
+  menuItem,
+  menuItemLink,
+  menuSubHeader,
+} from 'app/client/ui2018/menus';
+import {commonUrls, isFeatureEnabled} from 'app/common/gristUrls';
 import {FullUser} from 'app/common/LoginSessionAPI';
 import * as roles from 'app/common/roles';
-import {SUPPORT_EMAIL} from 'app/common/UserAPI';
 import {Disposable, dom, DomElementArg, styled} from 'grainjs';
 import {cssMenuItem} from 'popweasel';
 import {maybeAddSiteSwitcherSection} from 'app/client/ui/SiteSwitcher';
+import {makeT} from 'app/client/lib/localization';
+import {getGristConfig} from 'app/common/urlUtils';
+
+const t = makeT('AccountWidget');
 
 /**
- * Render the user-icon that opens the account menu. When no user is logged in, render a Sign-in
- * button instead.
+ * Render the user-icon that opens the account menu.
+ *
+ * When no user is logged in, render "Sign In" and "Sign Up" buttons.
+ *
+ * When no user is logged in and a template document is open, render a "Use This Template"
+ * button.
  */
 export class AccountWidget extends Disposable {
   constructor(private _appModel: AppModel, private _docPageModel?: DocPageModel) {
@@ -28,20 +41,62 @@ export class AccountWidget extends Disposable {
 
   public buildDom() {
     return cssAccountWidget(
-      dom.domComputed(this._appModel.currentValidUser, (user) =>
-        (user ?
-          cssUserIcon(createUserImage(user, 'medium', testId('user-icon')),
-            menu(() => this._makeAccountMenu(user), {placement: 'bottom-end'}),
-          ) :
-          cssSignInButton('Sign in', icon('Collapse'), testId('user-signin'),
-            menu(() => this._makeAccountMenu(user), {placement: 'bottom-end'}),
-          )
-        )
-      ),
+      dom.domComputed(use => {
+        const isTemplate = Boolean(this._docPageModel && use(this._docPageModel.isTemplate));
+        const user = this._appModel.currentValidUser;
+        if (!user && isTemplate) {
+          return this._buildUseThisTemplateButton();
+        } else if (!user) {
+          return this._buildSignInAndSignUpButtons();
+        } else {
+          return this._buildAccountMenuButton(user);
+        }
+      }),
       testId('dm-account'),
     );
   }
 
+  private _buildAccountMenuButton(user: FullUser|null) {
+    return cssUserIcon(
+      createUserImage(user, 'medium', testId('user-icon')),
+      menu(() => this._makeAccountMenu(user), {placement: 'bottom-end'}),
+    );
+  }
+
+  private _buildSignInAndSignUpButtons() {
+    return [
+      cssSigninButton(t('Sign In'),
+        cssSigninButton.cls('-secondary'),
+        dom.on('click', () => { this._docPageModel?.clearUnsavedChanges(); }),
+        dom.attr('href', use => {
+          // Keep the redirect param of the login URL fresh.
+          use(urlState().state);
+          return getLoginUrl();
+        }),
+        testId('user-sign-in'),
+      ),
+      cssSigninButton(t('Sign Up'),
+        dom.on('click', () => { this._docPageModel?.clearUnsavedChanges(); }),
+        dom.attr('href', use => {
+          // Keep the redirect param of the signup URL fresh.
+          use(urlState().state);
+          return getSignupUrl();
+        }),
+        testId('user-sign-up'),
+      ),
+    ];
+  }
+
+  private _buildUseThisTemplateButton() {
+    return cssUseThisTemplateButton(t('Use This Template'),
+      dom.attr('href', use => {
+        const {doc: srcDocId} = use(urlState().state);
+        return getLoginOrSignupUrl({srcDocId});
+      }),
+      dom.on('click', () => { this._docPageModel?.clearUnsavedChanges(); }),
+      testId('dm-account-use-this-template'),
+    );
+  }
 
   /**
    * Renders the content of the account menu, with a list of available orgs, settings, and sign-out.
@@ -49,31 +104,28 @@ export class AccountWidget extends Disposable {
    */
   private _makeAccountMenu(user: FullUser|null): DomElementArg[] {
     const currentOrg = this._appModel.currentOrg;
-    const gristDoc = this._docPageModel ? this._docPageModel.gristDoc.get() : null;
-    const isBillingManager = Boolean(currentOrg && currentOrg.billingAccount &&
-      (currentOrg.billingAccount.isManager || user?.email === SUPPORT_EMAIL));
 
     // The 'Document Settings' item, when there is an open document.
-    const documentSettingsItem = (gristDoc ?
-      menuItem(async () => (await loadGristDoc()).showDocSettingsModal(gristDoc.docInfo, this._docPageModel!),
-        'Document Settings',
-        testId('dm-doc-settings')) :
-      null);
+    const documentSettingsItem = this._docPageModel ? menuItemLink(
+      urlState().setLinkUrl({docPage: 'settings'}),
+      t("Document Settings"),
+      testId('dm-doc-settings')
+    ) : null;
 
     // The item to toggle mobile mode (presence of viewport meta tag).
     const mobileModeToggle = menuItem(viewport.toggleViewport,
       cssSmallDeviceOnly.cls(''),   // Only show this toggle on small devices.
-      'Toggle Mobile Mode',
+      t("Toggle Mobile Mode"),
       cssCheckmark('Tick', dom.show(viewport.viewportEnabled)),
       testId('usermenu-toggle-mobile'),
     );
 
     if (!user) {
       return [
-        menuItemLink({href: getLoginOrSignupUrl()}, 'Sign in'),
+        menuItemLink({href: getLoginOrSignupUrl()}, t("Sign in")),
         menuDivider(),
         documentSettingsItem,
-        menuItemLink({href: commonUrls.plans}, 'Pricing'),
+        menuItemLink({href: commonUrls.plans}, t("Pricing")),
         mobileModeToggle,
       ];
     }
@@ -87,28 +139,25 @@ export class AccountWidget extends Disposable {
           cssEmail(user.email, testId('usermenu-email'))
         )
       ),
-      menuItemLink(urlState().setLinkUrl({account: 'account'}), 'Profile Settings'),
+      menuItemLink(urlState().setLinkUrl({account: 'account'}), t("Profile Settings"), testId('dm-account-settings')),
 
       documentSettingsItem,
 
       // Show 'Organization Settings' when on a home page of a valid org.
       (!this._docPageModel && currentOrg && this._appModel.isTeamSite ?
-        menuItem(() => manageTeamUsers(currentOrg, user, this._appModel.api),
-                 roles.canEditAccess(currentOrg.access) ? 'Manage Team' : 'Access Details',
+        menuItem(() => manageTeamUsers({org: currentOrg, user, api: this._appModel.api}),
+                 roles.canEditAccess(currentOrg.access) ? t("Manage Team") : t("Access Details"),
                  testId('dm-org-access')) :
         // Don't show on doc pages, or for personal orgs.
         null),
 
-      shouldHideUiElement("billing") ? null :
-      // Show link to billing pages.
-      this._appModel.isTeamSite ?
-        // For links, disabling with just a class is hard; easier to just not make it a link.
-        // TODO weasel menus should support disabling menuItemLink.
-        (isBillingManager ?
-          menuItemLink(urlState().setLinkUrl({billing: 'billing'}), 'Billing Account') :
-          menuItem(() => null, 'Billing Account', dom.cls('disabled', true))
-        ) :
-        menuItem(() => this._appModel.showUpgradeModal(), 'Upgrade Plan'),
+      this._maybeBuildBillingPageMenuItem(),
+      this._maybeBuildActivationPageMenuItem(),
+      this._maybeBuildAdminPanelMenuItem(),
+      this._maybeBuildSupportGristButton(),
+
+      // TODO: Uncomment when team audit logs are ready to use.
+      // this._maybeBuildAuditLogsMenuItem(),
 
       mobileModeToggle,
 
@@ -117,9 +166,9 @@ export class AccountWidget extends Disposable {
 
       // In case of a single-org setup, skip all the account-switching UI. We'll also skip the
       // org-listing UI below.
-      this._appModel.topAppModel.isSingleOrg || shouldHideUiElement("multiAccounts") ? [] : [
+      this._appModel.topAppModel.isSingleOrg || !isFeatureEnabled("multiAccounts") ? [] : [
         menuDivider(),
-        menuSubHeader(dom.text((use) => use(users).length > 1 ? 'Switch Accounts' : 'Accounts')),
+        menuSubHeader(dom.text((use) => use(users).length > 1 ? t("Switch Accounts") : t("Accounts"))),
         dom.forEach(users, (_user) => {
           if (_user.id === user.id) { return null; }
           return menuItem(() => this._switchAccount(_user),
@@ -127,10 +176,10 @@ export class AccountWidget extends Disposable {
             cssOtherEmail(_user.email, testId('usermenu-other-email')),
           );
         }),
-        isExternal ? null : menuItemLink({href: getLoginUrl()}, "Add Account", testId('dm-add-account')),
+        isExternal ? null : menuItemLink({href: getLoginUrl()}, t("Add Account"), testId('dm-add-account')),
       ],
 
-      menuItemLink({href: getLogoutUrl()}, "Sign Out", testId('dm-log-out')),
+      menuItemLink({href: getLogoutUrl()}, t("Sign Out"), testId('dm-log-out')),
 
       maybeAddSiteSwitcherSection(this._appModel),
     ];
@@ -138,7 +187,7 @@ export class AccountWidget extends Disposable {
 
   // Switch BrowserSession to use the given user for the currently loaded org.
   private async _switchAccount(user: FullUser) {
-    await this._appModel.api.setSessionActive(user.email);
+    await this._appModel.switchUser(user);
     if (urlState().state.get().doc) {
       // Document access level may have changed.
       // If it was not accessible but now is, we currently need to reload the page to get
@@ -151,14 +200,87 @@ export class AccountWidget extends Disposable {
     }
     this._appModel.topAppModel.initialize();
   }
+
+  private _maybeBuildBillingPageMenuItem() {
+    const {deploymentType} = getGristConfig();
+    if (deploymentType !== 'saas') { return null; }
+
+    const {currentValidUser, currentOrg, isTeamSite} = this._appModel;
+    const canViewBillingPage = Boolean(
+      currentOrg && // have accecc to org
+      currentOrg.billingAccount && // have access to billing account
+      (currentOrg.billingAccount.isManager // is billing manager
+       || currentValidUser?.isSupport // or support
+       || this._appModel.isInstallAdmin())); // or install admin
+
+    return isTeamSite ?
+      // For links, disabling with just a class is hard; easier to just not make it a link.
+      // TODO weasel menus should support disabling menuItemLink.
+      (canViewBillingPage ?
+        menuItemLink(urlState().setLinkUrl({billing: 'billing'}), t('Billing Account')) :
+        menuItem(() => null, t('Billing Account'), dom.cls('disabled', true))
+      ) :
+      menuItem(() => this._appModel.showUpgradeModal(), t('Upgrade Plan'));
+  }
+
+  private _maybeBuildActivationPageMenuItem() {
+    const {deploymentType} = getGristConfig();
+    if (deploymentType !== 'enterprise' || !this._appModel.isInstallAdmin()) {
+      return null;
+    }
+
+    return menuItemLink(t('Activation'), urlState().setLinkUrl({activation: 'activation'}));
+  }
+
+  private _maybeBuildAdminPanelMenuItem() {
+    // Only show Admin Panel item to the installation admins.
+    if (this._appModel.currentUser?.isInstallAdmin) {
+      return menuItemLink(
+        getAdminPanelName(),
+        urlState().setLinkUrl({adminPanel: 'admin'}),
+        testId('usermenu-admin-panel'),
+      );
+    }
+  }
+
+  private _maybeBuildSupportGristButton() {
+    const {deploymentType} = getGristConfig();
+    const isEnabled = (deploymentType === 'core') && isFeatureEnabled("supportGrist");
+    if (isEnabled) {
+      return menuItemLink(t('Support Grist'), ' 💛',
+        {href: commonUrls.githubSponsorGristLabs, target: '_blank'},
+        testId('usermenu-support-grist'),
+      );
+    }
+  }
+
+  // TODO: Uncomment when team audit logs are ready to use.
+  // private _maybeBuildAuditLogsMenuItem() {
+  //   const { deploymentType } = getGristConfig();
+  //   if (
+  //     !this._appModel.isOwner() ||
+  //     !this._appModel.isTeamSite ||
+  //     !deploymentType ||
+  //     !["saas", "core", "enterprise"].includes(deploymentType)
+  //   ) {
+  //     return null;
+  //   }
+
+  //   return menuItemLink(
+  //     t("Audit Logs"),
+  //     menuAnnotate(t("New")),
+  //     urlState().setLinkUrl({ auditLogs: "audit-logs" })
+  //   );
+  // }
 }
 
 const cssAccountWidget = styled('div', `
+  display: flex;
   margin-right: 16px;
   white-space: nowrap;
 `);
 
-const cssUserIcon = styled('div', `
+export const cssUserIcon = styled('div', `
   height: 48px;
   width: 48px;
   padding: 8px;
@@ -176,14 +298,14 @@ const cssUserName = styled('div', `
   margin-left: 8px;
   font-size: ${vars.mediumFontSize};
   font-weight: ${vars.headerControlTextWeight};
-  color: ${colors.dark};
+  color: ${theme.text};
 `);
 
 const cssEmail = styled('div', `
   margin-top: 4px;
   font-size: ${vars.smallFontSize};
   font-weight: initial;
-  color: ${colors.slate};
+  color: ${theme.lightText};
 `);
 
 const cssSmallIconWrap = styled('div', `
@@ -192,16 +314,16 @@ const cssSmallIconWrap = styled('div', `
 `);
 
 const cssOtherEmail = styled('div', `
-  color: ${colors.slate};
+  color: ${theme.lightText};
   .${cssMenuItem.className}-sel & {
-    color: ${colors.light};
+    color: ${theme.menuItemSelectedFg};
   }
 `);
 
 const cssCheckmark = styled(icon, `
   flex: none;
   margin-left: 16px;
-  --icon-color: ${colors.lightGreen};
+  --icon-color: ${theme.accentIcon};
 `);
 
 // Note that this css class hides the item when the device width is small (not based on viewport
@@ -214,8 +336,22 @@ const cssSmallDeviceOnly = styled(menuItem, `
   }
 `);
 
-const cssSignInButton = styled(primaryButton, `
+const cssSigninButton = styled(bigPrimaryButtonLink, `
   display: flex;
+  align-items: center;
+  font-weight: 700;
+  min-height: unset;
+  height: 36px;
+  padding: 8px 16px 8px 16px;
+  font-size: ${vars.mediumFontSize};
+
+  &-secondary, &-secondary:hover {
+    background-color: transparent;
+    border-color: transparent;
+    color: ${theme.text};
+  }
+`);
+
+const cssUseThisTemplateButton = styled(primaryButtonLink, `
   margin: 8px;
-  gap: 4px;
 `);

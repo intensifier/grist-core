@@ -7,10 +7,10 @@
 !stubs
 !app
 !buildtools
-!ormconfig.js
 !static
 !bower_components
 !sandbox
 !plugins
 !test
 !ext
+**/_build

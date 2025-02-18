@@ -5,6 +5,8 @@ and starts the grist sandbox. See engine.py for the API documentation.
 import os
 import random
 import sys
+
+from timing import DummyTiming, Timing
 sys.path.append('thirdparty')
 # pylint: disable=wrong-import-position
 
@@ -16,19 +18,29 @@ import six
 
 import actions
 import engine
+import formula_prompt
 import migrations
 import schema
 import useractions
 import objtypes
-from acl_formula import parse_acl_formula
+from predicate_formula import parse_predicate_formula
 from sandbox import get_default_sandbox
 from imports.register import register_import_parsers
 
-import logger
-log = logger.Logger(__name__, logger.INFO)
+# Handler for logging, which flushes each message.
+class FlushingStreamHandler(logging.StreamHandler):
+  def emit(self, record):
+    super(FlushingStreamHandler, self).emit(record)
+    self.flush()
 
-# Configure logging module to behave similarly to logger. (It may be OK to get rid of logger.)
-logging.basicConfig(format="[%(levelname)s] [%(name)s] %(message)s")
+# Configure logging module to produce messages with log level and logger name.
+logging.basicConfig(format="[%(levelname)s] [%(name)s] %(message)s",
+    handlers=[FlushingStreamHandler(sys.stderr)],
+    level=logging.INFO)
+
+# The default level is INFO. If a different level is desired, add a call like this:
+#   log.setLevel(logging.WARNING)
+log = logging.getLogger(__name__)
 
 def table_data_from_db(table_name, table_data_repr):
   if table_data_repr is None:
@@ -56,7 +68,7 @@ def run(sandbox):
     # Wrap each method so that it logs a message that it's being called.
     @functools.wraps(method)
     def wrapper(*args, **kwargs):
-      log.debug("calling %s" % method.__name__)
+      log.debug("calling %s", method.__name__)
       return method(*args, **kwargs)
 
     sandbox.register(method.__name__, wrapper)
@@ -86,8 +98,8 @@ def run(sandbox):
     return eng.fetch_table_schema()
 
   @export
-  def autocomplete(txt, table_id, column_id, user):
-    return eng.autocomplete(txt, table_id, column_id, user)
+  def autocomplete(txt, table_id, column_id, row_id, user):
+    return eng.autocomplete(txt, table_id, column_id, row_id, user)
 
   @export
   def find_col_from_values(values, n, opt_table_id):
@@ -135,7 +147,34 @@ def run(sandbox):
   def get_formula_error(table_id, col_id, row_id):
     return objtypes.encode_object(eng.get_formula_error(table_id, col_id, row_id))
 
-  export(parse_acl_formula)
+  @export
+  def get_formula_prompt(table_id, col_id, description, include_all_tables=True, lookups=True):
+    return formula_prompt.get_formula_prompt(eng, table_id, col_id, description,
+                                             include_all_tables, lookups)
+
+  @export
+  def convert_formula_completion(completion):
+    return formula_prompt.convert_completion(completion)
+
+  @export
+  def evaluate_formula(table_id, col_id, row_id):
+    return formula_prompt.evaluate_formula(eng, table_id, col_id, row_id)
+
+  @export
+  def start_timing():
+    eng._timing = Timing()
+
+  @export
+  def stop_timing():
+    stats = eng._timing.get()
+    eng._timing = DummyTiming()
+    return stats
+
+  @export
+  def get_timings():
+    return eng._timing.get(False)
+
+  export(parse_predicate_formula)
   export(eng.load_empty)
   export(eng.load_done)
 

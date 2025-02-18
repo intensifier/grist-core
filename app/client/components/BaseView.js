@@ -1,30 +1,40 @@
-var _ = require('underscore');
-var ko = require('knockout');
-var moment = require('moment-timezone');
-var {getSelectionDesc} = require('app/common/DocActions');
-var {nativeCompare, roundDownToMultiple, waitObs} = require('app/common/gutil');
-var gutil = require('app/common/gutil');
+/* globals KeyboardEvent */
+
+const _ = require('underscore');
+const ko = require('knockout');
+const moment = require('moment-timezone');
+const {nativeCompare, roundDownToMultiple, waitObs} = require('app/common/gutil');
+const gutil = require('app/common/gutil');
 const MANUALSORT  = require('app/common/gristTypes').MANUALSORT;
-var gristTypes = require('app/common/gristTypes');
-var tableUtil = require('../lib/tableUtil');
-var {DataRowModel} = require('../models/DataRowModel');
-var {DynamicQuerySet} = require('../models/QuerySet');
-var {SortFunc} = require('app/common/SortFunc');
-var rowset = require('../models/rowset');
-var Base = require('./Base');
-var {Cursor} = require('./Cursor');
-var FieldBuilder = require('../widgets/FieldBuilder');
-var commands = require('./commands');
-var BackboneEvents = require('backbone').Events;
+const gristTypes = require('app/common/gristTypes');
+const tableUtil = require('../lib/tableUtil');
+const {DataRowModel} = require('../models/DataRowModel');
+const {DynamicQuerySet} = require('../models/QuerySet');
+const {SortFunc} = require('app/common/SortFunc');
+const rowset = require('../models/rowset');
+const Base = require('./Base');
+const {getDefaultColValues} = require("./BaseView2");
+const {Cursor} = require('./Cursor');
+const FieldBuilder = require('../widgets/FieldBuilder');
+const commands = require('./commands');
+const BackboneEvents = require('backbone').Events;
 const {ClientColumnGetters} = require('app/client/models/ClientColumnGetters');
 const {reportError, reportSuccess} = require('app/client/models/errors');
 const {urlState} = require('app/client/models/gristUrlState');
 const {SectionFilter} = require('app/client/models/SectionFilter');
-const {copyToClipboard} = require('app/client/lib/copyToClipboard');
+const {UnionRowSource} = require('app/client/models/UnionRowSource');
+const {copyToClipboard} = require('app/client/lib/clipboardUtils');
 const {setTestState} = require('app/client/lib/testState');
 const {ExtraRows} = require('app/client/models/DataTableModelWithDiff');
 const {createFilterMenu} = require('app/client/ui/ColumnFilterMenu');
 const {closeRegisteredMenu} = require('app/client/ui2018/menus');
+const {COMMENTS} = require('app/client/models/features');
+const {DismissedPopup} = require('app/common/Prefs');
+const {markAsSeen} = require('app/client/models/UserPrefs');
+const {buildConfirmDelete, reportUndo} = require('app/client/components/modals');
+const {buildReassignModal} = require('app/client/ui/buildReassignModal');
+const {MutedError} = require('app/client/models/errors');
+
 
 /**
  * BaseView forms the basis for ViewSection classes.
@@ -56,17 +66,7 @@ function BaseView(gristDoc, viewSectionModel, options) {
   // We use a DynamicQuerySet as the underlying RowSource, with ColumnFilters applies on top of
   // it. It filters based on section linking, re-querying as needed in case of onDemand tables.
   this._queryRowSource = DynamicQuerySet.create(this, gristDoc.querySetManager, this.tableModel);
-
-  // When we have a summary table, filter out rows corresponding to empty groups.
-  // (TODO this may be better implemented by deleting empty groups in the data engine.)
-  if (this.viewSection.table().summarySourceTable()) {
-    const groupGetter = this.tableModel.tableData.getRowPropFunc('group');
-    this._mainRowSource = rowset.BaseFilteredRowSource.create(this,
-      rowId => !groupGetter || !gristTypes.isEmptyList(groupGetter(rowId)));
-    this._mainRowSource.subscribeTo(this._queryRowSource);
-  } else {
-    this._mainRowSource = this._queryRowSource;
-  }
+  this._mainRowSource = this._queryRowSource;
 
   if (this.comparison) {
     // Assign extra row ids for any rows added in the remote (right) table or removed in the
@@ -75,15 +75,22 @@ function BaseView(gristDoc, viewSectionModel, options) {
     this._mainRowSource = rowset.ExtendedRowSource.create(this, this._mainRowSource, extraRowIds);
   }
 
+  // Rows that should temporarily be visible even if they don't match filters.
+  // This is so that a newly added row doesn't immediately disappear, which would be confusing.
+  this._exemptFromFilterRows = rowset.ExemptFromFilterRowSource.create(this);
+  this._exemptFromFilterRows.subscribeTo(this.tableModel);
+
   // Create a section filter and a filtered row source that subscribes to its changes.
-  // `sectionFilter` also provides an `addTemporaryRow()` to allow views to display newly inserted rows,
-  // and `setFilterOverride()` to allow controlling a filter from a column menu.
+  // `sectionFilter` also provides `setFilterOverride()` to allow controlling a filter from a column menu.
   this._sectionFilter = SectionFilter.create(this, this.viewSection, this.tableModel.tableData);
   this._filteredRowSource = rowset.FilteredRowSource.create(this, this._sectionFilter.sectionFilterFunc.get());
   this._filteredRowSource.subscribeTo(this._mainRowSource);
   this.autoDispose(this._sectionFilter.sectionFilterFunc.addListener(filterFunc => {
+    this._exemptFromFilterRows.reset();
     this._filteredRowSource.updateFilter(filterFunc);
   }));
+
+  this.rowSource = UnionRowSource.create(this, [this._filteredRowSource, this._exemptFromFilterRows]);
 
   // Sorted collection of all rows to show in this view.
   this.sortedRows = rowset.SortedRowSet.create(this, null, this.tableModel.tableData);
@@ -99,7 +106,7 @@ function BaseView(gristDoc, viewSectionModel, options) {
   }, this));
 
   // Here we are subscribed to the bulk of the data (main table, possibly filtered).
-  this.sortedRows.subscribeTo(this._filteredRowSource);
+  this.sortedRows.subscribeTo(this.rowSource);
 
   // We create a special one-row RowSource for the "Add new" row, in case we need it.
   this.newRowSource = rowset.RowSource.create(this);
@@ -132,8 +139,14 @@ function BaseView(gristDoc, viewSectionModel, options) {
     return linking && linking.cursorPos ? linking.cursorPos() : null;
   }).extend({deferred: true}));
 
-  // Update the cursor whenever linkedRowId() changes.
-  this.autoDispose(this.linkedRowId.subscribe(rowId => this.setCursorPos({rowId})));
+  // Update the cursor whenever linkedRowId() changes (but only if we have any linking).
+  this.autoDispose(this.linkedRowId.subscribe(rowId => {
+    if (this.viewSection.linkingState.peek()) {
+      this.setCursorPos({rowId: rowId || 'new'}, true);
+    }
+  }));
+
+  this.isLinkSource = this.autoDispose(ko.pureComputed(() => this.viewSection.linkedSections().all().length > 0));
 
   // Indicated whether editing the section should be disabled given the current linking state.
   this.disableEditing = this.autoDispose(ko.computed(() => {
@@ -141,7 +154,7 @@ function BaseView(gristDoc, viewSectionModel, options) {
     return linking && linking.disableEditing();
   }));
 
-  this.isPreview = this.options.isPreview;
+  this.isPreview = this.options.isPreview ?? false;
 
   this.enableAddRow = this.autoDispose(ko.computed(() => this.options.addNewRow &&
     !this.viewSection.disableAddRemoveRows() && !this.disableEditing()));
@@ -183,6 +196,9 @@ function BaseView(gristDoc, viewSectionModel, options) {
     this.fieldBuilders.at(this.cursor.fieldIndex())
   ));
 
+  // By default, a view doesn't support selectedColumns, but it can be overridden.
+  this.selectedColumns = null;
+
   // Observable for whether the data in this view is truncated, i.e. not all rows are included
   // (this can only be true for on-demand tables).
   this.isTruncated = ko.observable(false);
@@ -195,6 +211,7 @@ function BaseView(gristDoc, viewSectionModel, options) {
     this._queryRowSource.makeQuery(linkingFilter.filters, linkingFilter.operations, (err) => {
       if (this.isDisposed()) { return; }
       if (err) { reportError(err); }
+      this._exemptFromFilterRows.reset();
       this.onTableLoaded();
     });
   }));
@@ -222,7 +239,7 @@ BaseView.commonCommands = {
     this.scrollToCursor(true).catch(reportError);
     this.activateEditorAtCursor({init});
   },
-  editField: function() { closeRegisteredMenu(); this.scrollToCursor(true); this.activateEditorAtCursor(); },
+  editField: function(event) { closeRegisteredMenu(); this.scrollToCursor(true); this.activateEditorAtCursor({event}); },
 
   insertRecordBefore: function() { this.insertRow(this.cursor.rowIndex()); },
   insertRecordAfter: function() { this.insertRow(this.cursor.rowIndex() + 1); },
@@ -232,22 +249,66 @@ BaseView.commonCommands = {
 
   copyLink: function() { this.copyLink().catch(reportError); },
 
-  showRawData: function() { this.showRawData().catch(reportError); },
+  deleteRecords: function(source) { this.deleteRecords(source); },
 
   filterByThisCellValue: function() { this.filterByThisCellValue(); },
-  duplicateRows: function() { this._duplicateRows().catch(reportError); }
+  duplicateRows: function() { this._duplicateRows().catch(reportError); },
+  openDiscussion: function() { this.openDiscussionAtCursor(); },
+  viewAsCard: function() {
+    /* Overridden by subclasses.
+     *
+     * This is still needed so that <space> doesn't trigger the `input` command
+     * if a subclass doesn't support opening the current record as a card. */
+  },
+};
+
+BaseView.prototype.selectedRows = function() {
+  return [];
+};
+
+BaseView.prototype.deleteRows = function(rowIds) {
+  return this.tableModel.sendTableAction(['BulkRemoveRecord', rowIds]);
+};
+
+BaseView.prototype.deleteRecords = function(source) {
+  const rowIds = this.selectedRows();
+  if (this.viewSection.disableAddRemoveRows() || rowIds.length === 0){
+    return;
+  }
+  const isKeyboard = source instanceof KeyboardEvent;
+  const popups = this.gristDoc.docPageModel.appModel.dismissedPopups;
+  const popupName = DismissedPopup.check('deleteRecords');
+  const onSave = async (remember) => {
+    if (remember) {
+      markAsSeen(popups, popupName);
+    }
+    return this.deleteRows(rowIds);
+  };
+  if (isKeyboard && !popups.get().includes(popupName)) {
+    // If we can't find it, use viewPane itself
+    this.scrollToCursor();
+    const selectedCell = this.viewPane.querySelector(".selected_cursor") || this.viewPane;
+    buildConfirmDelete(selectedCell, onSave, rowIds.length <= 1);
+  } else {
+    onSave().then(() => {
+      if (!this.isDisposed()) {
+        reportUndo(this.gristDoc, `You deleted ${rowIds.length} row${rowIds.length > 1 ? 's' : ''}.`);
+      }
+      return true;
+    });
+  }
 };
 
 /**
  * Sets the cursor to the given position, deferring if necessary until the current query finishes
- * loading.
+ * loading. isFromLink will be set when called as result of cursor linking(see Cursor.setCursorPos for info)
  */
-BaseView.prototype.setCursorPos = function(cursorPos) {
+BaseView.prototype.setCursorPos = function(cursorPos, isFromLink = false) {
   if (this.isDisposed()) {
     return;
   }
   if (!this._isLoading.peek()) {
-    this.cursor.setCursorPos(cursorPos);
+    this.cursor.setCursorPos(cursorPos, isFromLink);
   } else {
     // This is the first step; the second happens in onTableLoaded.
     this._pendingCursorPos = cursorPos;
@@ -285,6 +346,30 @@ BaseView.prototype.activateEditorAtCursor = function(options) {
   builder.buildEditorDom(this.editRowModel, lazyRow, options || {});
 };
 
+
+/**
+ * Opens discussion panel at the cursor position. Returns true if discussion panel was opened.
+ */
+ BaseView.prototype.openDiscussionAtCursor = function(id) {
+  if (!COMMENTS().get()) { return false; }
+  var builder = this.activeFieldBuilder();
+  if (builder.isEditorActive()) {
+    return false;
+  }
+  var rowId = this.viewData.getRowId(this.cursor.rowIndex());
+  // LazyArrayModel row model which is also used to build the cell dom. Needed since
+  // it may be used as a key to retrieve the cell dom, which is useful for editor placement.
+  var lazyRow = this.getRenderedRowModel(rowId);
+  if (!lazyRow) {
+    // TODO scroll into view. For now, just don't start discussion.
+    return false;
+  }
+  this.editRowModel.assign(rowId);
+  builder.buildDiscussionPopup(this.editRowModel, lazyRow, id);
+  return true;
+};
+
+
 /**
  * Move the floating RowModel for editing to the current cursor position, and return it.
  *
@@ -307,8 +392,12 @@ BaseView.prototype.getAnchorLinkForSection = function(sectionId) {
       // Note that this case only happens in combination with the widget linking mentioned.
       // If the table is empty but the 'new record' row is selected, the `viewData.getRowId` line above works.
       || 'new';
-  const colRef = this.viewSection.viewFields().peek()[this.cursor.fieldIndex()].colRef();
-  return {hash: {sectionId, rowId, colRef}};
+  // The `fieldIndex` will be null if there are no visible columns.
+  const fieldIndex = this.cursor.fieldIndex.peek();
+  const field = fieldIndex !== null ? this.viewSection.viewFields().peek()[fieldIndex] : null;
+  const colRef = field?.colRef.peek();
+  const linkingRowIds = sectionId ? this.gristDoc.getLinkingRowIds(sectionId) : undefined;
+  return {hash: {sectionId, rowId, colRef, linkingRowIds}};
 }
 
 // Copy an anchor link for the current row to the clipboard.
@@ -324,12 +413,6 @@ BaseView.prototype.copyLink = async function() {
     throw new Error('cannot copy to clipboard');
   }
 };
-
-BaseView.prototype.showRawData = async function() {
-  const sectionId = this.schemaModel.rawViewSectionRef.peek();
-  const anchorUrlState = this.getAnchorLinkForSection(sectionId);
-  await urlState().pushUrl({...anchorUrlState, docPage: 'data'});
-}
 
 BaseView.prototype.filterByThisCellValue = function() {
   const rowId = this.viewData.getRowId(this.cursor.rowIndex());
@@ -353,7 +436,7 @@ BaseView.prototype.filterByThisCellValue = function() {
     }
     filterValues = [value];
   }
-  this.viewSection.setFilter(col.getRowId(), JSON.stringify({included: filterValues}));
+  this.viewSection.setFilter(col.getRowId(), {filter: JSON.stringify({included: filterValues})});
 };
 
 /**
@@ -371,7 +454,7 @@ BaseView.prototype.insertRow = function(index) {
   return this.sendTableAction(['AddRecord', null, { 'manualSort': insertPos }])
   .then(rowId => {
     if (!this.isDisposed()) {
-      this._sectionFilter.addTemporaryRow(rowId);
+      this._exemptFromFilterRows.addExemptRow(rowId);
       this.setCursorPos({rowId});
     }
     return rowId;
@@ -379,11 +462,7 @@ BaseView.prototype.insertRow = function(index) {
 };
 
 BaseView.prototype._getDefaultColValues = function() {
-  const linkingState = this.viewSection.linkingState.peek();
-  if (!linkingState) {
-    return {};
-  }
-  return linkingState.getDefaultColValues();
+  return getDefaultColValues(this.viewSection);
 };
 
 /**
@@ -491,7 +570,7 @@ BaseView.prototype._saveEditRowField = function(editRowModel, colName, value) {
     // Once we know the new row's rowId, add it to column filters to make sure it's displayed.
     .then(rowId => {
       if (!this.isDisposed()) {
-        this._sectionFilter.addTemporaryRow(rowId);
+        this._exemptFromFilterRows.addExemptRow(rowId);
         this.setCursorPos({rowId});
       }
       return rowId;
@@ -506,10 +585,11 @@ BaseView.prototype._saveEditRowField = function(editRowModel, colName, value) {
       mainRowModel[colName](value);
     }
     const ret = DataRowModel.prototype._saveField.call(editRowModel, colName, value)
-      // Display this rowId, even if it doesn't match the filter
+      // Display this rowId, even if it doesn't match the filter,
+      // unless the filter is on a Bool column
       .then((result) => {
-        if (!this.isDisposed()) {
-          this._sectionFilter.addTemporaryRow(rowId);
+        if (!this.isDisposed() && this.currentColumn().pureType() !== 'Bool') {
+          this._exemptFromFilterRows.addExemptRow(rowId);
         }
         return result;
       })
@@ -530,6 +610,9 @@ BaseView.prototype._saveEditRowField = function(editRowModel, colName, value) {
  * @returns {pasteObj} - Paste object
  */
 BaseView.prototype.copy = function(selection) {
+  // Clear the previous copy selection, if any.
+  commands.allCommands.clearCopySelection.run();
+
   this.copySelection(selection);
 
   return {
@@ -545,6 +628,9 @@ BaseView.prototype.copy = function(selection) {
  * @returns {pasteObj} - Paste object
  */
 BaseView.prototype.cut = function(selection) {
+  // Clear the previous copy selection, if any.
+  commands.allCommands.clearCopySelection.run();
+
   this.copySelection(selection);
 
   return {
@@ -565,20 +651,17 @@ BaseView.prototype.sendPasteActions = function(cutCallback, actions) {
     // If the cut occurs on an edit restricted cell, there may be no cut action.
     if (cutAction) { actions.unshift(cutAction); }
   }
-  return this.gristDoc.docData.sendActions(actions,
-    this._getPasteDesc(actions[actions.length - 1], cutAction));
-};
-
-/**
- * Returns a string which describes a cut/copy action.
- */
-BaseView.prototype._getPasteDesc = function(pasteAction, optCutAction) {
-  if (optCutAction) {
-    return `Moved ${getSelectionDesc(optCutAction, true)} to ` +
-      `${getSelectionDesc(pasteAction, true)}.`;
-  } else {
-    return `Pasted data to ${getSelectionDesc(pasteAction, true)}.`;
-  }
+  return this.gristDoc.docData.sendActions(actions).catch(ex => {
+    if (ex.code === 'UNIQUE_REFERENCE_VIOLATION') {
+      buildReassignModal({
+        docModel: this.gristDoc.docModel,
+        actions,
+      }).catch(reportError);
+      throw new MutedError();
+    } else {
+      throw ex;
+    }
+  });
 };
 
 BaseView.prototype.buildDom = function() {
@@ -625,7 +708,11 @@ BaseView.prototype.onRowResize = function(rowModels) {
  * Called when user selects a different row which drives the link-filtering of this section.
  */
 BaseView.prototype.onLinkFilterChange = function(rowId) {
-  this.setCursorPos({rowIndex: 0});
+  // If this section is linked, go to the first row as the row previously selected may no longer
+  // be visible.
+  if (this.viewSection.linkingState.peek()) {
+    this.setCursorPos({rowIndex: 0});
+  }
 };
 
 /**
@@ -655,9 +742,18 @@ BaseView.prototype.getLastDataRowIndex = function() {
 /**
  * Creates and opens ColumnFilterMenu for a given field/column, and returns its PopupControl.
  */
-BaseView.prototype.createFilterMenu = function(openCtl, filterInfo, onClose) {
-  return createFilterMenu(openCtl, this._sectionFilter, filterInfo, this._mainRowSource,
-    this.tableModel.tableData, onClose);
+BaseView.prototype.createFilterMenu = function(openCtl, filterInfo, options) {
+  const {showAllFiltersButton, onClose} = options;
+  return createFilterMenu({
+    openCtl,
+    sectionFilter: this._sectionFilter,
+    filterInfo,
+    rowSource: this._mainRowSource,
+    tableData: this.tableModel.tableData,
+    gristDoc: this.gristDoc,
+    showAllFiltersButton,
+    onClose,
+  });
 };
 
 /**
@@ -733,5 +829,18 @@ BaseView.prototype._duplicateRows = async function() {
   return result;
 }
 
+BaseView.prototype.viewSelectedRecordAsCard = function() {
+  if (this.isRecordCardDisabled()) { return; }
+
+  const colRef = this.viewSection.viewFields().at(this.cursor.fieldIndex()).column().id();
+  const rowId = this.viewData.getRowId(this.cursor.rowIndex());
+  const sectionId = this.viewSection.tableRecordCard().id();
+  const anchorUrlState = {hash: {colRef, rowId, sectionId, recordCard: true}};
+  urlState().pushUrl(anchorUrlState, {replace: true}).catch(reportError);
+}
+
+BaseView.prototype.isRecordCardDisabled = function() {
+  return this.viewSection.isTableRecordCardDisabled();
+}
 
 module.exports = BaseView;

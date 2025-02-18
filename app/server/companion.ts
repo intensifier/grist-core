@@ -1,12 +1,17 @@
+import { Level, TelemetryContracts } from 'app/common/Telemetry';
+import { version } from 'app/common/version';
 import { synchronizeProducts } from 'app/gen-server/entity/Product';
-import { HomeDBManager } from 'app/gen-server/lib/HomeDBManager';
+import { HomeDBManager } from 'app/gen-server/lib/homedb/HomeDBManager';
 import { applyPatch } from 'app/gen-server/lib/TypeORMPatches';
-import { getMigrations, getOrCreateConnection, undoLastMigration, updateDb } from 'app/server/lib/dbUtils';
+import { getMigrations, getOrCreateConnection, getTypeORMSettings,
+         undoLastMigration, updateDb } from 'app/server/lib/dbUtils';
 import { getDatabaseUrl } from 'app/server/lib/serverUtils';
+import { getTelemetryPrefs } from 'app/server/lib/Telemetry';
 import { Gristifier } from 'app/server/utils/gristify';
 import { pruneActionHistory } from 'app/server/utils/pruneActionHistory';
+import { showAuditLogEvents } from 'app/server/utils/showAuditLogEvents';
 import * as commander from 'commander';
-import { Connection, getConnectionOptions } from 'typeorm';
+import { Connection } from 'typeorm';
 
 /**
  * Main entrypoint for a cli toolbox for configuring aspects of Grist
@@ -39,11 +44,30 @@ export function getProgram(): commander.Command {
                               // want to reserve "grist" for electron app?
     .description('a toolbox of handy Grist-related utilities');
 
+  addAuditLogsCommand(program, {nested: true});
   addDbCommand(program, {nested: true});
   addHistoryCommand(program, {nested: true});
+  addSettingsCommand(program, {nested: true});
   addSiteCommand(program, {nested: true});
   addSqliteCommand(program);
+  addVersionCommand(program);
   return program;
+}
+
+function addAuditLogsCommand(program: commander.Command, options: CommandOptions) {
+  const sub = section(program, {
+    sectionName: 'audit-logs',
+    sectionDescription: 'show information about audit logs',
+    ...options,
+  });
+  sub("events")
+    .description("show audit log events")
+    .addOption(
+      new commander.Option("--type <type>")
+        .choices(["installation", "site"])
+        .makeOptionMandatory()
+    )
+    .action(showAuditLogEvents);
 }
 
 // Add commands related to document history:
@@ -58,6 +82,90 @@ export function addHistoryCommand(program: commander.Command, options: CommandOp
     .description('remove all but last N actions from doc')
     .argument('[N]', 'number of actions to keep', parseIntForCommander, 1)
     .action(pruneActionHistory);
+}
+
+// Add commands for general configuration
+export function addSettingsCommand(program: commander.Command,
+                                   options: CommandOptions) {
+  const sub = section(program, {
+    sectionName: 'settings',
+    sectionDescription: 'general configuration',
+    ...options
+  });
+  sub('telemetry')
+    .description('show telemetry settings')
+    .option('--json', 'show telemetry levels as json')
+    .option('--all', 'show all telemetry levels')
+    .action(showTelemetry);
+}
+
+async function showTelemetry(options: {
+  json?: boolean,
+  all?: boolean,
+}) {
+  const contracts = TelemetryContracts;
+  const db = await getHomeDBManager();
+  const prefs = await getTelemetryPrefs(db);
+  const levelName = prefs.telemetryLevel.value;
+  const level = Level[levelName];
+  if (options.json) {
+    console.log(JSON.stringify({
+      contracts,
+      currentLevel: level,
+      currentLevelName: levelName,
+    }, null, 2));
+  } else {
+    if (options.all) {
+      console.log("# All telemetry levels");
+      console.log("");
+      for (const iLevel of [Level.off, Level.limited, Level.full]) {
+        describeTelemetryLevel(iLevel, '#');
+        console.log("");
+        showTelemetryAtLevel(iLevel, '##');
+        console.log("");
+      }
+    } else {
+      describeTelemetryLevel(level, '');
+      console.log("");
+      showTelemetryAtLevel(level, '#');
+    }
+  }
+}
+
+function describeTelemetryLevel(level: Level, nesting: ''|'#') {
+  switch (level) {
+    case Level.off:
+      console.log(nesting + "# Telemetry level: off");
+      console.log("No telemetry is recorded or transmitted.");
+      break;
+    case Level.limited:
+      console.log(nesting + "# Telemetry level: limited");
+      console.log("This is a telemetry level appropriate for self-hosting instances of Grist.");
+      console.log("Data is transmitted to Grist Labs.");
+      break;
+    case Level.full:
+      console.log(nesting + "# Telemetry level: full");
+      console.log("This is a telemetry level appropriate for internal use by a hosted service, with");
+      console.log("`GRIST_TELEMETRY_URL` set to an endpoint controlled by the operator of the service.");
+      break;
+  }
+}
+
+function showTelemetryAtLevel(level: Level, nesting: ''|'#'|'##') {
+  const contracts = TelemetryContracts;
+  for (const [name, contract] of Object.entries(contracts)) {
+    if (contract.minimumTelemetryLevel > level) { continue; }
+    console.log(nesting + "# " + name);
+    console.log(contract.description);
+    console.log("");
+    console.log("| Field | Type | Description |");
+    console.log("| ----- | ---- | ----------- |");
+    for (const [fieldName, metadata] of Object.entries(contract.metadataContracts || {})) {
+      if ((metadata.minimumTelemetryLevel || 0) > level) { continue; }
+      console.log("| " + fieldName + " | " + metadata.dataType + " | " + metadata.description + " |");
+    }
+    console.log("");
+  }
 }
 
 // Add commands related to sites:
@@ -76,18 +184,14 @@ export function addSiteCommand(program: commander.Command,
       const profile = {email, name: email};
       const db = await getHomeDBManager();
       const user = await db.getUserByLogin(email, {profile});
-      if (!user) {
-        // This should not happen.
-        throw new Error('failed to create user');
-      }
-      await db.addOrg(user, {
+      db.unwrapQueryResult(await db.addOrg(user, {
         name: domain,
         domain,
       }, {
         setUserAsOwner: false,
         useNewPlan: true,
-        planType: 'teamFree'
-      });
+        product: 'teamFree'
+      }));
     });
 }
 
@@ -138,7 +242,7 @@ export function addDbCommand(program: commander.Command,
   sub('url')
     .description('construct a url for the database (for psql, catsql etc)')
     .action(withConnection(async () => {
-      console.log(getDatabaseUrl(await getConnectionOptions(), true));
+      console.log(getDatabaseUrl(getTypeORMSettings(), true));
       return 0;
     }));
 }
@@ -160,6 +264,12 @@ export function addSqliteCommand(program: commander.Command) {
     .action(filename => new Gristifier(filename).degristify());
 }
 
+export function addVersionCommand(program: commander.Command) {
+  program.command('version')
+    .description('show Grist version')
+    .action(() => console.log(version));
+}
+
 // Report the status of the database. Migrations appied, migrations pending,
 // product information applied, product changes pending.
 export async function dbCheck(connection: Connection) {
@@ -167,10 +277,9 @@ export async function dbCheck(connection: Connection) {
   const changingProducts = await synchronizeProducts(connection, false);
   // eslint-disable-next-line @typescript-eslint/no-shadow
   const log = process.env.TYPEORM_LOGGING === 'true' ? console.log : (...args: any[]) => null;
-  const options = await getConnectionOptions();
+  const options = getTypeORMSettings();
   log("database url:", getDatabaseUrl(options, false));
   log("migration files:", options.migrations);
-  log("migration directory:", (options.cli && options.cli.migrationsDir) || 'unspecified');
   log("migrations applied to db:", migrations.migrationsInDb);
   log("migrations listed in code:", migrations.migrationsInCode);
   let exitCode: number = 0;

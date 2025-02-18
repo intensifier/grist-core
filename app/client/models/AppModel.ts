@@ -1,26 +1,48 @@
+import {BehavioralPromptsManager} from 'app/client/components/BehavioralPromptsManager';
+import {hooks} from 'app/client/Hooks';
 import {get as getBrowserGlobals} from 'app/client/lib/browserGlobals';
+import {makeT} from 'app/client/lib/localization';
+import {sessionStorageObs} from 'app/client/lib/localStorageObs';
 import {error} from 'app/client/lib/log';
 import {reportError, setErrorNotifier} from 'app/client/models/errors';
 import {urlState} from 'app/client/models/gristUrlState';
 import {Notifier} from 'app/client/models/NotifyModel';
 import {getFlavor, ProductFlavor} from 'app/client/ui/CustomThemes';
-import {buildNewSiteModal, buildUpgradeModal, NEW_DEAL} from 'app/client/ui/ProductUpgrades';
+import {buildNewSiteModal, buildUpgradeModal} from 'app/client/ui/ProductUpgrades';
+import {gristThemePrefs} from 'app/client/ui2018/theme';
+import {AsyncCreate} from 'app/common/AsyncCreate';
+import {PlanSelection} from 'app/common/BillingAPI';
+import {ICustomWidget} from 'app/common/CustomWidget';
 import {OrgUsageSummary} from 'app/common/DocUsage';
-import {Features, isLegacyPlan, Product} from 'app/common/Features';
-import {GristLoadConfig} from 'app/common/gristUrls';
+import {Features, isFreePlan, isLegacyPlan, mergedFeatures, Product} from 'app/common/Features';
+import {GristLoadConfig, IGristUrlState} from 'app/common/gristUrls';
 import {FullUser} from 'app/common/LoginSessionAPI';
 import {LocalPlugin} from 'app/common/plugin';
-import {UserPrefs} from 'app/common/Prefs';
-import {isOwner} from 'app/common/roles';
+import {DismissedPopup, DismissedReminder, UserPrefs} from 'app/common/Prefs';
+import {isOwner, isOwnerOrEditor} from 'app/common/roles';
 import {getTagManagerScript} from 'app/common/tagManager';
+import {getDefaultThemePrefs, ThemePrefs, ThemePrefsChecker} from 'app/common/ThemePrefs';
 import {getGristConfig} from 'app/common/urlUtils';
-import {getOrgName, Organization, OrgError, SUPPORT_EMAIL, UserAPI, UserAPIImpl} from 'app/common/UserAPI';
-import {getUserPrefObs, getUserPrefsObs} from 'app/client/models/UserPrefs';
+import {ExtendedUser} from 'app/common/UserAPI';
+import {getOrgName, isTemplatesOrg, Organization, OrgError, UserAPI, UserAPIImpl} from 'app/common/UserAPI';
+import {getUserPrefObs, getUserPrefsObs, markAsSeen} from 'app/client/models/UserPrefs';
 import {bundleChanges, Computed, Disposable, Observable, subscribe} from 'grainjs';
 
+const t = makeT('AppModel');
+
+// Reexported for convenience.
 export {reportError} from 'app/client/models/errors';
 
-export type PageType = "doc" | "home" | "billing" | "welcome";
+export type PageType =
+  | "doc"
+  | "home"
+  | "billing"
+  | "welcome"
+  | "account"
+  | "admin"
+  | "activation"
+  | "audit-logs";
+
 const G = getBrowserGlobals('document', 'window');
 
 // TopAppModel is the part of the app model that persists across org and user switches.
@@ -54,16 +76,29 @@ export interface TopAppModel {
    * Reloads orgs and accounts for current user.
    */
   fetchUsersAndOrgs(): Promise<void>;
+
+  /**
+   * Enumerate the widgets in the WidgetRepository for this installation
+   * of Grist.
+   */
+  getWidgets(): Promise<ICustomWidget[]>;
+
+  /**
+   * Reload cached list of widgets, for testing purposes.
+   */
+  testReloadWidgets(): Promise<void>;
 }
 
-// AppModel is specific to the currently loaded organization and active user. It gets rebuilt when
-// we switch the current organization or the current user.
+/**
+ * AppModel is specific to the currently loaded organization and active user. It gets rebuilt when
+ * we switch the current organization or the current user.
+ */
 export interface AppModel {
   topAppModel: TopAppModel;
   api: UserAPI;
 
-  currentUser: FullUser|null;
-  currentValidUser: FullUser|null;      // Like currentUser, but null when anonymous
+  currentUser: ExtendedUser|null;
+  currentValidUser: ExtendedUser|null;      // Like currentUser, but null when anonymous
 
   currentOrg: Organization|null;        // null if no access to currentSubdomain
   currentOrgName: string;               // Our best guess for human-friendly name.
@@ -71,22 +106,46 @@ export interface AppModel {
   isPersonal: boolean;                  // Is it a personal site?
   isTeamSite: boolean;                  // Is it a team site?
   isLegacySite: boolean;                // Is it a legacy site?
+  isTemplatesSite: boolean;             // Is it the templates site?
   orgError?: OrgError;                  // If currentOrg is null, the error that caused it.
+  lastVisitedOrgDomain: Observable<string|null>;
 
   currentProduct: Product|null;         // The current org's product.
-  currentFeatures: Features;            // Features of the current org's product.
+  currentPriceId: string|null;          // The current org's stripe plan id.
+  currentFeatures: Features|null;            // Features of the current org's product.
+
   userPrefsObs: Observable<UserPrefs>;
+  themePrefs: Observable<ThemePrefs>;
+  /**
+   * Popups that user has seen.
+   */
+  dismissedPopups: Observable<DismissedPopup[]>;
+  dismissedWelcomePopups: Observable<DismissedReminder[]>;
 
   pageType: Observable<PageType>;
+  needsOrg: Observable<boolean>;
 
   notifier: Notifier;
   planName: string|null;
 
+  behavioralPromptsManager: BehavioralPromptsManager;
+
   refreshOrgUsage(): Promise<void>;
-  showUpgradeModal(): void;
-  showNewSiteModal(): void;
+  showUpgradeModal(): Promise<void>;
+  showNewSiteModal(): Promise<void>;
   isBillingManager(): boolean;          // If user is a billing manager for this org
   isSupport(): boolean;                 // If user is a Support user
+  isOwner(): boolean;                   // If user is an owner of this org
+  isOwnerOrEditor(): boolean;           // If user is an owner or editor of this org
+  isInstallAdmin(): boolean;            // Is user an admin of this installation
+  dismissPopup(name: DismissedPopup, isSeen: boolean): void;  // Mark popup as dismissed or not.
+  switchUser(user: FullUser, org?: string): Promise<void>;
+  isFreePlan(): boolean;
+}
+
+export interface TopAppModelOptions {
+  /** Defaults to true. */
+  useApi?: boolean;
 }
 
 export class TopAppModelImpl extends Disposable implements TopAppModel {
@@ -99,24 +158,36 @@ export class TopAppModelImpl extends Disposable implements TopAppModel {
   public readonly orgs = Observable.create<Organization[]>(this, []);
   public readonly users = Observable.create<FullUser[]>(this, []);
   public readonly plugins: LocalPlugin[] = [];
-  private readonly _gristConfig?: GristLoadConfig;
+  private readonly _gristConfig? = this._window.gristConfig;
+  // Keep a list of available widgets, once requested, so we don't have to
+  // keep reloading it. Downside: browser page will need reloading to pick
+  // up new widgets - that seems ok.
+  private readonly _widgets: AsyncCreate<ICustomWidget[]>;
 
-  constructor(
-    window: {gristConfig?: GristLoadConfig},
-    public readonly api: UserAPI = new UserAPIImpl(getHomeUrl()),
+  constructor(private _window: {gristConfig?: GristLoadConfig},
+    public readonly api: UserAPI = newUserAPIImpl(),
+    public readonly options: TopAppModelOptions = {}
   ) {
     super();
     setErrorNotifier(this.notifier);
-    this.isSingleOrg = Boolean(window.gristConfig && window.gristConfig.singleOrg);
-    this.productFlavor = getFlavor(window.gristConfig && window.gristConfig.org);
-    this._gristConfig = window.gristConfig;
+    this.isSingleOrg = Boolean(this._gristConfig?.singleOrg);
+    this.productFlavor = getFlavor(this._gristConfig?.org);
+    this._widgets = new AsyncCreate<ICustomWidget[]>(async () => {
+      if (this.options.useApi === false || !this._gristConfig?.enableWidgetRepository) {
+        return [];
+      }
+
+      return await this.api.getWidgets();
+    });
 
     // Initially, and on any change to subdomain, call initialize() to get the full Organization
     // and the FullUser to use for it (the user may change when switching orgs).
     this.autoDispose(subscribe(this.currentSubdomain, (use) => this.initialize()));
     this.plugins = this._gristConfig?.plugins || [];
 
-    this.fetchUsersAndOrgs().catch(reportError);
+    if (this.options.useApi !== false) {
+      this.fetchUsersAndOrgs().catch(reportError);
+    }
   }
 
   public initialize(): void {
@@ -130,6 +201,18 @@ export class TopAppModelImpl extends Disposable implements TopAppModel {
       const {currentUser, currentOrg, orgError} = app;
       AppModelImpl.create(this.appObs, this, currentUser, currentOrg, orgError);
     }
+  }
+
+  public async getWidgets(): Promise<ICustomWidget[]> {
+    return this._widgets.get();
+  }
+
+  public async testReloadWidgets() {
+    console.log("testReloadWidgets");
+    this._widgets.clear();
+    console.log("testReloadWidgets cleared");
+    const result = await this.getWidgets();
+    console.log("testReloadWidgets got", {result});
   }
 
   public getUntrustedContentOrigin() {
@@ -160,6 +243,10 @@ export class TopAppModelImpl extends Disposable implements TopAppModel {
 
   private async _doInitialize() {
     this.appObs.set(null);
+    if (this.options.useApi === false) {
+      AppModelImpl.create(this.appObs, this, null, null, {error: 'no-api', status: 500});
+      return;
+    }
     try {
       const {user, org, orgError} = await this.api.getSessionActive();
       if (this.isDisposed()) { return; }
@@ -174,7 +261,7 @@ export class TopAppModelImpl extends Disposable implements TopAppModel {
         if (org.billingAccount && org.billingAccount.product &&
             org.billingAccount.product.name === 'suspended') {
           this.notifier.createUserMessage(
-            'This team site is suspended. Documents can be read, but not modified.',
+            t("This team site is suspended. Documents can be read, but not modified."),
             {actions: ['renew', 'personal']}
           );
         }
@@ -193,7 +280,7 @@ export class AppModelImpl extends Disposable implements AppModel {
   public readonly api: UserAPI = this.topAppModel.api;
 
   // Compute currentValidUser, turning anonymous into null.
-  public readonly currentValidUser: FullUser|null =
+  public readonly currentValidUser: ExtendedUser|null =
     this.currentUser && !this.currentUser.anonymous ? this.currentUser : null;
 
   // Figure out the org name, or blank if details are unavailable.
@@ -201,89 +288,209 @@ export class AppModelImpl extends Disposable implements AppModel {
 
   public readonly currentOrgUsage: Observable<OrgUsageSummary|null> = Observable.create(this, null);
 
+  public readonly lastVisitedOrgDomain = this.autoDispose(sessionStorageObs('grist-last-visited-org-domain'));
+
   public readonly currentProduct = this.currentOrg?.billingAccount?.product ?? null;
-  public readonly currentFeatures = this.currentProduct?.features ?? {};
+  public readonly currentPriceId = this.currentOrg?.billingAccount?.stripePlanId ?? null;
+  public readonly currentFeatures = mergedFeatures(
+    this.currentProduct?.features ?? null,
+    this.currentOrg?.billingAccount?.features ?? null
+  );
 
   public readonly isPersonal = Boolean(this.currentOrg?.owner);
   public readonly isTeamSite = Boolean(this.currentOrg) && !this.isPersonal;
-  // TODO: the `NEW_DEAL` observable can be removed after new deal is released.
-  public readonly isLegacySite = Boolean(
-    NEW_DEAL().get() && this.currentProduct && isLegacyPlan(this.currentProduct.name));
+  public readonly isLegacySite = Boolean(this.currentProduct && isLegacyPlan(this.currentProduct.name));
+  public readonly isTemplatesSite = isTemplatesOrg(this.currentOrg);
 
   public readonly userPrefsObs = getUserPrefsObs(this);
+  public readonly themePrefs = getUserPrefObs(this.userPrefsObs, 'theme', {
+    defaultValue: getDefaultThemePrefs(),
+    checker: ThemePrefsChecker,
+  }) as Observable<ThemePrefs>;
+
+  public readonly dismissedPopups = getUserPrefObs(this.userPrefsObs, 'dismissedPopups',
+    { defaultValue: [] }) as Observable<DismissedPopup[]>;
+  public readonly dismissedWelcomePopups = getUserPrefObs(this.userPrefsObs, 'dismissedWelcomePopups',
+    { defaultValue: [] }) as Observable<DismissedReminder[]>;
 
   // Get the current PageType from the URL.
   public readonly pageType: Observable<PageType> = Computed.create(this, urlState().state,
-    (use, state) => (state.doc ? "doc" : (state.billing ? "billing" : (state.welcome ? "welcome" : "home"))));
+    (_use, state) => {
+      if (state.doc) {
+        return 'doc';
+      } else if (state.billing) {
+        return 'billing';
+      } else if (state.welcome) {
+        return 'welcome';
+      } else if (state.account) {
+        return 'account';
+      } else if (state.adminPanel) {
+        return 'admin';
+      } else if (state.activation) {
+        return 'activation';
+      } else if (state.auditLogs) {
+        return 'audit-logs';
+      } else {
+        return 'home';
+      }
+    });
+
+  public readonly needsOrg: Observable<boolean> = Computed.create(
+    this, urlState().state, (use, state) => {
+      return !(
+        Boolean(state.welcome) ||
+        state.billing === 'scheduled' ||
+        Boolean(state.account) ||
+        Boolean(state.activation) ||
+        Boolean(state.adminPanel)
+      );
+    });
 
   public readonly notifier = this.topAppModel.notifier;
 
+  public readonly behavioralPromptsManager: BehavioralPromptsManager =
+    BehavioralPromptsManager.create(this, this);
+
   constructor(
     public readonly topAppModel: TopAppModel,
-    public readonly currentUser: FullUser|null,
+    public readonly currentUser: ExtendedUser|null,
     public readonly currentOrg: Organization|null,
     public readonly orgError?: OrgError,
   ) {
     super();
+
+    // Whenever theme preferences change, update the global `gristThemePrefs` observable; this triggers
+    // an automatic update to the global `gristThemeObs` computed observable.
+    this.autoDispose(subscribe(this.themePrefs, (_use, themePrefs) => gristThemePrefs.set(themePrefs)));
+
     this._recordSignUpIfIsNewUser();
 
     const state = urlState().state.get();
     if (state.createTeam) {
       // Remove params from the URL.
       urlState().pushUrl({createTeam: false, params: {}}, {avoidReload: true, replace: true}).catch(() => {});
-      this.showNewSiteModal(state.params?.planType);
+      this.showNewSiteModal({
+        priceId: state.params?.billingPlan,
+        product: state.params?.planType,
+      }).catch(reportError);
+    } else if (state.upgradeTeam) {
+        // Remove params from the URL.
+      urlState().pushUrl({upgradeTeam: false, params: {}}, {avoidReload: true, replace: true}).catch(() => {});
+      this.showUpgradeModal({
+        priceId: state.params?.billingPlan,
+        product: state.params?.planType,
+      }).catch(reportError);
     }
+
+    G.window.resetDismissedPopups = (seen = false) => {
+      this.dismissedPopups.set(seen ? DismissedPopup.values : []);
+      this.behavioralPromptsManager.reset();
+    };
+
+    G.window.resetOnboarding = () => {
+      getUserPrefObs(this.userPrefsObs, 'showNewUserQuestions').set(true);
+    };
+
+    this.autoDispose(subscribe(urlState().state, this.topAppModel.orgs, async (_use, s, orgs) => {
+      this._updateLastVisitedOrgDomain(s, orgs);
+    }));
   }
 
   public get planName() {
     return this.currentProduct?.name ?? null;
   }
 
-  public async showUpgradeModal() {
+  public async showUpgradeModal(plan?: PlanSelection) {
     if (this.planName && this.currentOrg) {
       if (this.isPersonal) {
-        this.showNewSiteModal();
+        await this.showNewSiteModal(plan);
       } else if (this.isTeamSite) {
-        buildUpgradeModal(this, this.planName);
+        await buildUpgradeModal(this, {
+          appModel: this,
+          pickPlan: plan,
+          reason: 'upgrade'
+        });
       } else {
         throw new Error("Unexpected state");
       }
     }
   }
 
-  public showNewSiteModal(selectedPlan?: string) {
+
+  public async showNewSiteModal(plan?: PlanSelection) {
     if (this.planName) {
-      buildNewSiteModal(this, {
-        planName: this.planName,
-        selectedPlan,
+      await buildNewSiteModal(this, {
+        appModel: this,
+        plan,
         onCreate: () => this.topAppModel.fetchUsersAndOrgs().catch(reportError)
       });
     }
   }
 
   public isSupport() {
-    return this.currentValidUser?.email === SUPPORT_EMAIL;
+    return Boolean(this.currentValidUser?.isSupport);
   }
 
   public isBillingManager() {
     return Boolean(this.currentOrg?.billingAccount?.isManager);
   }
 
+  public isOwner() {
+    return Boolean(this.currentOrg && isOwner(this.currentOrg));
+  }
+
+  public isOwnerOrEditor() {
+    return Boolean(this.currentOrg && isOwnerOrEditor(this.currentOrg));
+  }
+
+  public isInstallAdmin(): boolean {
+    return Boolean(this.currentUser?.isInstallAdmin);
+  }
+
   /**
    * Fetch and update the current org's usage.
    */
   public async refreshOrgUsage() {
-    const currentOrg = this.currentOrg;
-    if (!isOwner(currentOrg)) {
+    if (!this.isOwner()) {
       // Note: getOrgUsageSummary already checks for owner access; we do an early return
       // here to skip making unnecessary API calls.
       return;
     }
 
-    const usage = await this.api.getOrgUsageSummary(currentOrg.id);
+    const usage = await this.api.getOrgUsageSummary(this.currentOrg!.id);
     if (!this.isDisposed()) {
       this.currentOrgUsage.set(usage);
     }
+  }
+
+  public dismissPopup(name: DismissedPopup, isSeen: boolean): void {
+    markAsSeen(this.dismissedPopups, name, isSeen);
+  }
+
+  public async switchUser(user: FullUser, org?: string) {
+    await this.api.setSessionActive(user.email, org);
+    this.lastVisitedOrgDomain.set(null);
+  }
+
+  public isFreePlan() {
+    return isFreePlan(this.planName || '');
+  }
+
+  private _updateLastVisitedOrgDomain({doc, org}: IGristUrlState, availableOrgs: Organization[]) {
+    if (
+      !org ||
+      // Invalid or inaccessible sites shouldn't be counted as visited.
+      !this.currentOrg ||
+      // Visits to a document shouldn't be counted either.
+      doc
+    ) {
+      return;
+    }
+
+    // Only count sites that a user has access to (i.e. those listed in the Site Switcher).
+    if (!availableOrgs.some(({domain}) => domain === org)) { return; }
+
+    this.lastVisitedOrgDomain.set(org);
   }
 
   /**
@@ -315,16 +522,70 @@ export class AppModelImpl extends Disposable implements AppModel {
   }
 }
 
-export function getHomeUrl(): string {
-  const {host, protocol} = window.location;
-  const gristConfig: any = (window as any).gristConfig;
-  return (gristConfig && gristConfig.homeUrl) || `${protocol}//${host}`;
-}
-
 export function getOrgNameOrGuest(org: Organization|null, user: FullUser|null) {
   if (!org) { return ''; }
   if (user && user.anonymous && org.owner && org.owner.id === user.id) {
     return "@Guest";
   }
   return getOrgName(org);
+}
+
+/**
+ * If we don't know what the home URL is, the top level of the site
+ * we are on may work. This should always work for single-server installs
+ * that don't encode organization information in domains. Even for other
+ * cases, this should be a good enough home URL for many purposes, it
+ * just may still have some organization information encoded in it from
+ * the domain that could influence results that might be supposed to be
+ * organization-neutral.
+ */
+export function getFallbackHomeUrl(): string {
+  const {host, protocol} = window.location;
+  return `${protocol}//${host}`;
+}
+
+/**
+ * Get the official home URL sent to us from the back end.
+ */
+export function getConfiguredHomeUrl(): string {
+  const gristConfig: any = (window as any).gristConfig;
+  return (gristConfig && gristConfig.homeUrl) || getFallbackHomeUrl();
+}
+
+/**
+ * Get the home URL, using fallback on the admin case and in the
+ * single-domain case case.
+ */
+export function getPreferredHomeUrl(): string|undefined {
+  const gristUrl = urlState().state.get();
+  const gristConfig: GristLoadConfig = (window as any).gristConfig;
+  if (gristUrl.adminPanel || gristConfig?.serveSameOrigin) {
+    // On the admin panel, we should not trust configuration much,
+    // since we want the user to be able to access it to diagnose
+    // problems with configuration. So we access the API via the
+    // site we happen to be on rather than anything configured on
+    // the back end.
+    //
+    // We can also do this in the common self-hosted case of a single
+    // domain, no orgs encoded in subdomains.
+    //
+    // Couldn't we just always do this? Maybe! It could require
+    // adjustments for calls that are meant to be site-neutral if the
+    // domain has an org encoded in it. But that's a small price to
+    // pay. Grist Labs uses a setup where api calls go to a dedicated
+    // domain distinct from all other sites, but there's no particular
+    // advantage to it.
+    return getFallbackHomeUrl();
+  }
+  return getConfiguredHomeUrl();
+}
+
+export function getHomeUrl(): string {
+  return getPreferredHomeUrl() || getConfiguredHomeUrl();
+}
+
+export function newUserAPIImpl(): UserAPIImpl {
+  return new UserAPIImpl(getHomeUrl(), {
+    fetch: hooks.fetch,
+  });
 }

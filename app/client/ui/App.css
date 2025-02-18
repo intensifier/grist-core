@@ -9,7 +9,8 @@ body {
   font-size: 1.2rem;
   margin: 0;
   padding: 0;
-  background: url('img/gplaypattern.png');
+  background: var(--grist-theme-bg, url('img/gplaypattern.png'));
+  background-color: var(--grist-theme-bg-color, unset);
 }
 
 .g-help {
@@ -18,7 +19,7 @@ body {
   left: 10%;
   height: 80%;
   width: 80%;
-  z-index: 999;
+  z-index: var(--grist-modal-z-index);
 
   padding: 1rem;
 

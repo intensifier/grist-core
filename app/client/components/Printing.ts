@@ -2,6 +2,7 @@ import {CustomView} from 'app/client/components/CustomView';
 import {DataRowModel} from 'app/client/models/DataRowModel';
 import DataTableModel from 'app/client/models/DataTableModel';
 import {ViewSectionRec} from 'app/client/models/DocModel';
+import {prefersColorSchemeDark, prefersColorSchemeDarkObs} from 'app/client/ui2018/theme';
 import {dom} from 'grainjs';
 
 type RowId = number|'new';
@@ -36,6 +37,16 @@ export async function printViewSection(layout: any, viewSection: ViewSectionRec)
   }
 
   function prepareToPrint(onOff: boolean) {
+    // window.print() is a blocking call, which means our listener for the
+    // `prefers-color-scheme: dark` media feature will not receive any updates for the
+    // duration that the print dialog is shown. This proves problematic since an event is
+    // sent just before the blocking call containing a value of false, regardless of the
+    // user agent's color scheme preference. It's not clear why this happens, but the result
+    // is Grist temporarily reverting to the light theme until the print dialog is dismissed.
+    // As a workaround, we'll temporarily pause our listener, and unpause after the print dialog
+    // is dismissed.
+    prefersColorSchemeDarkObs().pause();
+
     // Hide all layout boxes that do NOT contain the section to be printed.
     layout?.forEachBox((box: any) => {
       if (!box.dom.contains(sectionElem)) {
@@ -64,7 +75,7 @@ export async function printViewSection(layout: any, viewSection: ViewSectionRec)
   }
 
   const sub1 = dom.onElem(window, 'beforeprint', () => prepareToPrint(true));
-  const sub2 = dom.onElem(window, 'afterprint', () => {
+  const sub2 = dom.onElem(window, 'afterprint', (window as any).afterPrintCallback = () => {
     sub1.dispose();
     sub2.dispose();
     // To debug printing, set window.debugPrinting=1 in the console, then print a section, dismiss
@@ -75,6 +86,11 @@ export async function printViewSection(layout: any, viewSection: ViewSectionRec)
     } else {
       prepareToPrint(false);
     }
+    delete (window as any).afterPrintCallback;
+    prefersColorSchemeDarkObs().pause(false);
+
+    // This may have changed while window.print() was blocking.
+    prefersColorSchemeDarkObs().set(prefersColorSchemeDark());
   });
 
   // Running print on a timeout makes it possible to test printing using selenium, and doesn't

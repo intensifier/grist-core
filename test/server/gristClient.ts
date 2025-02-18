@@ -1,8 +1,10 @@
 import { DocAction } from 'app/common/DocActions';
+import { DocData } from 'app/common/DocData';
+import { SchemaTypes } from 'app/common/schema';
 import { FlexServer } from 'app/server/lib/FlexServer';
 import axios from 'axios';
 import pick = require('lodash/pick');
-import WebSocket from 'ws';
+import {GristClientSocket} from 'app/client/components/GristClientSocket';
 
 interface GristRequest {
   reqId: number;
@@ -28,12 +30,13 @@ export class GristClient {
 
   private _requestId: number = 0;
   private _pending: Array<GristResponse|GristMessage> = [];
+  private _docData?: DocData;  // accumulate tabular info like a real client.
   private _consumer: () => void;
   private _ignoreTrivialActions: boolean = false;
 
-  constructor(public ws: any) {
-    ws.onmessage = (data: any) => {
-      const msg = pick(JSON.parse(data.data),
+  constructor(public ws: GristClientSocket) {
+    ws.onmessage = (data: string) => {
+      const msg = pick(JSON.parse(data),
                        ['reqId', 'error', 'errorCode', 'data', 'type', 'docFD']);
       if (this._ignoreTrivialActions && msg.type === 'docUserAction' &&
           msg.data?.actionGroup?.internal === true &&
@@ -41,6 +44,17 @@ export class GristClient {
         return;
       }
       this._pending.push(msg);
+      if (msg.data?.doc) {
+        this._docData = new DocData(() => {
+          throw new Error('no fetches');
+        }, msg.data.doc);
+      }
+      if (this._docData && msg.type === 'docUserAction') {
+        const docActions = msg.data?.docActions || [];
+        for (const docAction of docActions) {
+          this._docData.receiveAction(docAction);
+        }
+      }
       if (this._consumer) { this._consumer(); }
     };
   }
@@ -63,6 +77,15 @@ export class GristClient {
 
   public count() {
     return this._pending.length;
+  }
+
+  public get docData() {
+    if (!this._docData) { throw new Error('no DocData'); }
+    return this._docData;
+  }
+
+  public getMetaRecords(tableId: keyof SchemaTypes) {
+    return this.docData.getMetaTable(tableId).getRecords();
   }
 
   public async read(): Promise<any> {
@@ -97,6 +120,11 @@ export class GristClient {
     }
   }
 
+  public waitForServer() {
+    // send an arbitrary failing message and wait for response.
+    return this.send('ping');
+  }
+
   // Helper to read the next docUserAction ignoring anything else (e.g. a duplicate clientConnect).
   public async readDocUserAction(): Promise<DocAction[]> {
     while (true) {    // eslint-disable-line no-constant-condition
@@ -121,7 +149,6 @@ export class GristClient {
   }
 
   public async close() {
-    this.ws.terminate();
     this.ws.close();
   }
 
@@ -139,7 +166,7 @@ export async function openClient(server: FlexServer, email: string, org: string,
   const headers: Record<string, string> = {};
   if (!emailHeader) {
     const resp = await axios.get(`${server.getOwnUrl()}/test/session`);
-    const cookie = resp.headers['set-cookie'][0];
+    const cookie = resp.headers['set-cookie']![0];
     if (email !== 'anon@getgrist.com') {
       const cid = decodeURIComponent(cookie.split('=')[1].split(';')[0]);
       const comm = server.getComm();
@@ -152,17 +179,19 @@ export async function openClient(server: FlexServer, email: string, org: string,
   } else {
     headers[emailHeader] = email;
   }
-  const ws = new WebSocket('ws://localhost:' + server.getOwnPort() + `/o/${org}`, {
+  const ws = new GristClientSocket('ws://localhost:' + server.getOwnPort() + `/o/${org}`, {
     headers
   });
   const client = new GristClient(ws);
   await new Promise(function(resolve, reject) {
-    ws.on('open', function() {
+    ws.onopen = function() {
+      ws.onerror = null;
       resolve(ws);
-    });
-    ws.on('error', function(err: any) {
+    };
+    ws.onerror = function(err: Error) {
+      ws.onopen = null;
       reject(err);
-    });
+    };
   });
   return client;
 }

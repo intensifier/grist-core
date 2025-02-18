@@ -2,18 +2,12 @@ declare module "app/client/components/AceEditor";
 declare module "app/client/components/Clipboard";
 declare module "app/client/components/CodeEditorPanel";
 declare module "app/client/components/DetailView";
-declare module "app/client/components/DocConfigTab";
 declare module "app/client/components/GridView";
-declare module "app/client/components/Layout";
-declare module "app/client/components/LayoutEditor";
-declare module "app/client/components/commandList";
 declare module "app/client/lib/Mousetrap";
 declare module "app/client/lib/browserGlobals";
 declare module "app/client/lib/dom";
 declare module "app/client/lib/koDom";
 declare module "app/client/lib/koForm";
-declare module "app/client/widgets/UserType";
-declare module "app/client/widgets/UserTypeImpl";
 
 // tslint:disable:max-classes-per-file
 
@@ -30,17 +24,21 @@ declare module "app/client/components/Base" {
 
 declare module "app/client/components/BaseView" {
 
-  import {Cursor, CursorPos} from 'app/client/components/Cursor';
+  import {Cursor} from 'app/client/components/Cursor';
   import {GristDoc} from 'app/client/components/GristDoc';
+  import {IGristUrlState} from 'app/common/gristUrls';
+  import {SelectionSummary} from 'app/client/components/SelectionSummary';
   import {Disposable} from 'app/client/lib/dispose';
   import BaseRowModel from "app/client/models/BaseRowModel";
   import {DataRowModel} from 'app/client/models/DataRowModel';
   import {LazyArrayModel} from "app/client/models/DataTableModel";
   import DataTableModel from "app/client/models/DataTableModel";
-  import {ViewSectionRec} from "app/client/models/DocModel";
+  import {ViewFieldRec, ViewSectionRec} from "app/client/models/DocModel";
   import {FilterInfo} from 'app/client/models/entities/ViewSectionRec';
   import {SortedRowSet} from 'app/client/models/rowset';
+  import {IColumnFilterMenuOptions} from 'app/client/ui/ColumnFilterMenu';
   import {FieldBuilder} from "app/client/widgets/FieldBuilder";
+  import {CursorPos} from 'app/plugin/GristAPI';
   import {DomArg} from 'grainjs';
   import {IOpenController} from 'popweasel';
 
@@ -57,23 +55,61 @@ declare module "app/client/components/BaseView" {
     public gristDoc: GristDoc;
     public cursor: Cursor;
     public sortedRows: SortedRowSet;
+    public rowSource: RowSource;
     public activeFieldBuilder: ko.Computed<FieldBuilder>;
+    public selectedColumns: ko.Computed<ViewFieldRec[]>|null;
     public disableEditing: ko.Computed<boolean>;
     public isTruncated: ko.Observable<boolean>;
     public tableModel: DataTableModel;
+    public selectionSummary?: SelectionSummary;
+    public currentEditingColumnIndex: ko.Observable<number>;
 
     constructor(gristDoc: GristDoc, viewSectionModel: any, options?: {addNewRow?: boolean, isPreview?: boolean});
     public setCursorPos(cursorPos: CursorPos): void;
-    public createFilterMenu(ctl: IOpenController, filterInfo: FilterInfo, onClose?: () => void): HTMLElement;
+    public createFilterMenu(ctl: IOpenController, filterInfo: FilterInfo,
+      options?: IColumnFilterMenuOptions): HTMLElement;
     public buildTitleControls(): DomArg;
     public getLoadingDonePromise(): Promise<void>;
     public activateEditorAtCursor(options?: Options): void;
+    public openDiscussionAtCursor(discussionId?: number): boolean;
     public onResize(): void;
     public prepareToPrint(onOff: boolean): void;
     public moveEditRowToCursor(): DataRowModel;
     public scrollToCursor(sync: boolean): Promise<void>;
+    public getAnchorLinkForSection(sectionId: number): IGristUrlState;
+    public viewSelectedRecordAsCard(): void;
+    public isRecordCardDisabled(): boolean;
   }
   export = BaseView;
+}
+
+declare module 'app/client/components/GridView' {
+  import BaseView from 'app/client/components/BaseView';
+  import {GristDoc} from 'app/client/components/GristDoc';
+  import {ColInfo, NewColInfo} from 'app/client/models/entities/ViewSectionRec';
+
+  interface InsertColOptions {
+    colInfo?: ColInfo;
+    index?: number;
+    skipPopup?: boolean;
+    onPopupClose?: () => void;
+  }
+
+  namespace GridView {}
+
+  class GridView extends BaseView {
+    public static create(...args: any[]): any;
+
+    public gristDoc: GristDoc;
+
+    constructor(gristDoc: GristDoc, viewSectionModel: any, isPreview?: boolean);
+    public insertColumn(
+      colId?: string|null,
+      options?: InsertColOptions,
+    ): Promise<NewColInfo>;
+    public showColumn(colRef: number, index?: number): Promise<void>;
+  }
+  export = GridView;
 }
 
 declare module "app/client/components/ViewConfigTab" {
@@ -92,31 +128,15 @@ declare module "app/client/components/ViewConfigTab" {
 
   class ViewConfigTab extends Disposable {
     constructor(options: {gristDoc: GristDoc, viewModel: ViewRec});
-    public buildSortDom(): DomContents;
+    public buildSortFilterDom(): DomContents;
     // TODO: these should be made private or renamed.
     public _buildAdvancedSettingsDom(): DomArg;
-    public _buildFilterDom(): DomArg;
     public _buildThemeDom(): DomArg;
     public _buildChartConfigDom(): DomContents;
     public _buildLayoutDom(): DomArg;
     public _buildCustomTypeItems(): DomArg;
   }
   export = ViewConfigTab;
-}
-
-declare module "app/client/components/commands" {
-  export class Command {
-    public name: string;
-    public desc: string;
-    public humanKeys: string[];
-    public keys: string[];
-    public run: () => any;
-  }
-
-  export type CommandsGroup = any;
-  export const init: any;
-  export const allCommands: any;
-  export const createGroup: any;
 }
 
 declare module "app/client/models/BaseRowModel" {
@@ -139,10 +159,19 @@ declare module "app/client/models/BaseRowModel" {
 
 declare module "app/client/models/MetaRowModel" {
   import BaseRowModel from "app/client/models/BaseRowModel";
+  import {ColValues} from 'app/common/DocActions';
+  import {SchemaTypes} from 'app/common/schema';
+
+  type NPartial<T> = {
+    [P in keyof T]?: T[P]|null;
+  };
+  type Values<T> = T extends keyof SchemaTypes ? NPartial<SchemaTypes[T]> : ColValues;
+
   namespace MetaRowModel {}
-  class MetaRowModel extends BaseRowModel {
+  class MetaRowModel<TName extends (keyof SchemaTypes)|undefined = undefined> extends BaseRowModel {
     public _isDeleted: ko.Observable<boolean>;
     public events: { trigger: (key: string) => void };
+    public updateColValues(colValues: Values<TName>): Promise<void>;
   }
   export = MetaRowModel;
 }
@@ -176,6 +205,7 @@ declare module "app/client/models/modelUtil" {
     prop(propName: string): KoSaveableObservable<any>;
   }
 
+  function objObservable<T>(obs: ko.KoSaveableObservable<T>): SaveableObjObservable<T>;
   function objObservable<T>(obs: ko.Observable<T>): ObjObservable<T>;
   function jsonObservable(obs: KoSaveableObservable<string>,
                           modifierFunc?: any, optContext?: any): SaveableObjObservable<any>;
@@ -303,4 +333,8 @@ interface Location {
   // We use reload(true) in places, which has an effect in Firefox, but may be more of a
   // historical accident than an intentional choice.
   reload(forceGet?: boolean): void;
+}
+
+interface JQuery {
+  datepicker(options: unknown): JQuery;
 }

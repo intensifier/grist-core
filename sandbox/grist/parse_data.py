@@ -15,6 +15,7 @@ import six
 from six.moves import zip, xrange
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.WARNING)
 
 
 # Typecheck using type(value) instead of isinstance(value, some_type) makes parsing 25% faster
@@ -76,6 +77,20 @@ class NumericConverter(BaseConverter):
     return ("Numeric", values)
 
 
+class BooleanConverter(BaseConverter):
+  """Handles the Grist Bool type"""
+
+  @classmethod
+  def convert(cls, value):
+    if value is False or value is True:
+      return value
+    raise ValueError()
+
+  @classmethod
+  def get_grist_column(cls, values):
+    return ("Bool", values)
+
+
 class SimpleDateTimeConverter(BaseConverter):
   """Handles Date and DateTime values which are already instances of datetime.datetime."""
 
@@ -83,7 +98,7 @@ class SimpleDateTimeConverter(BaseConverter):
   def convert(cls, value):
     if type(value) is datetime.datetime:
       return value
-    elif not value:
+    elif value is None:
       return None
     raise ValueError()
 
@@ -123,7 +138,7 @@ class ColumnDetector(object):
   """
   # Converters are listed in the order of preference, which is only used if two converters succeed
   # on the same exact number of values. Text is always a fallback.
-  converters = [SimpleDateTimeConverter, NumericConverter]
+  converters = [SimpleDateTimeConverter, BooleanConverter, NumericConverter]
 
   # If this many non-junk values or more can't be converted, fall back to text.
   _text_threshold = 0.10
@@ -181,6 +196,12 @@ class ColumnConverter(object):
     # For some reason, we get 'str' type rather than 'unicode' for empty strings.
     # Correct this, since all text should be unicode.
     value = u"" if value == "" else value
+
+    # Integer values sometimes show up as ints (from Excel), sometimes as floats (from Google).
+    # Make them consistently ints; this avoid addition of ".0" suffix when converting to text.
+    if type(value) == float and value.is_integer():
+      value = int(value)
+
     try:
       conv = self._converter.convert(value)
       self._converted_values.append(conv)

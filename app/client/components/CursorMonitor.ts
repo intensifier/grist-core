@@ -1,9 +1,9 @@
-import {CursorPos} from 'app/client/components/Cursor';
 import {GristDoc} from 'app/client/components/GristDoc';
-import {getStorage} from 'app/client/lib/localStorageObs';
+import {getStorage} from 'app/client/lib/storage';
 import {IDocPage, isViewDocPage, ViewDocPage} from 'app/common/gristUrls';
 import {Disposable, Listener, Observable} from 'grainjs';
 import {reportError} from 'app/client/models/errors';
+import {CursorPos} from 'app/plugin/GristAPI';
 
 /**
  * Enriched cursor position with a view id
@@ -59,7 +59,12 @@ export class CursorMonitor extends Disposable {
       if (!this._restored) { return; }
       // store position only when we have valid rowId
       // for some views (like CustomView) cursor position might not reflect actual row
-      if (pos && pos.rowId !== undefined) { this._storePosition(pos); }
+      if (pos && pos.rowId !== undefined) {
+        if (pos.sectionId) {
+          pos = {...pos, linkingRowIds: doc.getLinkingRowIds(pos.sectionId)};
+        }
+        this._storePosition(pos);
+      }
     }));
   }
 
@@ -93,6 +98,11 @@ export class CursorMonitor extends Disposable {
     }
     const position = this._readPosition(viewId);
     if (position) {
+      // Don't restore position if this is a collapsed section.
+      const collapsed = doc.viewModel.activeCollapsedSections.peek();
+      if (position.sectionId && collapsed.includes(position.sectionId)) {
+        return;
+      }
       // Ignore error with finding desired cell.
       await doc.recursiveMoveToCursorPos(position, true, true);
     }

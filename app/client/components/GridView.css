@@ -1,4 +1,5 @@
 .gridview_data_pane {
+  background-color: var(--grist-theme-table-body-bg, white);
   position: relative;
   width: 100%;
   overflow: hidden;
@@ -21,8 +22,8 @@
   overflow: auto;
   overscroll-behavior: none;
 
-  z-index: 2; /* scrollbar should be over the overlay background */
-  border-top: 1px solid lightgrey;
+  z-index: 20; /* scrollbar should be over the overlay background */
+  border-top: 1px solid var(--grist-theme-table-header-border, lightgrey);
 }
 
 .gridview_data_pane > .gridview_data_scroll {
@@ -35,7 +36,7 @@
   position: -webkit-sticky;
   position: sticky;
   top: 0px;
-  z-index: 2; /* z-index must be here, doesnt work on children*/
+  z-index: 20; /* z-index must be here, doesnt work on children*/
 }
 
 .gridview_data_header {
@@ -43,12 +44,12 @@
 }
 
 .gridview_corner_spacer { /* spacer in .gridview_data_header */
-  width: 4rem; /* matches row_num width */
+  width: 52px; /* matches row_num width */
   flex: none;
 }
 
 .field.column_name {
-  border-bottom: 1px solid lightgray;
+  border-bottom: 1px solid var(--grist-theme-table-header-border, lightgray);
   line-height: var(--gridview-header-height);
   height: calc(var(--gridview-header-height) + 1px); /* Also should match height for overlay elements */
 }
@@ -67,12 +68,13 @@
   position: sticky;
   left: 0px;
   overflow: hidden;
-  width: 4rem; /* Also should match width for .gridview_header_corner, and the overlay elements */
+  width: 52px; /* Also should match width for .gridview_header_corner, and the overlay elements */
   flex: none;
 
-  border-bottom: 1px solid var(--grist-color-dark-grey);
-  background-color: var(--grist-color-light-grey);
-  z-index: 2; /* goes over data cells */
+  border-bottom: 1px solid var(--grist-theme-table-header-border, lightgray);
+  color: var(--grist-theme-table-header-fg, unset);
+  background-color: var(--grist-theme-table-header-bg, var(--grist-color-light-grey));
+  z-index: 20; /* goes over data cells */
 
   padding-top: 2px;
   text-align: center;
@@ -129,7 +131,7 @@
     border-left: 1px solid var(--grist-color-dark-grey);
   }
   .print-widget .gridview_data_header {
-    padding-left: 4rem !important;
+    padding-left: 52px !important;
   }
   .print-widget .gridview_data_pane .print-all-rows {
     display: table-row-group;
@@ -149,15 +151,15 @@
 .scroll_shadow_top,
 .scroll_shadow_left {
   position:absolute;
-  background-color: var(--grist-color-light-grey) !important;
+  background-color: var(--grist-theme-table-header-bg, var(--grist-color-light-grey)) !important;
 }
 
 .gridview_data_corner_overlay {
-  width: 4rem;
+  width: 52px;
   height: calc(var(--gridview-header-height) + 1px); /* matches gridview_data_header height (+border) */
   top: 1px; /* go under 1px border on scrollpane */
-  border-bottom: 1px solid lightgray;
-  z-index: 3;
+  border-bottom: 1px solid var(--grist-theme-table-header-border, lightgray);
+  z-index: 30;
   cursor: pointer;
 }
 
@@ -175,23 +177,23 @@
      - frozen-offset: when frozen columns are wider then the screen, we want them to move left initially,
                       this value is the position where this movement should stop.
    */
-  left: calc(4em + (var(--frozen-width, 0) - min(var(--frozen-scroll-offset, 0), var(--frozen-offset, 0))) * 1px);
-  box-shadow: -6px 0 6px 6px #444;
+  left: calc(52px + (var(--frozen-width, 0) - min(var(--frozen-scroll-offset, 0), var(--frozen-offset, 0))) * 1px);
+  box-shadow: -6px 0 6px 6px var(--grist-theme-table-scroll-shadow, #444);
   /* shadow should only show to the right of it (10px should be enough) */
   -webkit-clip-path: polygon(0 0, 10px 0, 10px 100%, 0 100%);
   clip-path: polygon(0 0, 10px 0, 10px 100%, 0 100%);
-  z-index: 3;
+  z-index: 30;
 }
 
 /* Right shadow - normally not displayed - activated when grid has frozen columns */
 .scroll_shadow_frozen {
   height: 100%;
   width: 0px;
-  left: 4em;
-  box-shadow: -8px 0 14px 4px #444;
+  left: 52px;
+  box-shadow: -8px 0 14px 4px var(--grist-theme-table-scroll-shadow, #444);
   -webkit-clip-path: polygon(0 0, 10px 0, 10px 100%, 0 100%);
   clip-path: polygon(0 0, 28px 0, 24px 100%, 0 100%);
-  z-index: 3;
+  z-index: 30;
   position: absolute;
 }
 
@@ -203,9 +205,9 @@
   /* this value is the same as for the left shadow - but doesn't need to really on the scroll offset
      as this component will be hidden when the scroll starts
    */
-  left: calc(4em + var(--frozen-width, 0) * 1px);
-  background-color: #999999;
-  z-index: 3;
+  left: calc(52px + var(--frozen-width, 0) * 1px);
+  background-color: var(--grist-theme-table-frozen-columns-border, #999999);
+  z-index: 30;
   user-select: none;
   pointer-events: none
 }
@@ -215,28 +217,28 @@
   height: 0;
   width: 100%; /* needs to be wide enough to flow off the side*/
   top: calc(var(--gridview-header-height) + 1px); /* matches gridview_data_header height (+border) */
-  box-shadow: 0 -6px 6px 6px #444;
+  box-shadow: 0 -6px 6px 6px var(--grist-theme-table-scroll-shadow, #444);
 
   /* should only show below it (10px should be enough) */
   -webkit-clip-path: polygon(0 0, 0 10px, 100% 10px, 100% 0);
   clip-path: polygon(0 0, 0 10px, 100% 10px, 100% 0);
-  z-index: 3;
+  z-index: 30;
 }
 
 .gridview_header_backdrop_left {
-  width: calc(4rem + 1px); /* Matches rowid width (+border) */
+  width: calc(52px + 1px); /* Matches rowid width (+border) */
   height:100%;
   top: 1px; /* go under 1px border on scrollpane */
-  z-index: 1;
-  border-right: 1px solid lightgray;
+  z-index: 10;
+  border-right: 1px solid var(--grist-theme-table-header-border, lightgray);
 }
 
 .gridview_left_border {
   position: absolute;
   width: 0px; /* Matches rowid width (+border) */
   height: 100%;
-  z-index: 3;
-  border-right: 1px solid var(--grist-color-dark-grey) !important;
+  z-index: 30;
+  border-right: 1px solid var(--grist-theme-table-body-border, var(--grist-color-dark-grey)) !important;
   user-select: none;
   pointer-events: none
 }
@@ -245,8 +247,8 @@
   width: 100%;
   height: calc(var(--gridview-header-height) + 1px); /* matches gridview_data_header height (+border) */
   top: 1px; /* go under 1px border on scrollpane */
-  border-bottom: 1px solid lightgray;
-  z-index: 1;
+  border-bottom: 1px solid var(--grist-theme-table-header-border, lightgray);
+  z-index: 10;
 }
 
 .gridview_data_pane > .scroll_shadow_top {
@@ -266,8 +268,8 @@
   width: 0px;
   height: 100%;
   position: absolute;
-  border: 2px solid gray;
-  z-index: 20;
+  border: 2px solid var(--grist-theme-table-drag-drop-indicator, gray);
+  z-index: 200;
   top: 0px;
 }
 
@@ -275,19 +277,20 @@
   width: 0px;
   height: 100%;
   position: absolute;
-  border: 1px solid gray;
-  z-index: 15;
+  border: 1px solid var(--grist-theme-table-drag-drop-indicator, gray);
+  z-index: 150;
   top: 0px;
-  background-color: #F0F0F0;
+  background-color: var(--grist-theme-table-drag-drop-shadow, #F0F0F0);
   opacity: 0.5;
+  pointer-events: none;   /* allow scrolling the grid while column_shadow is under the cursor */
 }
 
 .row_indicator_line{
   width: 100%;
   height: 0px;
   position: absolute;
-  border: 2px solid gray;
-  z-index: 20;
+  border: 2px solid var(--grist-theme-table-drag-drop-indicator, gray);
+  z-index: 200;
   left: 0px;
 }
 
@@ -295,10 +298,10 @@
   width: 100%;
   height: 0px;
   position: absolute;
-  border: 1px solid gray;
-  z-index: 15;
+  border: 1px solid var(--grist-theme-table-drag-drop-indicator, gray);
+  z-index: 150;
   left: 0px;
-  background-color: #F0F0F0;
+  background-color: var(--grist-theme-table-drag-drop-shadow, #F0F0F0);
   opacity: 0.5;
   pointer-events: none; /* prevents row drag shadow from stealing row headers clicks */
 }
@@ -308,13 +311,16 @@
 /* style header and a data field */
 .record .field.frozen {
   position: sticky;
-  left: calc(4em + 1px + (var(--frozen-position, 0) - var(--frozen-offset, 0)) * 1px); /* 4em for row number + total width of cells + 1px for border*/
-  z-index: 1;
+  left: calc(52px + 1px + (var(--frozen-position, 0) - var(--frozen-offset, 0)) * 1px); /* 52px (4em) for row number + total width of cells + 1px for border*/
+  z-index: 10;
 }
-
 /* for data field we need to reuse color from record (add-row and zebra stripes) */
 .gridview_row .record .field.frozen {
-  background-color: inherit;
+  background-color: var(--field-background-color, inherit);
+}
+
+.gridview_row .record.record-add .field.frozen {
+  background-color: inherit !important;  /* important to win over zebra stripes */
 }
 
 /* HACK: add box shadow to fix outline overflow from active cursor */
@@ -323,12 +329,7 @@
 }
 
 .gridview_row .record.record-hlines .field.frozen {
-  box-shadow: 0px 1px 0px var(--grist-color-dark-grey);
-}
-
-/* selected field has a transparent color - with frozen fields we can't do it */
-.gridview_row .field.frozen.selected {
-  background-color: var(--grist-color-selection-opaque);
+  box-shadow: 0px 1px 0px var(--grist-theme-table-body-border, var(--grist-color-dark-grey));
 }
 
 /* make room for a frozen line by adding margin to first not frozen field - in header and in data */
@@ -342,28 +343,34 @@
     background: white !important;
   }
   .column_names .column_name.frozen {
-    background: var(--grist-color-light-grey) !important;
+    background: var(--grist-theme-table-header-bg, var(--grist-color-light-grey)) !important;
   }
 }
 
-/* Column hover effect */
+/* Highlight the entire column when the "Click to insert" tooltip is shown. */
+.column_name.hover-column > .selection,
+.column_name.hover-column.selected > .selection,
+.gridview_row .field.hover-column > .selection {
+  background-color: var(--grist-theme-selection, var(--grist-color-selection));
+  inset: 0;
+  position: absolute;
+}
 
-.gridview_row .field.hover-column, /* normal field in a row */
-.gridview_row .field.frozen.hover-column, /* frozen field in a row */
-.column_name.hover-column, /* column name */
-.column_name.hover-column.selected /* selected column name */ {
-  /* for frozen fields can't use alpha channel */
-  background-color: var(--grist-color-selection-opaque);
+/* Use a darker highlight if the column is being transformed. */
+.gridview_row .field.transform_field.hover-column > .selection {
+  background-color: var(--grist-theme-selection-darkest, rgba(22,179,120,0.35));
+  inset: 0;
+  position: absolute;
 }
-/* For zebra stripes, make the selection little darker */
-.record-zebra.record-even .field.hover-column {
-  background-color: var(--grist-color-selection-darker-opaque);
-}
-/* When column has a hover, remove menu button. */
+
+/* And hide the column menu button. */
 .column_name.hover-column .menu_toggle {
   visibility: hidden;
 }
 
+.column_name .menu_toggle {
+  z-index: 1;
+}
 /* Etc */
 
 .g-column-main-menu {
@@ -393,4 +400,29 @@
   border-right-width: 1px;
   min-width: 40px;
   padding-right: 12px;
+}
+
+.g-column-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.g-column-label .info_toggle_icon {
+  width: 13px;
+  height: 13px;
+  margin-right: 4px;
+  z-index: 1;
+}
+
+.g-column-label .kf_editable_label {
+  padding-left: 1px;
+  padding-right: 1px;
+  z-index: 1;
+}
+
+.g-column-label-spacer {
+  width: calc(13px + 4px + 4px);
+  height: 17px;
+  flex-shrink: 100;
 }

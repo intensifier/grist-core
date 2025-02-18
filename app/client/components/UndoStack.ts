@@ -1,14 +1,17 @@
-import {CursorPos} from 'app/client/components/Cursor';
 import {GristDoc} from 'app/client/components/GristDoc';
 import * as dispose from 'app/client/lib/dispose';
 import {MinimalActionGroup} from 'app/common/ActionGroup';
 import {PromiseChain, setDefault} from 'app/common/gutil';
+import {CursorPos} from 'app/plugin/GristAPI';
 import {fromKo, Observable} from 'grainjs';
 import * as ko from 'knockout';
 import sortBy = require('lodash/sortBy');
 
 export interface ActionGroupWithCursorPos extends MinimalActionGroup {
   cursorPos?: CursorPos;
+  // For operations not done by the server, we supply a function to
+  // handle them.
+  op?: (ag: MinimalActionGroup, isUndo: boolean) => Promise<void>;
 }
 
 // Provides observables indicating disabled state for undo/redo.
@@ -22,13 +25,13 @@ export interface IUndoState {
  * position in this stack. Undo and redo actions are generated and sent to the server here.
  */
 export class UndoStack extends dispose.Disposable {
-
+  public isDisabled: Observable<boolean>;
   public undoDisabledObs: ko.Observable<boolean>;
   public redoDisabledObs: ko.Observable<boolean>;
   private _gristDoc: GristDoc;
   private _stack: ActionGroupWithCursorPos[];
   private _pointer: number;
-  private _linkMap: Map<number, MinimalActionGroup[]>;
+  private _linkMap: Map<number, ActionGroupWithCursorPos[]>;
 
   // Chain of promises which send undo actions to the server. This delays the execution of the
   // next action until the current one has been received and moved the pointer index.
@@ -36,6 +39,8 @@ export class UndoStack extends dispose.Disposable {
 
   public create(log: MinimalActionGroup[], options: {gristDoc: GristDoc}) {
     this._gristDoc = options.gristDoc;
+
+    this.isDisabled = Observable.create(this, false);
 
     // TODO: _stack and _linkMap grow without bound within a single session.
     // The top of the stack is stack.length - 1. The pointer points above the most
@@ -96,13 +101,25 @@ export class UndoStack extends dispose.Disposable {
   }
 
   // Send an undo action. This should be called when the user presses 'undo'.
-  public sendUndoAction(): Promise<void> {
+  public async sendUndoAction(): Promise<void> {
+    if (this.isDisabled.get()) { return; }
+
     return this._undoChain.add(() => this._sendAction(true));
   }
 
   // Send a redo action. This should be called when the user presses 'redo'.
-  public sendRedoAction(): Promise<void> {
+  public async sendRedoAction(): Promise<void> {
+    if (this.isDisabled.get()) { return; }
+
     return this._undoChain.add(() => this._sendAction(false));
+  }
+
+  public enable(): void {
+    this.isDisabled.set(false);
+  }
+
+  public disable(): void {
+    this.isDisabled.set(true);
   }
 
   private async _sendAction(isUndo: boolean): Promise<void> {
@@ -119,11 +136,17 @@ export class UndoStack extends dispose.Disposable {
       // responsive, then again when the action is done. The second jump matters more for most
       // changes, but the first is the important one when Undoing an AddRecord.
       this._gristDoc.moveToCursorPos(ag.cursorPos, ag).catch(() => { /* do nothing */ });
-      await this._gristDoc.docComm.applyUserActionsById(
-        actionGroups.map(a => a.actionNum),
-        actionGroups.map(a => a.actionHash),
-        isUndo,
-        { otherId: ag.actionNum });
+      if (actionGroups.length === 1 && actionGroups[0].op) {
+        // this is an internal operation, rather than one done by the server,
+        // so we can't ask the server to undo it.
+        await actionGroups[0].op(actionGroups[0], isUndo);
+      } else {
+        await this._gristDoc.docComm.applyUserActionsById(
+          actionGroups.map(a => a.actionNum),
+          actionGroups.map(a => a.actionHash),
+          isUndo,
+          { otherId: ag.actionNum });
+      }
       this._gristDoc.moveToCursorPos(ag.cursorPos, ag).catch(() => { /* do nothing */ });
     } catch (err) {
       err.message = `Failed to apply ${isUndo ? 'undo' : 'redo'} action: ${err.message}`;
@@ -134,7 +157,7 @@ export class UndoStack extends dispose.Disposable {
   /**
    * Find all actionGroups in the bundle that starts with the given action group.
    */
-  private _findActionBundle(ag: MinimalActionGroup) {
+  private _findActionBundle(ag: ActionGroupWithCursorPos) {
     const prevNums = new Set();
     const actionGroups = [];
     const queue = [ag];

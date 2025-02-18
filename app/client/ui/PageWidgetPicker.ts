@@ -1,19 +1,41 @@
-import { reportError } from 'app/client/models/AppModel';
-import { ColumnRec, DocModel, TableRec, ViewSectionRec } from 'app/client/models/DocModel';
-import { linkId, NoLink } from 'app/client/ui/selectBy';
-import { getWidgetTypes, IWidgetType } from 'app/client/ui/widgetTypes';
-import { bigPrimaryButton } from "app/client/ui2018/buttons";
-import { colors, vars } from "app/client/ui2018/cssVars";
-import { icon } from "app/client/ui2018/icons";
-import { spinnerModal } from 'app/client/ui2018/modals';
-import { isLongerThan, nativeCompare } from "app/common/gutil";
-import { computed, Computed, Disposable, dom, domComputed, fromKo, IOption, select} from "grainjs";
-import { makeTestId, Observable, onKeyDown, styled} from "grainjs";
-import without = require('lodash/without');
+import {BehavioralPromptsManager} from 'app/client/components/BehavioralPromptsManager';
+import {GristDoc} from 'app/client/components/GristDoc';
+import {FocusLayer} from 'app/client/lib/FocusLayer';
+import {makeT} from 'app/client/lib/localization';
+import {reportError} from 'app/client/models/AppModel';
+import {ColumnRec, TableRec, ViewSectionRec} from 'app/client/models/DocModel';
+import {PERMITTED_CUSTOM_WIDGETS} from "app/client/models/features";
+import {linkId, NoLink} from 'app/client/ui/selectBy';
+import {overflowTooltip, withInfoTooltip} from 'app/client/ui/tooltips';
+import {getWidgetTypes} from "app/client/ui/widgetTypesMap";
+import {bigPrimaryButton} from "app/client/ui2018/buttons";
+import {theme, vars} from "app/client/ui2018/cssVars";
+import {icon} from "app/client/ui2018/icons";
+import {spinnerModal} from 'app/client/ui2018/modals';
+import {isLongerThan, nativeCompare} from "app/common/gutil";
+import {IAttachedCustomWidget, IWidgetType} from 'app/common/widgetTypes';
+import {
+  computed,
+  Computed,
+  Disposable,
+  dom,
+  domComputed,
+  DomElementArg,
+  fromKo,
+  IOption,
+  makeTestId,
+  Observable,
+  onKeyDown,
+  select,
+  styled
+} from "grainjs";
 import Popper from 'popper.js';
-import { IOpenController, popupOpen, setPopupToCreateDom } from 'popweasel';
+import {IOpenController, popupOpen, setPopupToCreateDom} from 'popweasel';
+import without = require('lodash/without');
 
-type TableId = number|'New Table'|null;
+const t = makeT('PageWidgetPicker');
+
+type TableRef = number|'New Table'|null;
 
 // Describes a widget selection.
 export interface IPageWidget {
@@ -22,7 +44,7 @@ export interface IPageWidget {
   type: IWidgetType;
 
   // The table (one of the listed tables or 'New Table')
-  table: TableId;
+  table: TableRef;
 
   // Whether to summarize the table (not available for "New Table").
   summarize: boolean;
@@ -36,6 +58,15 @@ export interface IPageWidget {
   // the page widget section id (should be 0 for a to-be-saved new widget)
   section: number;
 }
+
+export const DefaultPageWidget: () => IPageWidget = () => ({
+  type: 'record',
+  table: null,
+  summarize: false,
+  columns: [],
+  link: NoLink,
+  section: 0,
+});
 
 // Creates a IPageWidget from a ViewSectionRec.
 export function toPageWidget(section: ViewSectionRec): IPageWidget {
@@ -65,25 +96,46 @@ export interface IOptions extends ISelectOptions {
   placement?: Popper.Placement;
 }
 
+export interface ICompatibleTypes {
+
+  // true if "New Page" is selected in Page Picker
+  isNewPage: Boolean | undefined;
+
+  // true if can be summarized
+  summarize: Boolean;
+}
+
 const testId = makeTestId('test-wselect-');
 
 // The picker disables some choices that do not make much sense. This function return the list of
 // compatible types given the tableId and whether user is creating a new page or not.
-function getCompatibleTypes(tableId: TableId, isNewPage: boolean|undefined): IWidgetType[] {
+function getCompatibleTypes(tableId: TableRef,
+                            {isNewPage, summarize}: ICompatibleTypes): IWidgetType[] {
+  let compatibleTypes: Array<IWidgetType> = [];
   if (tableId !== 'New Table') {
-    return ['record', 'single', 'detail', 'chart', 'custom'];
+    compatibleTypes = ['record', 'single', 'detail', 'chart', 'custom', 'custom.calendar', 'form'];
   } else if (isNewPage) {
     // New view + new table means we'll be switching to the primary view.
-    return ['record'];
+    compatibleTypes = ['record', 'form'];
   } else {
     // The type 'chart' makes little sense when creating a new table.
-    return ['record', 'single', 'detail'];
+    compatibleTypes = ['record', 'single', 'detail', 'form'];
   }
+  return summarize ? compatibleTypes.filter((el) => isSummaryCompatible(el)) : compatibleTypes;
+}
+
+// The Picker disables some choices that do not make much sense.
+// This function return a boolean telling if summary can be used with this type.
+function isSummaryCompatible(widgetType: IWidgetType): boolean {
+  const incompatibleTypes: Array<IWidgetType> = ['form'];
+  return !incompatibleTypes.includes(widgetType);
 }
 
 // Whether table and type make for a valid selection whether the user is creating a new page or not.
-function isValidSelection(table: TableId, type: IWidgetType, isNewPage: boolean|undefined) {
-  return table !== null && getCompatibleTypes(table, isNewPage).includes(type);
+function isValidSelection(table: TableRef,
+                          type: IWidgetType,
+                          {isNewPage, summarize}: ICompatibleTypes) {
+  return table !== null && getCompatibleTypes(table, {isNewPage, summarize}).includes(type);
 }
 
 export type ISaveFunc = (val: IPageWidget) => Promise<any>;
@@ -94,7 +146,7 @@ export type ISaveFunc = (val: IPageWidget) => Promise<any>;
 const DELAY_BEFORE_SPINNER_MS = 500;
 
 // Attaches the page widget picker to elem to open on 'click' on the left.
-export function attachPageWidgetPicker(elem: HTMLElement, docModel: DocModel, onSave: ISaveFunc,
+export function attachPageWidgetPicker(elem: HTMLElement, gristDoc: GristDoc, onSave: ISaveFunc,
                                        options: IOptions = {}) {
   // Overrides .placement, this is needed to enable the page widget to update position when user
   // expand the `Group By` panel.
@@ -103,7 +155,7 @@ export function attachPageWidgetPicker(elem: HTMLElement, docModel: DocModel, on
   // particular listening to value.summarize to update popup position could be done directly in
   // code).
   options.placement = 'left';
-  const domCreator = (ctl: IOpenController) => buildPageWidgetPicker(ctl, docModel, onSave, options);
+  const domCreator = (ctl: IOpenController) => buildPageWidgetPicker(ctl, gristDoc, onSave, options);
   setPopupToCreateDom(elem, domCreator, {
     placement: 'left',
     trigger: ['click'],
@@ -113,10 +165,10 @@ export function attachPageWidgetPicker(elem: HTMLElement, docModel: DocModel, on
 }
 
 // Open page widget widget picker on the right of element.
-export function openPageWidgetPicker(elem: HTMLElement, docModel: DocModel, onSave: ISaveFunc,
+export function openPageWidgetPicker(elem: HTMLElement, gristDoc: GristDoc, onSave: ISaveFunc,
                                      options: IOptions = {}) {
   popupOpen(elem, (ctl) => buildPageWidgetPicker(
-    ctl, docModel, onSave, options
+    ctl, gristDoc, onSave, options
   ), { placement: 'right' });
 }
 
@@ -126,11 +178,12 @@ export function openPageWidgetPicker(elem: HTMLElement, docModel: DocModel, onSa
 // to overlay the trigger element (which could happen when the 'Group By' panel is expanded for the
 // first time). When saving is taking time, show a modal spinner (see DELAY_BEFORE_SPINNER_MS).
 export function buildPageWidgetPicker(
-    ctl: IOpenController,
-    docModel: DocModel,
-    onSave: ISaveFunc,
-    options: IOptions = {}) {
-
+  ctl: IOpenController,
+  gristDoc: GristDoc,
+  onSave: ISaveFunc,
+  options: IOptions = {}
+) {
+  const {behavioralPromptsManager, docModel} = gristDoc;
   const tables = fromKo(docModel.visibleTables.getObservable());
   const columns = fromKo(docModel.columns.createAllRowsModel('parentPos').getObservable());
 
@@ -174,15 +227,21 @@ export function buildPageWidgetPicker(
       // If savePromise throws an error, before or after timeout, we let the error propagate as it
       // should be handle by the caller.
       if (await isLongerThan(savePromise, DELAY_BEFORE_SPINNER_MS)) {
-        const label = getWidgetTypes(type).label;
-        await spinnerModal(`Building ${label} widget`, savePromise);
+        const label = getWidgetTypes(type).getLabel();
+        await spinnerModal(t("Building {{- label}} widget", { label }), savePromise);
       }
     }
   }
 
   // whether the current selection is valid
   function isValid() {
-    return isValidSelection(value.table.get(), value.type.get(), options.isNewPage);
+    return isValidSelection(
+      value.table.get(),
+      value.type.get(),
+      {
+        isNewPage: options.isNewPage,
+        summarize: value.summarize.get()
+      });
   }
 
   // Summarizing a table causes the 'Group By' panel to expand on the right. To prevent it from
@@ -199,10 +258,10 @@ export function buildPageWidgetPicker(
 
   // dom
   return cssPopupWrapper(
-    dom.create(PageWidgetSelect, value, tables, columns, onSaveCB, options),
+    dom.create(PageWidgetSelect,
+      value, tables, columns, onSaveCB, behavioralPromptsManager, options),
 
-    // gives focus and binds keydown events
-    (elem: any) => { setTimeout(() => elem.focus(), 0); },
+    elem => { FocusLayer.create(ctl, {defaultFocusElem: elem, pauseMousetrap: true}); },
     onKeyDown({
       Escape: () => ctl.close(),
       Enter: () => isValid() && onSaveCB()
@@ -218,7 +277,6 @@ export type IWidgetValueObs = {
 
 
 export interface ISelectOptions {
-
   // the button's label
   buttonLabel?: string;
 
@@ -231,9 +289,15 @@ export interface ISelectOptions {
   selectBy?: (val: IPageWidget) => Array<IOption<string>>;
 }
 
+const registeredCustomWidgets: IAttachedCustomWidget[] =  ['custom.calendar'];
+
+const permittedCustomWidgets: IAttachedCustomWidget[] = PERMITTED_CUSTOM_WIDGETS().get().map((widget) =>
+  widget as IAttachedCustomWidget)??[];
 // the list of widget types in the order they should be listed by the widget.
+const finalListOfCustomWidgetToShow =  permittedCustomWidgets.filter(a=>
+  registeredCustomWidgets.includes(a));
 const sectionTypes: IWidgetType[] = [
-  'record', 'single', 'detail', 'chart', 'custom'
+  'record', 'single', 'detail', 'form', 'chart', ...finalListOfCustomWidgetToShow, 'custom'
 ];
 
 
@@ -261,14 +325,17 @@ export class PageWidgetSelect extends Disposable {
     }) :
     null;
 
-  private _isNewTableDisabled = Computed.create(this, this._value.type, (use, t) => !isValidSelection(
-    'New Table', t, this._options.isNewPage));
+  private _isNewTableDisabled = Computed.create(this, this._value.type, (use, type) => !isValidSelection(
+    'New Table', type, {isNewPage: this._options.isNewPage, summarize: use(this._value.summarize)}));
+
+  private _isSummaryDisabled = Computed.create(this, this._value.type, (_use, type) => !isSummaryCompatible(type));
 
   constructor(
     private _value: IWidgetValueObs,
     private _tables: Observable<TableRec[]>,
     private _columns: Observable<ColumnRec[]>,
     private _onSave: () => Promise<void>,
+    private _behavioralPromptsManager: BehavioralPromptsManager,
     private _options: ISelectOptions = {}
   ) { super(); }
 
@@ -277,14 +344,16 @@ export class PageWidgetSelect extends Disposable {
       testId('container'),
       cssBody(
         cssPanel(
-          header('Select Widget'),
+          header(t("Select Widget")),
           sectionTypes.map((value) => {
-            const {label, icon: iconName} = getWidgetTypes(value);
-            const disabled = computed(this._value.table, (use, tid) => this._isTypeDisabled(value, tid));
+            const widgetInfo = getWidgetTypes(value);
+            const disabled = computed(this._value.table,
+              (use, tid) => this._isTypeDisabled(value, tid, use(this._value.summarize))
+            );
             return cssEntry(
               dom.autoDispose(disabled),
-              cssTypeIcon(iconName),
-              label,
+              cssTypeIcon(widgetInfo.icon),
+              widgetInfo.getLabel(),
               dom.on('click', () => !disabled.get() && this._selectType(value)),
               cssEntry.cls('-selected', (use) => use(this._value.type) === value),
               cssEntry.cls('-disabled', disabled),
@@ -294,35 +363,45 @@ export class PageWidgetSelect extends Disposable {
         ),
         cssPanel(
           testId('data'),
-          header('Select Data'),
+          header(t("Select Data")),
           cssEntry(
             cssIcon('TypeTable'), 'New Table',
             // prevent the selection of 'New Table' if it is disabled
             dom.on('click', (ev) => !this._isNewTableDisabled.get() && this._selectTable('New Table')),
+            this._behavioralPromptsManager.attachPopup('pageWidgetPicker', {
+              popupOptions: {
+                attach: null,
+                placement: 'right-start',
+              }
+            }),
             cssEntry.cls('-selected', (use) => use(this._value.table) === 'New Table'),
             cssEntry.cls('-disabled', this._isNewTableDisabled),
-            testId('table')
+            testId('table'),
           ),
           dom.forEach(this._tables, (table) => dom('div',
             cssEntryWrapper(
               cssEntry(cssIcon('TypeTable'),
-                       cssLabel(dom.text(use => use(table.tableNameDef) || use(table.tableId))),
+                       cssLabel(dom.text(table.tableNameDef), overflowTooltip()),
                        dom.on('click', () => this._selectTable(table.id())),
                        cssEntry.cls('-selected', (use) => use(this._value.table) === table.id()),
                        testId('table-label')
               ),
-              cssPivot(
-                cssBigIcon('Pivot'),
-                cssEntry.cls('-selected', (use) => use(this._value.summarize) && use(this._value.table) === table.id()),
-                dom.on('click', (ev, el) => this._selectPivot(table.id(), el as HTMLElement)),
-                testId('pivot'),
+                cssPivot(
+                  cssBigIcon('Pivot'),
+                  cssEntry.cls('-selected', (use) => use(this._value.summarize) &&
+                                                     use(this._value.table) === table.id()
+                  ),
+                  cssEntry.cls('-disabled', this._isSummaryDisabled),
+                  dom.on('click', (_ev, el) =>
+                    !this._isSummaryDisabled.get() && this._selectPivot(table.id(), el as HTMLElement)),
+                  testId('pivot'),
               ),
               testId('table'),
             )
           )),
         ),
         cssPanel(
-          header('Group by'),
+          header(t("Group by")),
           dom.hide((use) => !use(this._value.summarize)),
           domComputed(
             (use) => use(this._columns)
@@ -342,18 +421,36 @@ export class PageWidgetSelect extends Disposable {
       cssFooter(
         cssFooterContent(
           // If _selectByOptions exists and has more than then "NoLinkOption", show the selector.
-          dom.maybe((use) => this._selectByOptions && use(this._selectByOptions).length > 1, () => cssSelectBy(
-            cssSmallLabel('SELECT BY'),
-            dom.update(cssSelect(this._value.link, this._selectByOptions!),
-                       testId('selectby'))
-          )),
+          dom.maybe((use) => this._selectByOptions && use(this._selectByOptions).length > 1, () =>
+            withInfoTooltip(
+              cssSelectBy(
+                cssSmallLabel('SELECT BY'),
+                dom.update(cssSelect(this._value.link, this._selectByOptions!),
+                          testId('selectby'))
+              ),
+              'selectBy',
+              {popupOptions: {attach: null}, domArgs: [
+                this._behavioralPromptsManager.attachPopup('pageWidgetPickerSelectBy', {
+                  popupOptions: {
+                    attach: null,
+                    placement: 'bottom-start',
+                  }
+                }),
+              ]},
+            )
+          ),
           dom('div', {style: 'flex-grow: 1'}),
           bigPrimaryButton(
             // TODO: The button's label of the page widget picker should read 'Close' instead when
             // there are no changes.
-            this._options.buttonLabel || 'Add to Page',
+            this._options.buttonLabel || t("Add to Page"),
             dom.prop('disabled', (use) => !isValidSelection(
-              use(this._value.table), use(this._value.type), this._options.isNewPage)
+              use(this._value.table),
+              use(this._value.type),
+              {
+                isNewPage: this._options.isNewPage,
+                summarize: use(this._value.summarize)
+              })
             ),
             dom.on('click', () => this._onSave().catch(reportError)),
             testId('addBtn'),
@@ -372,11 +469,11 @@ export class PageWidgetSelect extends Disposable {
     this._value.summarize.set(true);
   }
 
-  private _selectType(t: IWidgetType) {
-    this._value.type.set(t);
+  private _selectType(type: IWidgetType) {
+    this._value.type.set(type);
   }
 
-  private _selectTable(tid: TableId) {
+  private _selectTable(tid: TableRef) {
     if (tid !== this._value.table.get()) {
       this._value.link.set(NoLink);
     }
@@ -388,7 +485,7 @@ export class PageWidgetSelect extends Disposable {
     return el.classList.contains(cssEntry.className + '-selected');
   }
 
-  private _selectPivot(tid: TableId, pivotEl: HTMLElement) {
+  private _selectPivot(tid: TableRef, pivotEl: HTMLElement) {
     if (this._isSelected(pivotEl)) {
       this._closeSummarizePanel();
     } else {
@@ -407,29 +504,29 @@ export class PageWidgetSelect extends Disposable {
     this._value.columns.set(newIds);
   }
 
-  private _isTypeDisabled(type: IWidgetType, table: TableId) {
+  private _isTypeDisabled(type: IWidgetType, table: TableRef, isSummaryOn: boolean) {
     if (table === null) {
       return false;
     }
-    return !getCompatibleTypes(table, this._options.isNewPage).includes(type);
+    return !getCompatibleTypes(table, {isNewPage: this._options.isNewPage, summarize: isSummaryOn}).includes(type);
   }
 
 }
 
-function header(label: string) {
-  return cssHeader(dom('h4', label), testId('heading'));
+function header(label: string, ...args: DomElementArg[]) {
+  return cssHeader(dom('h4', label), ...args, testId('heading'));
 }
 
 const cssContainer = styled('div', `
-  --outline: 1px solid rgba(217,217,217,0.60);
+  --outline: 1px solid ${theme.widgetPickerBorder};
 
   max-height: 386px;
-  box-shadow: 0 2px 20px 0 rgba(38,38,51,0.20);
+  box-shadow: 0 2px 20px 0 ${theme.widgetPickerShadow};
   border-radius: 2px;
   display: flex;
   flex-direction: column;
   user-select: none;
-  background-color: white;
+  background-color: ${theme.widgetPickerPrimaryBg};
 `);
 
 const cssPopupWrapper = styled('div', `
@@ -450,17 +547,19 @@ const cssPanel = styled('div', `
   overflow: auto;
   padding-bottom: 18px;
   &:nth-of-type(2n) {
-    background-color: ${colors.lightGrey};
+    background-color: ${theme.widgetPickerSecondaryBg};
     outline: var(--outline);
   }
 `);
 
 const cssHeader = styled('div', `
+  color: ${theme.text};
   margin: 24px 0 24px 24px;
   font-size: ${vars.mediumFontSize};
 `);
 
 const cssEntry = styled('div', `
+  color: ${theme.widgetPickerItemFg};
   padding: 0 0 0 24px;
   height: 32px;
   display: flex;
@@ -469,11 +568,13 @@ const cssEntry = styled('div', `
   align-items: center;
   white-space: nowrap;
   overflow: hidden;
+  cursor: pointer;
   &-selected {
-    background-color: ${colors.mediumGrey};
+    background-color: ${theme.widgetPickerItemSelectedBg};
   }
   &-disabled {
-    color: ${colors.mediumGrey};
+    color: ${theme.widgetPickerItemDisabledBg};
+    cursor: default;
   }
   &-disabled&-selected {
     background-color: inherit;
@@ -483,14 +584,14 @@ const cssEntry = styled('div', `
 const cssIcon = styled(icon, `
   margin-right: 8px;
   flex-shrink: 0;
-  --icon-color: ${colors.slate};
+  --icon-color: ${theme.widgetPickerIcon};
   .${cssEntry.className}-disabled > & {
-    opacity: 0.2;
+    opacity: 0.25;
   }
 `);
 
 const cssTypeIcon = styled(cssIcon, `
-  --icon-color: ${colors.lightGreen};
+  --icon-color: ${theme.widgetPickerPrimaryIcon};
 `);
 
 const cssLabel = styled('span', `
@@ -516,7 +617,11 @@ const cssPivot = styled(cssEntry, `
 const cssBigIcon = styled(icon, `
   width: 24px;
   height: 24px;
-  background-color: ${colors.darkGreen};
+  background-color: ${theme.widgetPickerSummaryIcon};
+  .${cssEntry.className}-disabled > & {
+    opacity: 0.25;
+    filter: saturate(0);
+  }
 `);
 
 const cssFooter = styled('div', `
@@ -534,11 +639,14 @@ const cssFooterContent = styled('div', `
 `);
 
 const cssSmallLabel = styled('span', `
+  color: ${theme.text};
   font-size: ${vars.xsmallFontSize};
   margin-right: 8px;
 `);
 
 const cssSelect = styled(select, `
+  color: ${theme.selectButtonFg};
+  background-color: ${theme.selectButtonBg};
   flex: 1 0 160px;
   width: 160px;
 `);

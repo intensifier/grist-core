@@ -1,10 +1,15 @@
-import * as commands from 'app/client/components/commands';
+import {makeT} from 'app/client/lib/localization';
+import {logTelemetryEvent} from 'app/client/lib/telemetry';
+import {getMainOrgUrl} from 'app/client/models/gristUrlState';
 import {cssLinkText, cssPageEntryMain, cssPageIcon, cssPageLink} from 'app/client/ui/LeftPanelCommon';
-import {colors} from 'app/client/ui2018/cssVars';
+import {YouTubePlayer} from 'app/client/ui/YouTubePlayer';
+import {theme} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
-import {modal} from 'app/client/ui2018/modals';
-import {commonUrls, shouldHideUiElement} from 'app/common/gristUrls';
-import {dom, makeTestId, styled} from 'grainjs';
+import {cssModalCloseButton, modal} from 'app/client/ui2018/modals';
+import {isFeatureEnabled, ONBOARDING_VIDEO_YOUTUBE_EMBED_ID} from 'app/common/gristUrls';
+import {dom, keyframes, makeTestId, styled} from 'grainjs';
+
+const t = makeT('OpenVideoTour');
 
 const testId = makeTestId('test-video-tour-');
 
@@ -13,25 +18,37 @@ const testId = makeTestId('test-video-tour-');
  */
  export function openVideoTour(refElement: HTMLElement) {
   return modal(
-    (ctl) => {
+    (ctl, owner) => {
+      const youtubePlayer = YouTubePlayer.create(owner,
+        ONBOARDING_VIDEO_YOUTUBE_EMBED_ID,
+        {
+          onPlayerReady: (player) => player.playVideo(),
+          height: '100%',
+          width: '100%',
+          origin: getMainOrgUrl(),
+          playerVars: {
+            rel: 0,
+          },
+        },
+        cssYouTubePlayer.cls(''),
+      );
+
+      owner.onDispose(async () => {
+        if (youtubePlayer.isLoading()) { return; }
+
+        logTelemetryEvent('watchedVideoTour', {
+          limited: {watchTimeSeconds: Math.floor(youtubePlayer.getCurrentTime())},
+        });
+      });
+
       return [
         cssModal.cls(''),
-        cssCloseButton(
+        cssModalCloseButton(
           cssCloseIcon('CrossBig'),
           dom.on('click', () => ctl.close()),
           testId('close'),
         ),
-        cssVideoWrap(
-          cssVideo(
-            {
-              src: commonUrls.videoTour,
-              title: 'YouTube video player',
-              frameborder: '0',
-              allow: 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture',
-              allowfullscreen: '',
-            },
-          ),
-        ),
+        cssYouTubePlayerContainer(youtubePlayer.buildDom()),
         testId('modal'),
       ];
     },
@@ -48,7 +65,7 @@ const testId = makeTestId('test-video-tour-');
 export function createVideoTourTextButton(): HTMLDivElement {
   const elem: HTMLDivElement = cssVideoTourTextButton(
     cssVideoIcon('Video'),
-    'Grist Video Tour',
+    t("Grist Video Tour"),
     dom.on('click', () => openVideoTour(elem)),
     testId('text-button'),
   );
@@ -62,19 +79,14 @@ export function createVideoTourTextButton(): HTMLDivElement {
  * Shows the video tour on click.
  */
 export function createVideoTourToolsButton(): HTMLDivElement | null {
-  if (shouldHideUiElement('helpCenter')) { return null; }
+  if (!isFeatureEnabled('helpCenter')) { return null; }
 
   let iconElement: HTMLElement;
 
-  const commandsGroup = commands.createGroup({
-    videoTourToolsOpen: () => openVideoTour(iconElement),
-  }, null, true);
-
   return cssPageEntryMain(
-    dom.autoDispose(commandsGroup),
     cssPageLink(
       iconElement = cssPageIcon('Video'),
-      cssLinkText('Video Tour'),
+      cssLinkText(t("Video Tour")),
       dom.cls('tour-help-center'),
       dom.on('click', () => openVideoTour(iconElement)),
       testId('tools-button'),
@@ -91,49 +103,43 @@ const cssModal = styled('div', `
   max-width: 864px;
 `);
 
-const cssVideoWrap = styled('div', `
+const delayedVisibility = keyframes(`
+  to {
+    visibility: visible;
+  }
+`);
+
+const cssYouTubePlayerContainer = styled('div', `
   position: relative;
   padding-bottom: 56.25%;
   height: 0;
+  /* Wait until the modal is finished animating. */
+  visibility: hidden;
+  animation: 0s linear 0.4s forwards ${delayedVisibility};
 `);
 
-const cssVideo = styled('iframe', `
+const cssYouTubePlayer = styled('div', `
   position: absolute;
   top: 0;
   left: 0;
-  width: 100%;
-  height: 100%;
 `);
 
 const cssVideoTourTextButton = styled('div', `
-  color: ${colors.lightGreen};
+  color: ${theme.controlFg};
   cursor: pointer;
 
   &:hover {
-    color: ${colors.darkGreen};
+    color: ${theme.controlHoverFg};
   }
 `);
 
 const cssVideoIcon = styled(icon, `
-  background-color: ${colors.lightGreen};
+  background-color: ${theme.controlFg};
   cursor: pointer;
   margin: 0px 4px 3px 0;
 
   .${cssVideoTourTextButton.className}:hover > & {
-    background-color: ${colors.darkGreen};
-  }
-`);
-
-const cssCloseButton = styled('div', `
-  align-self: flex-end;
-  margin: -8px;
-  padding: 4px;
-  border-radius: 4px;
-  cursor: pointer;
-  --icon-color: ${colors.slate};
-
-  &:hover {
-    background-color: ${colors.mediumGreyOpaque};
+    background-color: ${theme.controlHoverFg};
   }
 `);
 

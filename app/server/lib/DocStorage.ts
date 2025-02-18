@@ -7,7 +7,6 @@
  */
 
 
-import * as sqlite3 from '@gristlabs/sqlite3';
 import {LocalActionBundle} from 'app/common/ActionBundle';
 import {BulkColValues, DocAction, TableColValues, TableDataAction, toTableDataAction} from 'app/common/DocActions';
 import * as gristTypes from 'app/common/gristTypes';
@@ -17,22 +16,21 @@ import * as schema from 'app/common/schema';
 import {SingleCell} from 'app/common/TableData';
 import {GristObjCode} from "app/plugin/GristData";
 import {ActionHistoryImpl} from 'app/server/lib/ActionHistoryImpl';
-import {ExpandedQuery} from 'app/server/lib/ExpandedQuery';
+import {combineExpr, ExpandedQuery} from 'app/server/lib/ExpandedQuery';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
 import log from 'app/server/lib/log';
 import assert from 'assert';
 import * as bluebird from 'bluebird';
-import * as fse from 'fs-extra';
-import {RunResult} from 'sqlite3';
 import * as _ from 'underscore';
 import * as util from 'util';
-import uuidv4 from "uuid/v4";
+import {v4 as uuidv4} from 'uuid';
 import {OnDemandStorage} from './OnDemandActions';
-import {ISQLiteDB, MigrationHooks, OpenMode, quoteIdent, ResultRow, SchemaInfo, SQLiteDB} from './SQLiteDB';
+import {ISQLiteDB, MigrationHooks, OpenMode, PreparedStatement, quoteIdent,
+        ResultRow, RunResult, SchemaInfo, SQLiteDB} from 'app/server/lib/SQLiteDB';
 import chunk = require('lodash/chunk');
 import cloneDeep = require('lodash/cloneDeep');
 import groupBy = require('lodash/groupBy');
-
+import { MinDBOptions } from './SqliteCommon';
 
 // Run with environment variable NODE_DEBUG=db (may include additional comma-separated sections)
 // for verbose logging.
@@ -46,6 +44,10 @@ const PENDING_VALUE = [GristObjCode.Pending];
 // Once a file is deleted it can't be restored by undo, so we want it to be impossible or at least extremely unlikely
 // that someone would delete a reference to an attachment and then undo that action this many days later.
 export const ATTACHMENTS_EXPIRY_DAYS = 7;
+
+// Cleanup expired attachments every hour (also happens when shutting down).
+export const REMOVE_UNUSED_ATTACHMENTS_DELAY = {delayMs: 60 * 60 * 1000, varianceMs: 30 * 1000};
+
 
 export class DocStorage implements ISQLiteDB, OnDemandStorage {
 
@@ -69,7 +71,8 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
       await db.exec(`CREATE TABLE _gristsys_Files (
         id INTEGER PRIMARY KEY,
         ident TEXT UNIQUE,
-        data BLOB
+        data BLOB,
+        storageId TEXT
        )`);
       await db.exec(`CREATE TABLE _gristsys_Action (
         id INTEGER PRIMARY KEY,
@@ -375,7 +378,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
           const colListSql = newCols.map(c => `${quoteIdent(c.colId)}=?`).join(', ');
           const types = newCols.map(c => c.type);
           const sqlParams = DocStorage._encodeColumnsToRows(types, newCols.map(c => [PENDING_VALUE]));
-          await db.run(`UPDATE ${quoteIdent(tableId)} SET ${colListSql}`, sqlParams[0]);
+          await db.run(`UPDATE ${quoteIdent(tableId)} SET ${colListSql}`, ...sqlParams[0]);
         }
       },
 
@@ -390,7 +393,13 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
         }
         await createAttachmentsIndex(db);
       },
-
+      async function(db: SQLiteDB): Promise<void> {
+        // Storage version 9.
+        // Migration to add `storage` column to _gristsys_Files, which can optionally refer to an external storage
+        // where the file is stored.
+        // Default should be NULL.
+        await db.exec(`ALTER TABLE _gristsys_Files ADD COLUMN storageId TEXT`);
+      },
     ]
   };
 
@@ -443,7 +452,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
    * Converts an array of columns to an array of rows (suitable to use as sqlParams), encoding all
    * values as needed, according to an array of Grist type strings (must be parallel to columns).
    */
-  private static _encodeColumnsToRows(types: string[], valueColumns: any[]): any[] {
+  private static _encodeColumnsToRows(types: string[], valueColumns: any[]): any[][] {
     const marshaller = new marshal.Marshaller({version: 2});
     const rows = _.unzip(valueColumns);
     for (const row of rows) {
@@ -464,7 +473,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
    */
   private static _encodeValue(
     marshaller: marshal.Marshaller, gristType: string, sqlType: string, val: any
-  ): Uint8Array|string|number|boolean {
+  ): Uint8Array|string|number|boolean|null {
     const marshalled = () => {
       marshaller.marshal(val);
       return marshaller.dump();
@@ -486,6 +495,8 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     }
     // Leave nulls unchanged.
     if (val === null) { return val; }
+    // Return undefined as null.
+    if (val === undefined) { return null; }
     // At this point, we have a non-null primitive.  Check what is the Sqlite affinity
     // of the destination.  May be NUMERIC, INTEGER, TEXT, or BLOB.  We handle REAL
     // also even though it is not currently used.
@@ -645,6 +656,8 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
   // tables (obtained from auto-generated schema.js).
   private _docSchema: {[tableId: string]: {[colId: string]: string}};
 
+  private _cachedDataSize: number|null = null;
+
   public constructor(public storageManager: IDocStorageManager, public docName: string) {
     this.docPath = this.storageManager.getPath(docName);
     this._db = null;
@@ -728,8 +741,11 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
       })
       .catch(err => {
         // This replicates previous logic for _updateMetadata.
-        if (err.message.startsWith('SQLITE_ERROR: no such table')) {
+        // It matches errors from node-sqlite3 and better-sqlite3
+        if (err.message.startsWith('SQLITE_ERROR: no such table') ||
+          err.message.startsWith('no such table:')) {
           err.message = `NO_METADATA_ERROR: ${this.docName} has no metadata`;
+          if (!err.cause) { err.cause = {}; }
           err.cause.code = 'NO_METADATA_ERROR';
         }
         throw err;
@@ -759,40 +775,100 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
    * would be (very?) inefficient until node-sqlite3 adds support for incremental reading from a
    * blob: https://github.com/mapbox/node-sqlite3/issues/424.
    *
-   * @param {String} sourcePath: The path of the file containing the attachment data.
-   * @param {String} fileIdent: The unique identifier of the file in the database. ActiveDoc uses the
-   *    checksum of the file's contents with the original extension.
+   * @param {string} fileIdent - The unique identifier of the file in the database.
+   * @param {Buffer | undefined} fileData - Contents of the file.
+   * @param {string | undefined} storageId - Identifier of the store that file is stored in.
    * @returns {Promise[Boolean]} True if the file got attached; false if this ident already exists.
    */
-  public findOrAttachFile(sourcePath: string, fileIdent: string): Promise<boolean> {
-    return this.execTransaction(db => {
-      // Try to insert a new record with the given ident. It'll fail UNIQUE constraint if exists.
-      return db.run('INSERT INTO _gristsys_Files (ident) VALUES (?)', fileIdent)
-      // Only if this succeeded, do the work of reading the file and inserting its data.
-        .then(() => fse.readFile(sourcePath))
-        .then(data =>
-              db.run('UPDATE _gristsys_Files SET data=? WHERE ident=?', data, fileIdent))
-        .then(() => true)
-      // If UNIQUE constraint failed, this ident must already exists, so return false.
-        .catch(err => {
-          if (/^SQLITE_CONSTRAINT: UNIQUE constraint failed/.test(err.message)) {
-            return false;
-          }
-          throw err;
-        });
+  public attachFileIfNew(
+    fileIdent: string,
+    fileData: Buffer | undefined,
+    storageId?: string,
+  ): Promise<boolean> {
+    return this.execTransaction(async (db) => {
+      const isNewFile = await this._addBasicFileRecord(db, fileIdent);
+      if (isNewFile) {
+        await this._updateFileRecord(db, fileIdent, fileData, storageId);
+      }
+      return isNewFile;
+    });
+  }
+
+  /**
+   * Attaches a file to the document, updating the file record if it already exists.
+   *
+   * TODO: This currently does not make the attachment available to the sandbox code. This is likely
+   * to be needed in the future, and a suitable API will need to be provided. Note that large blobs
+   * would be (very?) inefficient until node-sqlite3 adds support for incremental reading from a
+   * blob: https://github.com/mapbox/node-sqlite3/issues/424.
+   *
+   * @param {string} fileIdent - The unique identifier of the file in the database.
+   * @param {Buffer | undefined} fileData - Contents of the file.
+   * @param {string | undefined} storageId - Identifier of the store that file is stored in.
+   * @returns {Promise[Boolean]} True if the file got attached; false if this ident already exists.
+   */
+  public attachOrUpdateFile(
+    fileIdent: string,
+    fileData: Buffer | undefined,
+    storageId?: string,
+  ): Promise<boolean> {
+    return this.execTransaction(async (db) => {
+      const isNewFile = await this._addBasicFileRecord(db, fileIdent);
+      await this._updateFileRecord(db, fileIdent, fileData, storageId);
+      return isNewFile;
     });
   }
 
   /**
    * Reads and returns the data for the given attachment.
-   * @param {String} fileIdent: The unique identifier of a file, as used by findOrAttachFile.
-   * @returns {Promise[Buffer]} The data buffer associated with fileIdent.
+   * @param {string} fileIdent - The unique identifier of a file, as used by attachFileIfNew.
+   *   file identifier.
+   * @returns {Promise[FileInfo | null]} - File information, or null if no record exists for that file identifier.
    */
-  public getFileData(fileIdent: string): Promise<Buffer> {
-    return this.get('SELECT data FROM _gristsys_Files WHERE ident=?', fileIdent)
-      .then(row => row && row.data);
+  public async getFileInfo(fileIdent: string): Promise<FileInfo | null> {
+    const row = await this.get(`SELECT ident, storageId, data FROM _gristsys_Files WHERE ident=?`, fileIdent);
+    if(!row) {
+      return null;
+    }
+
+    return {
+      ident: row.ident as string,
+      storageId: (row.storageId ?? null) as (string | null),
+      // Use a zero buffer for now if it doesn't exist. Should be refactored to allow null.
+      data: row.data ? row.data as Buffer : Buffer.alloc(0),
+    };
   }
 
+  /**
+   * Reads and returns the metadata for a file, without retrieving the file's contents.
+   * @param {string} fileIdent - The unique identifier of a file, as used by attachFileIfNew.
+   * @returns {Promise[FileInfo | null]} - File information, or null if no record exists for that
+   *   file identifier.
+   */
+  public async getFileInfoNoData(fileIdent: string): Promise<FileInfo | null> {
+    const row = await this.get(`SELECT ident, storageId FROM _gristsys_Files WHERE ident=?`, fileIdent);
+    if (!row) {
+      return null;
+    }
+
+    return {
+        ident: row.ident as string,
+        storageId: (row.storageId ?? null) as (string | null),
+        // Use a zero buffer for now if it doesn't exist. Should be refactored to allow null.
+        data: Buffer.alloc(0),
+    };
+  }
+
+  public async listAllFiles(): Promise<FileInfo[]> {
+    const rows = await this.all(`SELECT ident, storageId FROM _gristsys_Files`);
+
+    return rows.map(row => ({
+      ident: row.ident as string,
+      storageId: (row.storageId ?? null) as (string | null),
+      // Use a zero buffer for now to represent no data. Should be refactored to allow null.
+      data: Buffer.alloc(0),
+    }));
+  }
 
   /**
    * Fetches the given table from the database. See fetchQuery() for return value.
@@ -863,17 +939,16 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     }
 
     // Convert query to SQL.
-    const params: any[] = [];
-    let whereParts: string[] = [];
+    const params: any[] = query.where?.params || [];
+    const whereParts: string[] = [];
     for (const colId of Object.keys(query.filters)) {
       const values = query.filters[colId];
       // If values is empty, "IN ()" works in SQLite (always false), but wouldn't work in Postgres.
       whereParts.push(`${quoteIdent(query.tableId)}.${quoteIdent(colId)} IN (${values.map(() => '?').join(', ')})`);
       params.push(...values);
     }
-    whereParts = whereParts.concat(query.wheres ?? []);
     const sql = this._getSqlForQuery(query, whereParts);
-    return this._getDB().allMarshal(sql, params);
+    return this._getDB().allMarshal(sql, ...params);
   }
 
   /**
@@ -1085,7 +1160,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
   public _process_RemoveRecord(tableId: string, rowId: string): Promise<RunResult> {
     const sql = "DELETE FROM " + quoteIdent(tableId) + " WHERE id=?";
     debuglog("RemoveRecord SQL: " + sql, [rowId]);
-    return this.run(sql, [rowId]);
+    return this.run(sql, rowId);
   }
 
 
@@ -1119,23 +1194,19 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     if (numChunks > 0) {
       debuglog("DocStorage.BulkRemoveRecord: splitting " + rowIds.length +
                " deletes into chunks of size " + chunkSize);
-      await this.prepare(preSql + chunkParams + postSql)
-        .then(function(stmt) {
-          return bluebird.Promise.each(_.range(0, numChunks * chunkSize, chunkSize), function(index: number) {
-            debuglog("DocStorage.BulkRemoveRecord: chunk delete " + index + "-" + (index + chunkSize - 1));
-            return bluebird.Promise.fromCallback((cb: any) => stmt.run(rowIds.slice(index, index + chunkSize), cb));
-          })
-            .then(function() {
-              return bluebird.Promise.fromCallback((cb: any) => stmt.finalize(cb));
-            });
-        });
+      const stmt = await this.prepare(preSql + chunkParams + postSql);
+      for (const index of _.range(0, numChunks * chunkSize, chunkSize)) {
+        debuglog("DocStorage.BulkRemoveRecord: chunk delete " + index + "-" + (index + chunkSize - 1));
+        await stmt.run(...rowIds.slice(index, index + chunkSize));
+      }
+      await stmt.finalize();
     }
 
     if (numLeftovers > 0) {
       debuglog("DocStorage.BulkRemoveRecord: leftover delete " + (numChunks * chunkSize) + "-" + (rowIds.length - 1));
       const leftoverParams = _.range(numLeftovers).map(q).join(',');
       await this.run(preSql + leftoverParams + postSql,
-                     rowIds.slice(numChunks * chunkSize, rowIds.length));
+                     ...rowIds.slice(numChunks * chunkSize, rowIds.length));
     }
   }
 
@@ -1398,6 +1469,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
 
   /**
    * Delete attachments from _gristsys_Files that have no matching metadata row in _grist_Attachments.
+   * This leaves any attachment files in any remote attachment stores, which will be cleaned up separately.
    */
   public async removeUnusedAttachments() {
     const result = await this._getDB().run(`
@@ -1415,6 +1487,14 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     }
   }
 
+  public interrupt(): Promise<void> {
+    return this._getDB().interrupt();
+  }
+
+  public getOptions(): MinDBOptions|undefined {
+    return this._getDB().getOptions();
+  }
+
   public all(sql: string, ...args: any[]): Promise<ResultRow[]> {
     return this._getDB().all(sql, ...args);
   }
@@ -1427,8 +1507,8 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     return this._markAsChanged(this._getDB().exec(sql));
   }
 
-  public prepare(sql: string, ...args: any[]): Promise<sqlite3.Statement> {
-    return this._getDB().prepare(sql, ...args);
+  public prepare(sql: string): Promise<PreparedStatement> {
+    return this._getDB().prepare(sql);
   }
 
   public get(sql: string, ...args: any[]): Promise<ResultRow|undefined> {
@@ -1456,6 +1536,10 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
       return row.value;
     }
     return undefined;
+  }
+
+  public getDB(): SQLiteDB {
+    return this._getDB();
   }
 
   public async hasPluginDataItem(pluginId: string, key: string): Promise<any> {
@@ -1518,7 +1602,20 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     }
   }
 
+  /**
+   * Return the total size of data in the user + meta tables of the SQLite doc (excluding gristsys
+   * tables). Uses cached results if possible. Any change to data invalidates the cache, via
+   * _markAsChanged().
+   */
   public async getDataSize(): Promise<number> {
+    return this._cachedDataSize ?? (this._cachedDataSize = await this.getDataSizeUncached());
+  }
+
+  /**
+   * Measure and return the total size of data in the user + meta tables of the SQLite doc
+   * (excluding gristsys tables). Note that this operation involves reading the entire database.
+   */
+  public async getDataSizeUncached(): Promise<number> {
     const result = await this.get(`
       SELECT SUM(pgsize - unused) AS totalSize
       FROM dbstat
@@ -1526,7 +1623,16 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
         name LIKE 'sqlite_%' OR
         name LIKE '_gristsys_%'
       );
-    `);
+    `).catch(e => {
+      if (String(e).match(/no such table: dbstat/)) {
+        // We are using a version of SQLite that doesn't have
+        // dbstat compiled in. But it would be sad to disable
+        // Grist entirely just because we can't track byte-count.
+        // So return NaN in this case.
+        return {totalSize: NaN};
+      }
+      throw e;
+    });
     return result!.totalSize;
   }
 
@@ -1534,6 +1640,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     try {
       return await promise;
     } finally {
+      this._cachedDataSize = null;
       this.storageManager.markAsChanged(this.docName);
     }
   }
@@ -1556,19 +1663,15 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
   /**
    * Internal helper for applying Bulk Update or Add Record sql
    */
-  private async _applyMaybeBulkUpdateOrAddSql(sql: string, sqlParams: any[]): Promise<void> {
+  private async _applyMaybeBulkUpdateOrAddSql(sql: string, sqlParams: any[][]): Promise<void> {
     if (sqlParams.length === 1) {
-      await this.run(sql, sqlParams[0]);
+      await this.run(sql, ...sqlParams[0]);
     } else {
-      return this.prepare(sql)
-        .then(function(stmt) {
-          return bluebird.Promise.each(sqlParams, function(param: string) {
-            return bluebird.Promise.fromCallback((cb: any) => stmt.run(param, cb));
-          })
-            .then(function() {
-              return bluebird.Promise.fromCallback((cb: any) => stmt.finalize(cb));
-            });
-        });
+      const stmt = await this.prepare(sql);
+      for (const param of sqlParams) {
+        await stmt.run(...param);
+      }
+      await stmt.finalize();
     }
   }
 
@@ -1593,9 +1696,9 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     }
     const oldGristType = this._getGristType(tableId, colId);
     const oldSqlType = colInfo.type || 'BLOB';
-    const oldDefault = colInfo.dflt_value;
+    const oldDefault = fixDefault(colInfo.dflt_value);
     const newSqlType = newColType ? DocStorage._getSqlType(newColType) : oldSqlType;
-    const newDefault = newColType ? DocStorage._formattedDefault(newColType) : oldDefault;
+    const newDefault = fixDefault(newColType ? DocStorage._formattedDefault(newColType) : oldDefault);
     const newInfo = {name: newColId, type: newSqlType, dflt_value: newDefault};
     // Check if anything actually changed, and only rebuild the table then.
     if (Object.keys(newInfo).every(p => ((newInfo as any)[p] === colInfo[p]))) {
@@ -1719,6 +1822,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
         const values = query.filters[colId];
         const tableName = `_grist_tmp_${tableNames.length}_${uuidv4().replace(/-/g, '_')}`;
         await db.exec(`CREATE TEMPORARY TABLE ${tableName}(data)`);
+        tableNames.push(tableName);
         for (const valuesChunk of chunk(values, maxSQLiteVariables)) {
           const placeholders = valuesChunk.map(() => '(?)').join(',');
           await db.run(`INSERT INTO ${tableName}(data) VALUES ${placeholders}`, valuesChunk);
@@ -1726,8 +1830,9 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
         whereParts.push(`${quoteIdent(query.tableId)}.${quoteIdent(colId)} IN (SELECT data FROM ${tableName})`);
       }
       const sql = this._getSqlForQuery(query, whereParts);
+      const params = query.where?.params || [];
       try {
-        return await db.allMarshal(sql);
+        return await db.allMarshal(sql, ...params);
       } finally {
         await Promise.all(tableNames.map(tableName => db.exec(`DROP TABLE ${tableName}`)));
       }
@@ -1739,7 +1844,8 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
    * a set of WHERE terms that should be ANDed.
    */
   private _getSqlForQuery(query: ExpandedQuery, whereParts: string[]) {
-    const whereClause = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const whereCondition = combineExpr('AND', [query.where?.clause, ...whereParts]);
+    const whereClause = whereCondition ? `WHERE ${whereCondition}` : '';
     const limitClause = (typeof query.limit === 'number') ? `LIMIT ${query.limit}` : '';
     const joinClauses = query.joins ? query.joins.join(' ') : '';
     const selects = query.selects ? query.selects.join(', ') : '*';
@@ -1783,6 +1889,32 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     }
     return null;
   }
+
+  private async _addBasicFileRecord(db: SQLiteDB, fileIdent: string): Promise<boolean> {
+    // Try to insert a new record with the given ident. It'll fail the UNIQUE constraint if exists.
+    // Catching the violation is the simplest and most reliable way of doing this.
+    // If this function runs multiple times in parallel (which can happen), nothing guarantees the
+    // order that multiple `db.run` or `db.get` statements will run in (not even .execTransaction).
+    // This means it's not safe to check then insert - we just have to try the insert and see if it
+    // fails.
+    try {
+      await db.run('INSERT INTO _gristsys_Files (ident) VALUES (?)', fileIdent);
+    } catch(err) {
+      // If UNIQUE constraint failed, this ident must already exist.
+      if (/^(SQLITE_CONSTRAINT: )?UNIQUE constraint failed/.test(err.message)) {
+        return false;
+      } else {
+        throw err;
+      }
+    }
+    return true;
+  }
+
+  private async _updateFileRecord(
+    db: SQLiteDB, fileIdent: string, fileData?: Buffer, storageId?: string
+  ): Promise<void> {
+    await db.run('UPDATE _gristsys_Files SET data=?, storageId=? WHERE ident=?', fileData, storageId, fileIdent);
+  }
 }
 
 interface RebuildResult {
@@ -1811,4 +1943,18 @@ export interface IndexInfo extends IndexColumns {
  */
 export async function createAttachmentsIndex(db: ISQLiteDB) {
   await db.exec(`CREATE INDEX _grist_Attachments_fileIdent ON _grist_Attachments(fileIdent)`);
+}
+
+// Old docs may have incorrect quotes in their schema for default values
+// that node-sqlite3 may tolerate but not other wrappers. Patch such
+// material as we run into it.
+function fixDefault(def: string) {
+  return (def === '""') ? "''" : def;
+}
+
+// Information on an attached file from _gristsys_files
+export interface FileInfo {
+  ident: string;
+  storageId: string | null;
+  data: Buffer;
 }

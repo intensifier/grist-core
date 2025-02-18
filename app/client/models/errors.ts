@@ -1,6 +1,6 @@
 import {get as getBrowserGlobals} from 'app/client/lib/browserGlobals';
 import * as log from 'app/client/lib/log';
-import {INotifyOptions, Notifier} from 'app/client/models/NotifyModel';
+import {INotification, INotifyOptions, MessageType, Notifier} from 'app/client/models/NotifyModel';
 import {ApiErrorDetails} from 'app/common/ApiError';
 import {fetchFromHome, pageHasHome} from 'app/common/urlUtils';
 import isError = require('lodash/isError');
@@ -9,6 +9,15 @@ import pick = require('lodash/pick');
 const G = getBrowserGlobals('document', 'window');
 
 let _notifier: Notifier;
+
+/**
+ * Doesn't show or trigger any UI when thrown. Use it when you will handle it yourself, but
+ * need to stop any futher actions from the app. Currently only used in the model that tries
+ * to react in response of UNIQUE reference constraint validation.
+ */
+export class MutedError extends Error {
+
+}
 
 export class UserError extends Error {
   public name: string = "UserError";
@@ -44,9 +53,9 @@ export function getAppErrors(): string[] {
 /**
  * Shows normal notification without any styling or icon.
  */
-export function reportMessage(msg: string, options?: Partial<INotifyOptions>) {
+export function reportMessage(msg: MessageType, options?: Partial<INotifyOptions>): INotification|undefined {
   if (_notifier && !_notifier.isDisposed()) {
-    _notifier.createUserMessage(msg, {
+    return _notifier.createUserMessage(msg, {
       ...options
     });
   }
@@ -59,16 +68,43 @@ export function reportMessage(msg: string, options?: Partial<INotifyOptions>) {
 export function reportWarning(msg: string, options?: Partial<INotifyOptions>) {
   options = {level: 'warning', ...options};
   log.warn(`${options.level}: `, msg);
-  _logError(msg);
-  reportMessage(msg, options);
+  logError(msg);
+  return reportMessage(msg, options);
 }
 
 /**
  * Shows success toast notification (with green styling).
  */
-export function reportSuccess(msg: string, options?: Partial<INotifyOptions>) {
-  reportMessage(msg, {level: 'success', ...options});
+export function reportSuccess(msg: MessageType, options?: Partial<INotifyOptions>) {
+  return reportMessage(msg, {level: 'success', ...options});
 }
+
+function isUnhelpful(ev: ErrorEvent) {
+  if (ev.message === 'ResizeObserver loop completed with undelivered notifications.') {
+    // Sometimes on Chrome, changing the browser zoom level causes this benign error to
+    // be thrown. It seems to only appear on the Access Rules page, and may have something
+    // to do with Ace. In any case, the error seems harmless and it isn't particularly helpful,
+    // so we don't report it more than once. A quick Google search for the error message
+    // produces many reports, although at the time of this comment, none seem to be related
+    // to Ace, so there's a chance something else is amiss.
+    return true;
+  }
+
+  if (!ev.filename && !ev.lineno && ev.message?.toLowerCase().includes('script error')) {
+    // Errors from cross-origin scripts, and some add-ons, show up as unhelpful sanitized "Script
+    // error." messages. We want to know if they occur, but they are useless to the user, and useless
+    // to report multiple times. We report them just once to the server.
+    //
+    // In particular, this addresses a bug on iOS version of Firefox, which produces uncaught
+    // sanitized errors on load AND on attempts to report them, leading to a loop that hangs the
+    // browser. Reporting just once is a sufficient workaround.
+    return true;
+  }
+
+  return false;
+}
+
+const unhelpfulErrors = new Set<string>();
 
 /**
  * Report an error to the user using the global Notifier instance. If the argument is a UserError
@@ -78,13 +114,26 @@ export function reportSuccess(msg: string, options?: Partial<INotifyOptions>) {
  * Not all errors will be shown as an error toast, depending on the content of the error
  * this function might show a simple toast message.
  */
-export function reportError(err: Error|string): void {
+export function reportError(err: Error|string, ev?: ErrorEvent): void {
+  if (err instanceof MutedError) {
+    return;
+  }
   log.error(`ERROR:`, err);
   if (String(err).match(/GristWSConnection disposed/)) {
     // This error can be emitted while a page is reloaded, and isn't worth reporting.
     return;
   }
-  _logError(err);
+  if (ev && isUnhelpful(ev)) {
+    // Report just once to the server. There is little point reporting subsequent such errors once
+    // we know they happen, since each individual error has no useful information.
+    if (!unhelpfulErrors.has(ev.message)) {
+      logError(err);
+      unhelpfulErrors.add(ev.message);
+    }
+    return;
+  }
+
+  logError(err);
   if (_notifier && !_notifier.isDisposed()) {
     if (!isError(err)) {
       err = new Error(String(err));
@@ -100,7 +149,7 @@ export function reportError(err: Error|string): void {
       const options: Partial<INotifyOptions> = {
         title: "Reached plan limit",
         key: `limit:${details.limit.quantity || message}`,
-        actions: ['upgrade'],
+        actions: details.tips?.some(t => t.action === 'manage') ? ['manage'] : ['upgrade'],
       };
       if (details.tips && details.tips.some(tip => tip.action === 'add-members')) {
         // When adding members would fix a problem, give more specific advice.
@@ -154,8 +203,7 @@ export function setUpErrorHandling(doReportError = reportError, koUtil?: any) {
   }
 
   // Report also uncaught JS errors and unhandled Promise rejections.
-  G.window.onerror = ((ev: any, url: any, lineNo: any, colNo: any, err: any) =>
-    doReportError(err || ev));
+  G.window.addEventListener('error', (ev: ErrorEvent) => doReportError(ev.error || ev.message, ev));
 
   G.window.addEventListener('unhandledrejection', (ev: any) => {
     const reason = ev.reason || (ev.detail && ev.detail.reason);
@@ -175,7 +223,7 @@ export function setUpErrorHandling(doReportError = reportError, koUtil?: any) {
  * over-logging (regular errors such as access rights or account limits) and
  * under-logging (javascript errors during startup might never get reported).
  */
-function _logError(error: Error|string) {
+export function logError(error: Error|string) {
   if (!pageHasHome()) { return; }
   const docId = G.window.gristDocPageModel?.currentDocId?.get();
   fetchFromHome('/api/log', {
@@ -195,6 +243,6 @@ function _logError(error: Error|string) {
   }).catch(e => {
     // There ... isn't much we can do about this.
     // tslint:disable-next-line:no-console
-    console.warn('Failed to log event', event);
+    console.warn('Failed to log event', e);
   });
 }

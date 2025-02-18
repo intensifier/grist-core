@@ -4,13 +4,16 @@
  * and TypeTransform.
  */
 import * as commands from 'app/client/components/commands';
+import * as AceEditor from 'app/client/components/AceEditor';
 import {GristDoc} from 'app/client/components/GristDoc';
 import {ColumnRec} from 'app/client/models/entities/ColumnRec';
 import {ViewFieldRec} from 'app/client/models/entities/ViewFieldRec';
 import {TableData} from 'app/client/models/TableData';
 import {FieldBuilder} from 'app/client/widgets/FieldBuilder';
 import {UserAction} from 'app/common/DocActions';
+import {GristObjCode} from 'app/plugin/GristData';
 import {Disposable, Observable} from 'grainjs';
+import isPlainObject from 'lodash/isPlainObject';
 import * as ko from 'knockout';
 import noop = require('lodash/noop');
 
@@ -33,6 +36,7 @@ export class ColumnTransform extends Disposable {
   protected editor: AceEditor|null = null;              // Created when the dom is built by extending classes
   protected formulaUpToDate = Observable.create(this, true);
   protected _tableData: TableData;
+  protected rules: [GristObjCode.List, ...number[]]|null;
 
   // Whether _doFinalize should execute the transform, or cancel it.
   protected _shouldExecute: boolean = false;
@@ -52,6 +56,7 @@ export class ColumnTransform extends Disposable {
     this.origColumn = this.field.column();
     this.origDisplayCol = this.field.displayColModel();
     this.origWidgetOptions = this.field.widgetOptionsJson();
+    this.rules = this.origColumn.rules();
     this.isCallPending = _fieldBuilder.isCallPending;
 
     this._tableData = gristDoc.docData.getTable(this.origColumn.table().tableId())!;
@@ -84,7 +89,16 @@ export class ColumnTransform extends Disposable {
    * @param {String} optInit - Optional initial value for the editor.
    */
   protected buildEditorDom(optInit?: string) {
+    if (!this.editor) {
+      this.editor = this.autoDispose(AceEditor.create({
+        observable: this.transformColumn.formula,
+        saveValueOnBlurEvent: false,
+        // TODO: set `getSuggestions` (see `FormulaEditor.ts` for an example).
+      }));
+    }
     return this.editor.buildDom((aceObj: any) => {
+      aceObj.setOptions({placeholder: 'Enter formula.'});
+      aceObj.setHighlightActiveLine(false);
       this.editor.adjustContentToWidth();
       this.editor.attachSaveCommand();
       aceObj.on('change', () => {
@@ -141,11 +155,11 @@ export class ColumnTransform extends Disposable {
     // started doing something else, and we should finalize the transform.
     return actions.every(action => (
       // ['AddColumn', USER_TABLE, 'gristHelper_Transform', colInfo]
-      (action[2] === 'gristHelper_Transform') ||
+      (action[2]?.toString().startsWith('gristHelper_Transform')) ||
       // ['AddColumn', USER_TABLE, 'gristHelper_Converted', colInfo]
-      (action[2] === 'gristHelper_Converted') ||
+      (action[2]?.toString().startsWith('gristHelper_Converted')) ||
       // ['ConvertFromColumn', USER_TABLE, SOURCE_COLUMN, 'gristHelper_Converted']
-      (action[3] === 'gristHelper_Converted') ||
+      (action[3]?.toString().startsWith('gristHelper_Converted')) ||
       // ["SetDisplayFormula", USER_TABLE, ...]
       (action[0] === 'SetDisplayFormula') ||
       // ['UpdateRecord', '_grist_Table_column', transformColId, ...]
@@ -163,8 +177,19 @@ export class ColumnTransform extends Disposable {
   protected async addTransformColumn(colType: string): Promise<number> {
     // Retrieve widget options on prepare (useful for type transforms)
     const newColInfo = await this._tableData.sendTableAction(['AddColumn', "gristHelper_Transform", {
-      type: colType, isFormula: true, formula: this.getIdentityFormula(),
+      type: colType,
+      isFormula: true,
+      formula: this.getIdentityFormula(),
+      ...(this.origWidgetOptions ? {widgetOptions: JSON.stringify(this.origWidgetOptions)} : {}),
     }]);
+    if (this.rules) {
+      // We are in bundle, it is safe to just send another action.
+      // NOTE: We could add rules with AddColumn action, but there are some optimizations that converts array values.
+      await this.gristDoc.docData.sendActions([
+        ['UpdateRecord', '_grist_Tables_column', newColInfo.colRef, {rules: this.rules}]
+      ]);
+    }
+
     return newColInfo.colRef;
   }
 
@@ -209,9 +234,10 @@ export class ColumnTransform extends Disposable {
     } finally {
       // Wait until the change completed to set column back, to avoid value flickering.
       field.colRef(origRef);
-      void tableData.sendTableAction(['RemoveColumn', transformColId]);
+      const cleanupProm = tableData.sendTableAction(['RemoveColumn', transformColId]);
       this.cleanup();
       this.dispose();
+      await cleanupProm;
     }
   }
 
@@ -219,7 +245,11 @@ export class ColumnTransform extends Disposable {
    * The user actions to send when actually executing the transform.
    */
   protected executeActions(): UserAction[] {
+    const newWidgetOptions = isPlainObject(this.origWidgetOptions) ?
+     {...this.origWidgetOptions as object, ...this._fieldBuilder.options.peek()} :
+     this._fieldBuilder.options.peek();
     return [
+      ...this.previewActions(),
       [
         'CopyFromColumn',
         this._tableData.tableId,
@@ -229,7 +259,7 @@ export class ColumnTransform extends Disposable {
         // Those options are supposed to be set by prepTransformColInfo(TypeTransform) and
         // adjusted by client.
         // TODO: is this really needed? Aren't those options already in the data-engine?
-        JSON.stringify(this._fieldBuilder.options.peek()),
+        JSON.stringify(newWidgetOptions),
       ],
     ];
   }
@@ -249,5 +279,24 @@ export class ColumnTransform extends Disposable {
 
   protected isFinalizing(): boolean {
     return this._isFinalizing;
+  }
+
+  protected preview() {
+    if (!this.editor) { return; }
+    return this.editor.writeObservable();
+  }
+
+  /**
+   * Generates final actions before executing the transform. Used only when the editor was created.
+   */
+  protected previewActions(): UserAction[] {
+    if (!this.editor) { return []; }
+    const formula = this.editor.getValue();
+    const oldFormula = this.transformColumn.formula();
+    if (formula === oldFormula) { return []; }
+    if (!formula && !oldFormula) { return []; }
+    return [
+      ['UpdateRecord', '_grist_Tables_column', this.transformColumn.getRowId(), {formula}]
+    ];
   }
 }

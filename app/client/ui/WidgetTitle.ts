@@ -1,56 +1,131 @@
-import {FocusLayer} from 'app/client/lib/FocusLayer';
+import * as commands from 'app/client/components/commands';
+import {makeT} from 'app/client/lib/localization';
+import { FocusLayer } from 'app/client/lib/FocusLayer';
 import {ViewSectionRec} from 'app/client/models/entities/ViewSectionRec';
 import {basicButton, cssButton, primaryButton} from 'app/client/ui2018/buttons';
-import {colors, vars} from 'app/client/ui2018/cssVars';
-import {cssTextInput} from 'app/client/ui2018/editableLabel';
+import { theme } from 'app/client/ui2018/cssVars';
 import {menuCssClass} from 'app/client/ui2018/menus';
 import {ModalControl} from 'app/client/ui2018/modals';
-import {Computed, dom, DomElementArg, IInputOptions, input, makeTestId, Observable, styled} from 'grainjs';
-import {IOpenController, setPopupToCreateDom} from 'popweasel';
+import { Computed, dom, DomElementArg, makeTestId, Observable, styled } from 'grainjs';
+import {IOpenController, IPopupOptions, PopupControl, setPopupToCreateDom} from 'popweasel';
+import { descriptionInfoTooltip } from './tooltips';
+import { autoGrow } from './forms';
+import { cssInput, cssLabel, cssRenamePopup, cssTextArea } from 'app/client/ui/RenamePopupStyles';
 
 const testId = makeTestId('test-widget-title-');
+const t = makeT('WidgetTitle');
 
 interface WidgetTitleOptions {
   tableNameHidden?: boolean,
   widgetNameHidden?: boolean,
+  disabled?: boolean,
 }
 
 export function buildWidgetTitle(vs: ViewSectionRec, options: WidgetTitleOptions, ...args: DomElementArg[]) {
   const title = Computed.create(null, use => use(vs.titleDef));
-  return buildRenameWidget(vs, title, options, dom.autoDispose(title), ...args);
+  const description = Computed.create(null, use => use(vs.description));
+  return buildRenamableTitle(vs, title, description, options, dom.autoDispose(title), ...args);
 }
 
-export function buildTableName(vs: ViewSectionRec, ...args: DomElementArg[]) {
+interface TableNameOptions {
+  isEditing: Observable<boolean>,
+  disabled?: boolean,
+}
+
+export function buildTableName(vs: ViewSectionRec, options: TableNameOptions, ...args: DomElementArg[]) {
   const title = Computed.create(null, use => use(use(vs.table).tableNameDef));
-  return buildRenameWidget(vs, title, { widgetNameHidden: true }, dom.autoDispose(title), ...args);
-}
-
-export function buildRenameWidget(
-  vs: ViewSectionRec,
-  title: Observable<string>,
-  options: WidgetTitleOptions,
-  ...args: DomElementArg[]) {
-  return cssTitleContainer(
-    cssTitle(
-      testId('text'),
-      dom.text(title),
-      // In case titleDef is all blank space, make it visible on hover.
-      cssTitle.cls("-empty", use => !use(title)?.trim()),
-      elem => {
-        setPopupToCreateDom(elem, ctl => buildWidgetRenamePopup(ctl, vs, options), {
-          placement: 'bottom-start',
-          trigger: ['click'],
-          attach: 'body',
-          boundaries: 'viewport',
-        });
-      },
-      dom.on('click', (ev) => { ev.stopPropagation(); ev.preventDefault(); }),
-    ),
+  const description = Computed.create(null, use => use(vs.description));
+  return buildRenamableTitle(
+    vs,
+    title,
+    description,
+    {
+      openOnClick: false,
+      widgetNameHidden: true,
+      ...options,
+    },
+    dom.autoDispose(title),
     ...args
   );
 }
 
-function buildWidgetRenamePopup(ctrl: IOpenController, vs: ViewSectionRec, options: WidgetTitleOptions) {
+interface RenamableTitleOptions {
+  tableNameHidden?: boolean,
+  widgetNameHidden?: boolean,
+  /** Defaults to true. */
+  openOnClick?: boolean,
+  isEditing?: Observable<boolean>,
+  disabled?: boolean,
+}
+
+function buildRenamableTitle(
+  vs: ViewSectionRec,
+  title: Observable<string>,
+  description: Observable<string>,
+  options: RenamableTitleOptions,
+  ...args: DomElementArg[]
+) {
+  const {openOnClick = true, disabled = false, isEditing, ...renameTitleOptions} = options;
+  let popupControl: PopupControl | undefined;
+  return cssTitleContainer(
+    cssTitle(
+      testId('text'),
+      dom.text(title),
+      dom.on('click', () => {
+        // The popup doesn't close if `openOnClick` is false and the title is
+        // clicked. Make sure that it does.
+        if (!openOnClick) { popupControl?.close(); }
+      }),
+      // In case titleDef is all blank space, make it visible on hover.
+      cssTitle.cls("-empty", use => !use(title)?.trim()),
+      cssTitle.cls("-open-on-click", openOnClick),
+      cssTitle.cls("-disabled", disabled),
+      elem => {
+        if (disabled) { return; }
+
+        // The widget title popup can be configured to open in up to two ways:
+        //   1. When the title is clicked - done by setting `openOnClick` to `true`.
+        //   2. When `isEditing` is set to true - done by setting `isEditing` to `true`.
+        //
+        // Typically, the former should be set. The latter is useful for triggering the
+        // popup from a different part of the UI, like a menu item.
+        const trigger: IPopupOptions['trigger'] = [];
+        if (openOnClick) { trigger.push('click'); }
+        if (isEditing) {
+          trigger.push((_: Element, ctl: PopupControl) => {
+            popupControl = ctl;
+            ctl.autoDispose(isEditing.addListener((editing) => {
+              if (editing) {
+                ctl.open();
+              } else if (!ctl.isDisposed()) {
+                ctl.close();
+              }
+            }));
+          });
+        }
+        setPopupToCreateDom(elem, ctl => {
+          if (isEditing) {
+            ctl.onDispose(() => isEditing.set(false));
+          }
+
+          return buildRenameTitlePopup(ctl, vs, renameTitleOptions);
+        }, {
+          placement: 'bottom-start',
+          trigger,
+          attach: 'body',
+          boundaries: 'viewport',
+        });
+      },
+      openOnClick ? dom.on('click', (ev) => { ev.stopPropagation(); ev.preventDefault(); }) : null,
+    ),
+    dom.maybe(description, () => [
+      descriptionInfoTooltip(description.get(), "widget")
+    ]),
+    ...args
+  );
+}
+
+function buildRenameTitlePopup(ctrl: IOpenController, vs: ViewSectionRec, options: RenamableTitleOptions) {
   const tableRec = vs.table.peek();
   // If the table is a summary table.
   const isSummary = Boolean(tableRec.summarySourceTable.peek());
@@ -65,13 +140,21 @@ function buildWidgetRenamePopup(ctrl: IOpenController, vs: ViewSectionRec, optio
   // Placeholder for widget title:
   // - when widget title is empty shows a default widget title (what would be shown when title is empty)
   // - when widget title is set, shows just a text to override it.
-  const inputWidgetPlaceholder = !vs.title.peek() ? 'Override widget title' : vs.defaultWidgetTitle.peek();
+  const inputWidgetPlaceholder = !vs.title.peek() ? t("Override widget title") : vs.defaultWidgetTitle.peek();
+
+  // User input for widget description
+  const inputWidgetDesc = Observable.create(ctrl, vs.description.peek() ?? '');
 
   const disableSave = Computed.create(ctrl, (use) => {
     const newTableName = use(inputTableName)?.trim() ?? '';
     const newWidgetTitle = use(inputWidgetTitle)?.trim() ?? '';
+    const newWidgetDesc = use(inputWidgetDesc)?.trim() ?? '';
     // Can't save when table name is empty or there wasn't any change.
-    return !newTableName || (newTableName === tableName && newWidgetTitle === use(vs.title));
+    return !newTableName || (
+      newTableName === tableName
+      && newWidgetTitle === use(vs.title)
+      && newWidgetDesc === use(vs.description)
+    );
   });
 
   const modalCtl = ModalControl.create(ctrl, () => ctrl.close());
@@ -97,10 +180,20 @@ function buildWidgetRenamePopup(ctrl: IOpenController, vs: ViewSectionRec, optio
       await vs.title.saveOnly(newTitle);
     }
   };
-  const doSave = modalCtl.doWork(() => Promise.all([
+
+  const saveWidgetDesc = async () => {
+    const newWidgetDesc = inputWidgetDesc.get().trim() ?? '';
+    // If value was changed.
+    if (newWidgetDesc !== vs.description.peek()) {
+      await vs.description.saveOnly(newWidgetDesc);
+    }
+  };
+
+  const save = () => Promise.all([
     saveTableName(),
-    saveWidgetTitle()
-  ]), {close: true});
+    saveWidgetTitle(),
+    saveWidgetDesc()
+  ]);
 
   function initialFocus() {
     const isRawView = !widgetInput;
@@ -120,52 +213,117 @@ function buildWidgetRenamePopup(ctrl: IOpenController, vs: ViewSectionRec, optio
     }
   }
 
-  // Build actual dom that looks like:
-  // DATA TABLE NAME
-  // [input]
-  // WIDGET TITLE
-  // [input]
-  // [Save] [Cancel]
+  // When the popup is closing we will save everything, unless the user has pressed the cancel button.
+  let cancelled = false;
+
+  // Function to close the popup with saving.
+  const close = () => ctrl.close();
+
+  // Function to close the popup without saving.
+  const cancel = () => { cancelled = true; close(); };
+
+  // Function that is called when popup is closed.
+  const onClose = () => {
+    if (!cancelled) {
+      save().catch(reportError);
+    }
+  };
+
+  // User interface for the popup.
+  const myCommands = {
+    // Escape key: just close the popup.
+    cancel,
+    // Enter key: save and close the popup, unless the description input is focused.
+    // There is also a variant for Ctrl+Enter which will always save.
+    accept: () => {
+      // Enters are ignored in the description input (unless ctrl is pressed)
+      if (document.activeElement === descInput) { return true; }
+      close();
+    },
+    // ArrowUp
+    cursorUp: () => {
+      // moves focus to the widget title input if it is already at the top of widget description
+      if (document.activeElement === descInput && descInput?.selectionStart === 0) {
+        widgetInput?.focus();
+        widgetInput?.select();
+      } else if (document.activeElement === widgetInput) {
+        tableInput?.focus();
+        tableInput?.select();
+      } else {
+        return true;
+      }
+    },
+    // ArrowDown
+    cursorDown: () => {
+      if (document.activeElement === tableInput) {
+        widgetInput?.focus();
+        widgetInput?.select();
+      } else if (document.activeElement === widgetInput) {
+        descInput?.focus();
+        descInput?.select();
+      } else {
+        return true;
+      }
+    }
+  };
+
+  // Create this group and attach it to the popup and all inputs.
+  const commandGroup = commands.createGroup({ ...myCommands }, ctrl, true);
+
   let tableInput: HTMLInputElement|undefined;
   let widgetInput: HTMLInputElement|undefined;
+  let descInput: HTMLTextAreaElement | undefined;
   return cssRenamePopup(
     // Create a FocusLayer to keep focus in this popup while it's active, and prevent keyboard
     // shortcuts from being seen by the view underneath.
-    elem => { FocusLayer.create(ctrl, {defaultFocusElem: elem, pauseMousetrap: true}); },
+    elem => { FocusLayer.create(ctrl, { defaultFocusElem: elem, pauseMousetrap: false }); },
+    dom.onDispose(onClose),
+    dom.autoDispose(commandGroup),
     testId('popup'),
     dom.cls(menuCssClass),
     dom.maybe(!options.tableNameHidden, () => [
-      cssLabel('DATA TABLE NAME'),
+      cssLabel(t("DATA TABLE NAME")),
       // Update tableName on key stroke - this will show the default widget name as we type.
       // above this modal.
       tableInput = cssInput(
         inputTableName,
         updateOnKey,
-        {disabled: isSummary, placeholder: 'Provide a table name'},
-        testId('table-name-input')
+        {disabled: isSummary, placeholder: t("Provide a table name")},
+        testId('table-name-input'),
+        commandGroup.attach(),
       ),
     ]),
     dom.maybe(!options.widgetNameHidden, () => [
-      cssLabel('WIDGET TITLE'),
+      cssLabel(t("WIDGET TITLE")),
       widgetInput = cssInput(inputWidgetTitle, updateOnKey, {placeholder: inputWidgetPlaceholder},
-        testId('section-name-input')
+        testId('section-name-input'),
+        commandGroup.attach(),
       ),
     ]),
+    cssLabel(t("WIDGET DESCRIPTION")),
+    descInput = cssTextArea(inputWidgetDesc, updateOnKey,
+      testId('section-description-input'),
+      commandGroup.attach(),
+      autoGrow(inputWidgetDesc),
+    ),
     cssButtons(
-      primaryButton('Save',
-        dom.on('click', doSave),
+      primaryButton(t("Save"),
+        dom.on('click', close),
         dom.boolAttr('disabled', use => use(disableSave) || use(modalCtl.workInProgress)),
         testId('save'),
       ),
-      basicButton('Cancel',
+      basicButton(t("Cancel"),
         testId('cancel'),
-        dom.on('click', () => modalCtl.close())
+        dom.on('click', cancel)
       ),
     ),
     dom.onKeyDown({
-      Escape: () => modalCtl.close(),
-      // On enter save or cancel - depending on the change.
-      Enter: () => disableSave.get() ? modalCtl.close() : doSave(),
+      Enter$: e => {
+        if (e.ctrlKey || e.metaKey) {
+          close();
+          return false;
+        }
+      }
     }),
     elem => { setTimeout(initialFocus, 0); },
   );
@@ -178,41 +336,28 @@ const cssTitleContainer = styled('div', `
   flex: 1 1 0px;
   min-width: 0px;
   display: flex;
+  .info_toggle_icon {
+    width: 13px;
+    height: 13px;
+  }
 `);
 
 const cssTitle = styled('div', `
-  cursor: pointer;
   overflow: hidden;
   border-radius: 3px;
   margin: -4px;
   padding: 4px;
   text-overflow: ellipsis;
   align-self: start;
-  &:hover {
-    background-color: ${colors.mediumGrey};
+  &-open-on-click:not(&-disabled) {
+    cursor: pointer;
+  }
+  &-open-on-click:not(&-disabled):hover {
+    background-color: ${theme.hover};
   }
   &-empty {
     min-width: 48px;
     min-height: 23px;
-  }
-`);
-
-const cssRenamePopup = styled('div', `
-  display: flex;
-  flex-direction: column;
-  min-width: 280px;
-  padding: 16px;
-  background-color: white;
-  border-radius: 2px;
-  outline: none;
-`);
-
-const cssLabel = styled('label', `
-  font-size: ${vars.xsmallFontSize};
-  font-weight: ${vars.bigControlTextWeight};
-  margin: 0 0 8px 0;
-  &:not(:first-child) {
-    margin-top: 16px;
   }
 `);
 
@@ -221,26 +366,5 @@ const cssButtons = styled('div', `
   margin-top: 16px;
   & > .${cssButton.className}:not(:first-child) {
     margin-left: 8px;
-  }
-`);
-
-const cssInputWithIcon = styled('div', `
-  position: relative;
-  display: flex;
-  flex-direction: column;
-`);
-
-const cssInput = styled((
-  obs: Observable<string>,
-  opts: IInputOptions,
-  ...args) => input(obs, opts, cssTextInput.cls(''), ...args), `
-  text-overflow: ellipsis;
-  &:disabled {
-    color: ${colors.slate};
-    background-color: ${colors.lightGrey};
-    pointer-events: none;
-  }
-  .${cssInputWithIcon.className} > &:disabled {
-    padding-right: 28px;
   }
 `);

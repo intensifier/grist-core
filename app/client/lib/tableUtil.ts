@@ -3,12 +3,12 @@ import {get as getBrowserGlobals} from 'app/client/lib/browserGlobals';
 import type {KoArray} from 'app/client/lib/koArray';
 import {simpleStringHash} from 'app/client/lib/textUtils';
 import type {ViewFieldRec} from 'app/client/models/DocModel';
-import type {BulkUpdateRecord} from 'app/common/DocActions';
+import TableModel from 'app/client/models/TableModel';
+import type {BulkColValues, BulkUpdateRecord} from 'app/common/DocActions';
 import {safeJsonParse} from 'app/common/gutil';
 import type {TableData} from 'app/common/TableData';
 import {tsvEncode} from 'app/common/tsvFormat';
 import {dom} from 'grainjs';
-import map = require('lodash/map');
 import zipObject = require('lodash/zipObject');
 
 const G = getBrowserGlobals('document', 'DOMParser');
@@ -31,12 +31,16 @@ export function fieldInsertPositions(viewFields: KoArray<ViewFieldRec>, index: n
  * @param {CopySelection} selection - a CopySelection instance
  * @return {String}
  **/
-export function makePasteText(tableData: TableData, selection: CopySelection) {
+export function makePasteText(tableData: TableData, selection: CopySelection, includeColHeaders: boolean) {
   // tsvEncode expects data as a 2-d array with each a array representing a row
   // i.e. [["1-1", "1-2", "1-3"],["2-1", "2-2", "2-3"]]
-  const values = selection.rowIds.map(rowId =>
-    selection.columns.map(col => col.fmtGetter(rowId)));
-  return tsvEncode(values);
+  const result = [];
+  if (includeColHeaders) {
+    result.push(selection.fields.map(f => f.label()));
+  }
+  result.push(...selection.rowIds.map(rowId =>
+    selection.columns.map(col => col.fmtGetter(rowId))));
+  return tsvEncode(result);
 }
 
 /**
@@ -71,7 +75,7 @@ export function makePasteHtml(tableData: TableData, selection: CopySelection, in
     )),
     // Include column headers if requested.
     (includeColHeaders ?
-      dom('tr', selection.colIds.map(colId => dom('th', colId))) :
+      dom('tr', selection.fields.map(field => dom('th', field.label()))) :
       null
     ),
     // Fill with table cells.
@@ -134,8 +138,11 @@ export function parsePasteHtml(data: string): RichPasteObject[][] {
 }
 
 // Helper function to add css style properties to an html tag
-function _styleAttr(style: object) {
-  return map(style, (value, prop) => `${prop}: ${value};`).join(' ');
+function _styleAttr(style: object|undefined) {
+  if (typeof style !== 'object') {
+    return '';
+  }
+  return Object.entries(style).map(([prop, value]) => `${prop}: ${value};`).join(' ');
 }
 
 /**
@@ -165,4 +172,26 @@ export function makeDeleteAction(selection: CopySelection): BulkUpdateRecord|nul
   }
   return ['BulkUpdateRecord', tableId, rowIds,
     zipObject(colIds, colIds.map(() => blankRow))];
+}
+
+
+/**
+ * Fills currently selected grid with the contents of the top row in that selection.
+ */
+export function fillSelectionDown(selection: CopySelection, tableModel: TableModel) {
+  const rowIds = selection.rowIds.filter((r): r is number => (typeof r === 'number'));
+  if (rowIds.length <= 1) {
+    return;
+  }
+  const nonFormulaColumns = selection.fields.map(f => f.column.peek()).filter(col => !col.isFormula.peek());
+  if (nonFormulaColumns.length === 0) {
+    return;
+  }
+  const colInfo: BulkColValues = {};
+  for (const col of nonFormulaColumns) {
+    const colId = col.colId.peek();
+    const val = tableModel.tableData.getValue(rowIds[0], colId)!;
+    colInfo[colId] = rowIds.map(() => val);
+  }
+  return tableModel.sendTableAction(["BulkUpdateRecord", rowIds, colInfo]);
 }

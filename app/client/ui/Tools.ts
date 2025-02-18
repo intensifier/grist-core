@@ -1,22 +1,34 @@
+import {ACLUsersPopup} from 'app/client/aclui/ACLUsers';
 import {GristDoc} from 'app/client/components/GristDoc';
+import {makeT} from 'app/client/lib/localization';
 import {urlState} from 'app/client/models/gristUrlState';
 import {getUserOrgPrefObs, markAsSeen} from 'app/client/models/UserPrefs';
 import {showExampleCard} from 'app/client/ui/ExampleCard';
-import {examples} from 'app/client/ui/ExampleInfo';
-import {createHelpTools, cssLinkText, cssPageEntry, cssPageEntryMain, cssPageEntrySmall,
-        cssPageIcon, cssPageLink, cssSectionHeader, cssSpacer, cssSplitPageEntry,
-        cssTools} from 'app/client/ui/LeftPanelCommon';
-import {hoverTooltip, tooltipCloseButton} from 'app/client/ui/tooltips';
-import {colors} from 'app/client/ui2018/cssVars';
+import {buildExamples} from 'app/client/ui/ExampleInfo';
+import {
+  createHelpTools,
+  cssLinkText,
+  cssMenuTrigger,
+  cssPageEntry,
+  cssPageEntryMain,
+  cssPageEntrySmall,
+  cssPageIcon,
+  cssPageLink,
+  cssSectionHeader,
+  cssSectionHeaderText,
+  cssSpacer,
+  cssSplitPageEntry,
+  cssTools
+} from 'app/client/ui/LeftPanelCommon';
+import {theme} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
-import {cssLink} from 'app/client/ui2018/links';
-import {menuAnnotate} from 'app/client/ui2018/menus';
 import {confirmModal} from 'app/client/ui2018/modals';
-import {userOverrideParams} from 'app/common/gristUrls';
 import {isOwner} from 'app/common/roles';
 import {Disposable, dom, makeTestId, Observable, observable, styled} from 'grainjs';
+import noop from 'lodash/noop';
 
 const testId = makeTestId('test-tools-');
+const t = makeT('Tools');
 
 export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Observable<boolean>): Element {
   const docPageModel = gristDoc.docPageModel;
@@ -31,18 +43,35 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
   updateCanViewAccessRules();
   return cssTools(
     cssTools.cls('-collapsed', (use) => !use(leftPanelOpen)),
-    cssSectionHeader("TOOLS"),
+    cssSectionHeader(cssSectionHeaderText(t("TOOLS"))),
     cssPageEntry(
       cssPageEntry.cls('-selected', (use) => use(gristDoc.activeViewId) === 'acl'),
       cssPageEntry.cls('-disabled', (use) => !use(canViewAccessRules)),
-      dom.domComputed(canViewAccessRules, (_canViewAccessRules) => {
+      dom.domComputedOwned(canViewAccessRules, (computedOwner, _canViewAccessRules) => {
+        const aclUsers = ACLUsersPopup.create(computedOwner, docPageModel);
+        if (_canViewAccessRules) {
+          aclUsers.load()
+          // getUsersForViewAs() could fail for couple good reasons (access deny to anon user,
+          // `document not found` when anon creates a new empty document, ...), users can have more
+          // info by opening acl page, so let's silently fail here.
+            .catch(noop);
+        }
         return cssPageLink(
           cssPageIcon('EyeShow'),
-          cssLinkText('Access Rules',
-            menuAnnotate('Beta', cssBetaTag.cls(''))
-          ),
+          cssLinkText(t("Access Rules")),
           _canViewAccessRules ? urlState().setLinkUrl({docPage: 'acl'}) : null,
-          isOverridden ? addRevertViewAsUI() : null,
+          cssMenuTrigger(
+            icon('Dots'),
+            aclUsers.menu({
+              placement: 'bottom-start',
+              parentSelectorToMark: '.' + cssPageEntry.className
+            }),
+
+            // Clicks on the menu trigger shouldn't follow the link that it's contained in.
+            dom.on('click', (ev) => { ev.stopPropagation(); ev.preventDefault(); }),
+            testId('access-rules-trigger'),
+            dom.show(use => use(aclUsers.isInitialized) && _canViewAccessRules),
+          ),
         );
       }),
       testId('access-rules'),
@@ -51,35 +80,37 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
       cssPageEntry.cls('-selected', (use) => use(gristDoc.activeViewId) === 'data'),
       cssPageLink(
         cssPageIcon('Database'),
-        cssLinkText('Raw Data'),
+        cssLinkText(t("Raw Data")),
         testId('raw'),
         urlState().setLinkUrl({docPage: 'data'})
       )
     ),
     cssPageEntry(
-      cssPageLink(cssPageIcon('Log'), cssLinkText('Document History'), testId('log'),
+      cssPageLink(cssPageIcon('Log'), cssLinkText(t("Document History")), testId('log'),
         dom.on('click', () => gristDoc.showTool('docHistory')))
-    ),
-    // TODO: polish validation and add it back
-    dom.maybe((use) => use(gristDoc.app.features).validationsTool, () =>
-      cssPageEntry(
-        cssPageLink(cssPageIcon('Validation'), cssLinkText('Validate Data'), testId('validate'),
-          dom.on('click', () => gristDoc.showTool('validations'))))
     ),
     cssPageEntry(
       cssPageEntry.cls('-selected', (use) => use(gristDoc.activeViewId) === 'code'),
       cssPageLink(cssPageIcon('Code'),
-        cssLinkText('Code View'),
+        cssLinkText(t("Code View")),
         urlState().setLinkUrl({docPage: 'code'})
       ),
       testId('code'),
     ),
+    cssPageEntry(
+      cssPageEntry.cls('-selected', (use) => use(gristDoc.activeViewId) === 'settings'),
+      cssPageLink(cssPageIcon('Settings'),
+        cssLinkText(t("Settings")),
+        urlState().setLinkUrl({docPage: 'settings'})
+      ),
+      testId('settings'),
+    ),
     cssSpacer(),
     dom.maybe(docPageModel.currentDoc, (doc) => {
-      const ex = examples.find(e => e.urlId === doc.urlId);
+      const ex = buildExamples().find(e => e.urlId === doc.urlId);
       if (!ex || !ex.tutorialUrl) { return null; }
       return cssPageEntry(
-        cssPageLink(cssPageIcon('Page'), cssLinkText('How-to Tutorial'), testId('tutorial'),
+        cssPageLink(cssPageIcon('Page'), cssLinkText(t("How-to Tutorial")), testId('tutorial'),
           {href: ex.tutorialUrl, target: '_blank'},
           cssExampleCardOpener(
             icon('TypeDetails'),
@@ -95,18 +126,18 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
       );
     }),
     // Show the 'Tour of this Document' button if a GristDocTour table exists.
-    dom.maybe(gristDoc.hasDocTour, () =>
+    dom.maybe(use => use(gristDoc.docModel.hasDocTour) && !use(gristDoc.docModel.isTutorial), () =>
       cssSplitPageEntry(
         cssPageEntryMain(
           cssPageLink(cssPageIcon('Page'),
-            cssLinkText('Tour of this Document'),
+            cssLinkText(t("Tour of this Document")),
             urlState().setLinkUrl({docTour: true}),
             testId('doctour'),
           ),
         ),
         !isDocOwner ? null : cssPageEntrySmall(
           cssPageLink(cssPageIcon('Remove'),
-            dom.on('click', () => confirmModal('Delete document tour?', 'Delete', () =>
+            dom.on('click', () => confirmModal(t("Delete document tour?"), t("Delete"), () =>
               gristDoc.docData.sendAction(['RemoveTable', 'GristDocTour']))
             ),
             testId('remove-doctour')
@@ -176,43 +207,6 @@ export interface AutomaticHelpToolInfo {
   markAsSeen: () => void;
 }
 
-// When viewing a page as another user, the "Access Rules" page link includes a button to revert
-// the user and open the page, and a click on the page link shows a tooltip to revert.
-function addRevertViewAsUI() {
-  return [
-    // A button that allows reverting back to yourself.
-    dom('a',
-      cssExampleCardOpener.cls(''),
-      cssRevertViewAsButton.cls(''),
-      icon('Convert'),
-      urlState().setHref(userOverrideParams(null, {docPage: 'acl'})),
-      dom.on('click', (ev) => ev.stopPropagation()),    // Avoid refreshing the tooltip.
-      testId('revert-view-as'),
-    ),
-
-    // A tooltip that allows reverting back to yourself.
-    hoverTooltip((ctl) =>
-      cssConvertTooltip(icon('Convert'),
-        cssLink('Return to viewing as yourself',
-          urlState().setHref(userOverrideParams(null, {docPage: 'acl'})),
-        ),
-        tooltipCloseButton(ctl),
-      ),
-      {openOnClick: true}
-    ),
-  ];
-}
-
-const cssConvertTooltip = styled('div', `
-  display: flex;
-  align-items: center;
-  --icon-color: ${colors.lightGreen};
-
-  & > .${cssLink.className} {
-    margin-left: 8px;
-  }
-`);
-
 const cssExampleCardOpener = styled('div', `
   cursor: pointer;
   margin-right: 4px;
@@ -223,25 +217,12 @@ const cssExampleCardOpener = styled('div', `
   width: 24px;
   padding: 4px;
   line-height: 0px;
-  --icon-color: ${colors.light};
-  background-color: ${colors.lightGreen};
+  --icon-color: ${theme.iconButtonFg};
+  background-color: ${theme.iconButtonPrimaryBg};
   &:hover {
-    background-color: ${colors.darkGreen};
+    background-color: ${theme.iconButtonPrimaryHoverBg};
   }
   .${cssTools.className}-collapsed & {
     display: none;
-  }
-`);
-
-const cssRevertViewAsButton = styled(cssExampleCardOpener, `
-  background-color: ${colors.darkGrey};
-  &:hover {
-    background-color: ${colors.slate};
-  }
-`);
-
-const cssBetaTag = styled('div', `
-  .${cssPageEntry.className}-disabled & {
-    opacity: 0.4;
   }
 `);

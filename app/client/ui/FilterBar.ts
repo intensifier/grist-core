@@ -1,83 +1,123 @@
-import { allInclusive } from "app/client/models/ColumnFilter";
-import { ColumnRec, ViewFieldRec, ViewSectionRec } from "app/client/models/DocModel";
+import { GristDoc } from "app/client/components/GristDoc";
+import { NEW_FILTER_JSON } from "app/client/models/ColumnFilter";
+import { ColumnRec, ViewSectionRec } from "app/client/models/DocModel";
 import { FilterInfo } from "app/client/models/entities/ViewSectionRec";
 import { attachColumnFilterMenu } from "app/client/ui/ColumnFilterMenu";
-import { cssButton, cssButtonGroup } from "app/client/ui2018/buttons";
-import { colors, testId } from "app/client/ui2018/cssVars";
+import { cssButton } from "app/client/ui2018/buttons";
+import { testId, theme, vars } from "app/client/ui2018/cssVars";
 import { icon } from "app/client/ui2018/icons";
-import { menu, menuItemAsync } from "app/client/ui2018/menus";
 import { dom, IDisposableOwner, IDomArgs, styled } from "grainjs";
-import { IMenuOptions, PopupControl } from "popweasel";
+import { IPopupOptions, PopupControl } from "popweasel";
+import { makeT } from "app/client/lib/localization";
+import { dropdownWithSearch } from "app/client/ui/searchDropdown";
 
-export function filterBar(_owner: IDisposableOwner, viewSection: ViewSectionRec) {
+const t = makeT('FilterBar');
+
+export function filterBar(
+  _owner: IDisposableOwner,
+  gristDoc: GristDoc,
+  viewSection: ViewSectionRec
+) {
   const popupControls = new WeakMap<ColumnRec, PopupControl>();
   return cssFilterBar(
     testId('filter-bar'),
-    dom.forEach(viewSection.activeFilters, (filterInfo) => makeFilterField(viewSection, filterInfo, popupControls)),
+    dom.forEach(viewSection.activeFilters, (filterInfo) => makeFilterField(filterInfo, popupControls)),
+    dom.maybe(viewSection.showNestedFilteringPopup, () => {
+      return dom('div',
+        gristDoc.behavioralPromptsManager.attachPopup('nestedFiltering', {
+          onDispose: () => viewSection.showNestedFilteringPopup.set(false),
+        }),
+      );
+    }),
     makePlusButton(viewSection, popupControls),
+    cssFilterBar.cls('-hidden', use => use(viewSection.pinnedActiveFilters).length === 0),
   );
 }
 
-function makeFilterField(viewSection: ViewSectionRec, filterInfo: FilterInfo,
-                         popupControls: WeakMap<ColumnRec, PopupControl>) {
+function makeFilterField(filterInfo: FilterInfo, popupControls: WeakMap<ColumnRec, PopupControl>) {
+  const {fieldOrColumn, filter, pinned, isPinned} = filterInfo;
   return cssFilterBarItem(
     testId('filter-field'),
-    primaryButton(
+    cssFilterBarItemButton(
       testId('btn'),
-      cssIcon('FilterSimple'),
-      cssMenuTextLabel(dom.text(filterInfo.fieldOrColumn.origCol().label)),
-      cssBtn.cls('-grayed', filterInfo.filter.isSaved),
-      attachColumnFilterMenu(viewSection, filterInfo, {
-        placement: 'bottom-start', attach: 'body',
-        trigger: ['click', (_el, popupControl) => popupControls.set(filterInfo.fieldOrColumn.origCol(), popupControl)]
+      cssFilterBarItemIcon('FilterSimple'),
+      cssMenuTextLabel(dom.text(fieldOrColumn.origCol().label)),
+      cssBtn.cls('-grayed', use => use(filter.isSaved) && use(pinned.isSaved)),
+      attachColumnFilterMenu(filterInfo, {
+        popupOptions: {
+          placement: 'bottom-start',
+          attach: 'body',
+          trigger: [
+            'click',
+            (_el, popupControl) => popupControls.set(fieldOrColumn.origCol(), popupControl),
+          ],
+        },
+        showAllFiltersButton: true,
       }),
     ),
-    deleteButton(
-      testId('delete'),
-      cssIcon('CrossSmall'),
-      cssBtn.cls('-grayed', filterInfo.filter.isSaved),
-      dom.on('click', () => viewSection.setFilter(filterInfo.fieldOrColumn.origCol().origColRef(), '')),
-    )
+    cssFilterBarItem.cls('-unpinned', use => !use(isPinned)),
   );
 }
 
-export function addFilterMenu(filters: FilterInfo[], viewSection: ViewSectionRec,
-                              popupControls: WeakMap<ColumnRec, PopupControl>, options?: IMenuOptions) {
+export interface AddFilterMenuOptions {
+  /**
+   * If 'only-unfiltered', only columns without active filters will be selectable in
+   * the menu.
+   *
+   * If 'unpinned-or-unfiltered', columns that have active filters but are not pinned
+   * will also be selectable.
+   *
+   * Defaults to `only-unfiltered'.
+   */
+  allowedColumns?: 'only-unfiltered' | 'unpinned-or-unfiltered';
+  /**
+   * Options that are passed to the menu component.
+   */
+  menuOptions?: IPopupOptions;
+}
+
+export function addFilterMenu(
+  filters: FilterInfo[],
+  popupControls: WeakMap<ColumnRec, PopupControl>,
+  options: AddFilterMenuOptions = {}
+) {
+  const {allowedColumns, menuOptions} = options;
   return (
-    menu((ctl) => [
-      ...filters.map((filterInfo) => (
-        menuItemAsync(
-          () => turnOnAndOpenFilter(filterInfo.fieldOrColumn, viewSection, popupControls),
-          filterInfo.fieldOrColumn.origCol().label.peek(),
-          dom.cls('disabled', filterInfo.isFiltered),
-          testId('add-filter-item'),
-        )
-      )),
-      // We need to stop click event to propagate otherwise it would cause view section menu to
-      // close.
-      dom.on('click', (ev) => {
-        ctl.close();
-        ev.stopPropagation();
-      }),
-    ], options)
+    dropdownWithSearch<FilterInfo>({
+      action: (filterInfo) => openFilter(filterInfo, popupControls),
+      options: () => filters.map((filterInfo) => ({
+        label: filterInfo.fieldOrColumn.origCol().label.peek(),
+        value: filterInfo,
+        disabled: allowedColumns === 'unpinned-or-unfiltered'
+          ? filterInfo.isPinned.peek() && filterInfo.isFiltered.peek()
+          : filterInfo.isFiltered.peek()
+      })),
+      popupOptions: menuOptions,
+      placeholder: t('Search Columns'),
+    })
   );
 }
 
-function turnOnAndOpenFilter(fieldOrColumn: ViewFieldRec|ColumnRec, viewSection: ViewSectionRec,
-                             popupControls: WeakMap<ColumnRec, PopupControl>) {
-  viewSection.setFilter(fieldOrColumn.origCol().origColRef(), allInclusive);
+function openFilter(
+  {fieldOrColumn, isFiltered, viewSection}: FilterInfo,
+  popupControls: WeakMap<ColumnRec, PopupControl>,
+) {
+  viewSection.setFilter(fieldOrColumn.origCol().origColRef(), {
+    filter: isFiltered.peek() ? undefined : NEW_FILTER_JSON,
+    pinned: true,
+  });
   popupControls.get(fieldOrColumn.origCol())?.open();
 }
 
 function makePlusButton(viewSectionRec: ViewSectionRec, popupControls: WeakMap<ColumnRec, PopupControl>) {
   return dom.domComputed((use) => {
     const filters = use(viewSectionRec.filters);
-    const anyFilter = use(viewSectionRec.activeFilters).length > 0;
     return cssPlusButton(
       cssBtn.cls('-grayed'),
-      cssIcon('Plus'),
-      addFilterMenu(filters, viewSectionRec, popupControls),
-      anyFilter ? null : cssPlusLabel('Add Filter'),
+      cssPlusIcon('Plus'),
+      addFilterMenu(filters, popupControls, {
+        allowedColumns: 'unpinned-or-unfiltered',
+      }),
       testId('add-filter-btn')
     );
   });
@@ -86,57 +126,60 @@ function makePlusButton(viewSectionRec: ViewSectionRec, popupControls: WeakMap<C
 const cssFilterBar = styled('div.filter_bar', `
   display: flex;
   flex-direction: row;
-  margin-bottom: 8px;
-  margin-left: -4px;
-  overflow-x: scroll;
-  scrollbar-width: none;
-  &::-webkit-scrollbar {
+  flex-wrap: wrap;
+  row-gap: 8px;
+  margin: 8px 0px 8px -4px;
+  &-hidden {
     display: none;
   }
 `);
-const cssFilterBarItem = styled(cssButtonGroup, `
-  flex-shrink: 0;
+const cssFilterBarItem = styled('div', `
+  flex: 1 1 80px;
+  min-width: 0px;
+  max-width: max-content;
+  border-radius: ${vars.controlBorderRadius};
   margin: 0 4px;
-  & > .${cssButton.className}:first-child {
-    border-right: 0.5px solid white;
+  &-unpinned {
+    display: none;
   }
+`);
+const cssFilterBarItemIcon = styled(icon, `
+  flex-shrink: 0;
 `);
 const cssMenuTextLabel = styled('span', `
   flex-grow: 1;
-  padding: 0 4px;
   overflow: hidden;
+  white-space: nowrap;
   text-overflow: ellipsis;
 `);
-const cssIcon = styled(icon, `
+const cssPlusIcon = styled(icon, `
   margin-top: -3px;
 `);
 const cssBtn = styled('div', `
+  display: flex;
+  align-items: center;
+  column-gap: 4px;
+
   height: 24px;
   padding: 3px 8px;
   .${cssFilterBar.className} > & {
     margin: 0 4px;
   }
   &-grayed {
-    color:        ${colors.light};
-    --icon-color: ${colors.light};
-    background-color: ${colors.slate};
-    border-color: ${colors.slate};
+    color:        ${theme.filterBarButtonSavedFg};
+    --icon-color: ${theme.filterBarButtonSavedFg};
+    background-color: ${theme.filterBarButtonSavedBg};
+    border-color: ${theme.filterBarButtonSavedBg};
   }
   &-grayed:hover {
-    background-color: ${colors.darkGrey};
-    border-color: ${colors.darkGrey};
+    background-color: ${theme.filterBarButtonSavedHoverBg};
+    border-color: ${theme.filterBarButtonSavedHoverBg};
   }
 `);
-const primaryButton = (...args: IDomArgs<HTMLDivElement>) => (
+const cssFilterBarItemButton = (...args: IDomArgs<HTMLDivElement>) => (
   dom('div', cssButton.cls(''), cssButton.cls('-primary'),
       cssBtn.cls(''), ...args)
 );
-const deleteButton = styled(primaryButton, `
-  padding: 3px 4px;
-`);
-const cssPlusButton = styled(primaryButton, `
+const cssPlusButton = styled(cssFilterBarItemButton, `
   padding: 3px 3px
-`);
-const cssPlusLabel = styled('span', `
-  margin: 0 12px 0 4px;
 `);

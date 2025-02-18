@@ -5,38 +5,33 @@
 
 .viewsection_buttons {
   margin-left: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
 }
 
 .viewsection_title {
+  align-items: center;
   flex-shrink: 0;
   cursor: default;
-  height: 24px;
+  min-height: 24px;
   margin-left: -16px;   /* to include drag handle that shows up on hover */
-  color: var(--grist-color-slate);
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.viewsection_title, .viewsection_title_font {
+  color: var(--grist-theme-text-light, var(--grist-color-slate));
   font-size: var(--grist-small-font-size);
   font-weight: 500;
-  white-space: nowrap;
 }
 
 .viewsection_content {
-  background-color: #ffffff;
   overflow: visible;
   margin: 12px;
-}
-
-/* TODO should be switched to use new icon */
-.viewsection_drag_indicator {
-  visibility: hidden;
-  top: 1px;
-  width: 16px;
-  height: 16px;
-  margin: 0;
-  padding: 0px;
-}
-
-.viewsection_title:hover .viewsection_drag_indicator.layout_grabbable {
-  visibility: visible;
-  z-index: 100;   /* ensure it's above the resizer line, since it's hard to grab otherwise */
+  background-color: var(--grist-theme-widget-bg, white);
 }
 
 .viewsection_btn {
@@ -91,19 +86,19 @@
 .view_data_pane_container {
   position: relative;
   flex: auto;
-  border: 1px solid var(--grist-color-dark-grey);
+  border: 1px solid var(--grist-theme-widget-border, var(--grist-color-dark-grey));
 }
 
 @media not print {
 .active_section > .view_data_pane_container {
-  box-shadow: -2px 0 0 0px var(--grist-color-light-green);
-  border-left: 1px solid var(--grist-color-light-green);
+  box-shadow: -2px 0 0 0px var(--grist-theme-widget-active-border, var(--grist-color-light-green));
+  border-left: 1px solid var(--grist-theme-widget-active-border, var(--grist-color-light-green));
 }
 
 .active_section > .view_data_pane_container.viewsection_type_detail {
   /* this color is a translucent version of grist-color-light-green */
-  box-shadow: -2px 0 0 0px var(--grist-color-inactive-cursor);
-  border-left: 1px solid var(--grist-color-inactive-cursor);
+  box-shadow: -2px 0 0 0px var(--grist-theme-cursor-inactive, var(--grist-color-inactive-cursor));
+  border-left: 1px solid var(--grist-theme-cursor-inactive, var(--grist-color-inactive-cursor));
 }
 }
 
@@ -111,8 +106,21 @@
 .active_section--no-indicator > .view_data_pane_container,
 .active_section--no-indicator > .view_data_pane_container.viewsection_type_detail {
   box-shadow: none;
-  border-left: 1px solid var(--grist-color-dark-grey);
+  border-left: 1px solid var(--grist-theme-widget-border, var(--grist-color-dark-grey));
 }
+
+/* Used by full screen section. Removes the green box-shadow and restores normal color of the border.
+   It still leaves the indicator for the cardlist selection (the green box shadow in card) which looks nice.
+*/
+.layout_box_maximized .active_section > .view_data_pane_container{
+  box-shadow: none;
+  border: 1px solid var(--grist-theme-widget-border, var(--grist-color-dark-grey));
+}
+/* Remove the drag indicator */
+.layout_box_maximized .active_section .viewsection_drag_indicator {
+  visibility: hidden !important;
+}
+
 
 .disable_viewpane {
   justify-content: center;
@@ -121,6 +129,7 @@
   z-index: 1;
   width: 100%;
   height: 100%;
+  color: var(--grist-theme-text-light, var(--grist-color-slate));
   background-color: rgba(0, 0, 0, 0.1);
   font-size: 12pt;
 }

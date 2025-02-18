@@ -2,11 +2,13 @@ import {ActionGroup} from 'app/common/ActionGroup';
 import {DocAction} from 'app/common/DocActions';
 import {FilteredDocUsageSummary} from 'app/common/DocUsage';
 import {Product} from 'app/common/Features';
-import {StringUnion} from 'app/common/StringUnion';
 import {UserProfile} from 'app/common/LoginSessionAPI';
+import {StringUnion} from 'app/common/StringUnion';
+import {AttachmentTransferStatus} from 'app/common/UserAPI';
 
-export const ValidEvent = StringUnion('docListAction', 'docUserAction', 'docShutdown', 'docError',
-                               'docUsage', 'clientConnect');
+export const ValidEvent = StringUnion(
+  'docListAction', 'docUserAction', 'docShutdown', 'docError',
+  'docUsage', 'docChatter', 'clientConnect');
 export type ValidEvent = typeof ValidEvent.type;
 
 
@@ -50,12 +52,12 @@ export interface CommMessageBase {
   data?: unknown;
 }
 
-export type CommDocMessage = CommDocUserAction | CommDocUsage | CommDocShutdown | CommDocError;
+export type CommDocMessage = CommDocUserAction | CommDocUsage | CommDocShutdown | CommDocError | CommDocChatter;
 export type CommMessage = CommDocMessage | CommDocListAction | CommClientConnect;
 
 export type CommResponseBase = CommResponse | CommResponseError | CommMessage;
 
-export type CommDocEventType = CommDocMessage['type']
+export type CommDocEventType = CommDocMessage['type'];
 
 /**
  * Event for a change to the document list.
@@ -86,6 +88,30 @@ export interface CommDocUserAction extends CommMessageBase {
     actionGroup: ActionGroup;
     docUsage: FilteredDocUsageSummary;
     error?: string;
+  };
+}
+
+
+export enum WebhookMessageType {
+  Update = 'webhookUpdate',
+  Overflow = 'webhookOverflowError'
+}
+export interface CommDocChatter extends CommMessageBase {
+  type: 'docChatter';
+  docFD: number;
+  data: {
+    webhooks?: {
+      type: WebhookMessageType,
+      // If present, something happened related to webhooks.
+      // Currently, we give no details, leaving it to client
+      // to call back for details if it cares.
+    },
+    // This could also be a fine place to send updated info
+    // about other users of the document.
+    timing?: {
+      status: 'active'|'disabled';
+    },
+    attachmentTransfer?: AttachmentTransferStatus;
   };
 }
 

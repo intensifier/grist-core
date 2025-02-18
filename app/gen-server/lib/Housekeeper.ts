@@ -1,7 +1,11 @@
 import { ApiError } from 'app/common/ApiError';
+import { delay } from 'app/common/delay';
+import { buildUrlId } from 'app/common/gristUrls';
+import { normalizedDateTimeString } from 'app/common/normalizedDateTimeString';
 import { Document } from 'app/gen-server/entity/Document';
+import { Organization } from 'app/gen-server/entity/Organization';
 import { Workspace } from 'app/gen-server/entity/Workspace';
-import { HomeDBManager, Scope } from 'app/gen-server/lib/HomeDBManager';
+import { HomeDBManager, Scope } from 'app/gen-server/lib/homedb/HomeDBManager';
 import { fromNow } from 'app/gen-server/sqlUtils';
 import { getAuthorizedUserId } from 'app/server/lib/Authorizer';
 import { expressWrap } from 'app/server/lib/expressWrap';
@@ -9,19 +13,25 @@ import { GristServer } from 'app/server/lib/GristServer';
 import { IElectionStore } from 'app/server/lib/IElectionStore';
 import log from 'app/server/lib/log';
 import { IPermitStore } from 'app/server/lib/Permit';
-import { stringParam } from 'app/server/lib/requestUtils';
+import { optStringParam, stringParam } from 'app/server/lib/requestUtils';
 import * as express from 'express';
 import fetch from 'node-fetch';
 import * as Fetch from 'node-fetch';
+import { EntityManager } from 'typeorm';
 
-const HOUSEKEEPER_PERIOD_MS = 1 * 60 * 60 * 1000;   // operate every 1 hour
+const DELETE_TRASH_PERIOD_MS = 1 * 60 * 60 * 1000;  // operate every 1 hour
+const LOG_METRICS_PERIOD_MS = 24 * 60 * 60 * 1000;  // operate every day
 const AGE_THRESHOLD_OFFSET = '-30 days';            // should be an interval known by postgres + sqlite
+
+const SYNC_WORK_LIMIT_MS = 50;      // Don't keep doing synchronous work longer than this.
+const SYNC_WORK_BREAK_MS = 50;      // Once reached SYNC_WORK_LIMIT_MS, take a break of this length.
 
 /**
  * Take care of periodic tasks:
  *
  *  - deleting old soft-deleted documents
  *  - deleting old soft-deleted workspaces
+ *  - logging metrics
  *
  * Call start(), keep the object around, and call stop() when shutting down.
  *
@@ -29,8 +39,10 @@ const AGE_THRESHOLD_OFFSET = '-30 days';            // should be an interval kno
  * multiple home servers, there will be no competition or duplication of effort.
  */
 export class Housekeeper {
-  private _interval?: NodeJS.Timeout;
+  private _deleteTrashinterval?: NodeJS.Timeout;
+  private _logMetricsInterval?: NodeJS.Timeout;
   private _electionKey?: string;
+  private _telemetry = this._server.getTelemetry();
 
   public constructor(private _dbManager: HomeDBManager, private _server: GristServer,
                      private _permitStore: IPermitStore, private _electionStore: IElectionStore) {
@@ -41,16 +53,21 @@ export class Housekeeper {
    */
   public async start() {
     await this.stop();
-    this._interval = setInterval(() => this.deleteTrashExclusively().catch(log.warn.bind(log)), HOUSEKEEPER_PERIOD_MS);
+    this._deleteTrashinterval = setInterval(() => {
+      this.deleteTrashExclusively().catch(log.warn.bind(log));
+    }, DELETE_TRASH_PERIOD_MS);
+    this._logMetricsInterval = setInterval(() => {
+      this.logMetricsExclusively().catch(log.warn.bind(log));
+    }, LOG_METRICS_PERIOD_MS);
   }
 
   /**
    * Stop scheduling housekeeping tasks.  Note: doesn't wait for any housekeeping task in progress.
    */
   public async stop() {
-    if (this._interval) {
-      clearInterval(this._interval);
-      this._interval = undefined;
+    for (const interval of ['_deleteTrashinterval', '_logMetricsInterval'] as const) {
+      clearInterval(this[interval]);
+      this[interval] = undefined;
     }
   }
 
@@ -58,7 +75,7 @@ export class Housekeeper {
    * Deletes old trash if no other server is working on it or worked on it recently.
    */
   public async deleteTrashExclusively(): Promise<boolean> {
-    const electionKey = await this._electionStore.getElection('trash', HOUSEKEEPER_PERIOD_MS / 2.0);
+    const electionKey = await this._electionStore.getElection('housekeeping', DELETE_TRASH_PERIOD_MS / 2.0);
     if (!electionKey) {
       log.info('Skipping deleteTrash since another server is working on it or worked on it recently');
       return false;
@@ -119,6 +136,94 @@ export class Housekeeper {
       };
       await this._dbManager.deleteWorkspace(scope, workspace.id);
     }
+
+    // Delete old forks
+    const forks = await this._getForksToDelete();
+    for (const fork of forks) {
+      const docId = buildUrlId({trunkId: fork.trunkId!, forkId: fork.id, forkUserId: fork.createdBy!});
+      const permitKey = await this._permitStore.setPermit({docId});
+      try {
+        const result = await fetch(
+          await this._server.getHomeUrlByDocId(docId, `/api/docs/${docId}`),
+          {
+            method: 'DELETE',
+            headers: {
+              Permit: permitKey,
+            },
+          }
+        );
+        if (result.status !== 200) {
+          log.error(`failed to delete fork ${docId}: error status ${result.status}`);
+        }
+      } finally {
+        await this._permitStore.removePermit(permitKey);
+      }
+    }
+  }
+
+  /**
+   * Logs metrics if no other server is working on it or worked on it recently.
+   */
+  public async logMetricsExclusively(): Promise<boolean> {
+    const electionKey = await this._electionStore.getElection('logMetrics', LOG_METRICS_PERIOD_MS / 2.0);
+    if (!electionKey) {
+      log.info('Skipping logMetrics since another server is working on it or worked on it recently');
+      return false;
+    }
+    this._electionKey = electionKey;
+    await this.logMetrics();
+    return true;
+  }
+
+  /**
+   * Logs metrics regardless of what other servers may be doing.
+   */
+  public async logMetrics() {
+    if (this._telemetry.shouldLogEvent('siteUsage')) {
+      log.warn("logMetrics siteUsage starting");
+      // Avoid using a transaction since it may end up being held up for a while, and for no good
+      // reason (atomicity matters for this reporting).
+      const manager = this._dbManager.connection.manager;
+      const usageSummaries = await this._getOrgUsageSummaries(manager);
+
+      // We sleep occasionally during this logging. We may log many MANY lines, which can hang up a
+      // server for minutes (unclear why; perhaps filling up buffers, and allocating memory very
+      // inefficiently?)
+      await forEachWithBreaks("logMetrics siteUsage progress", usageSummaries, summary => {
+        this._telemetry.logEvent(null, 'siteUsage', {
+          limited: {
+            siteId: summary.site_id,
+            siteType: summary.site_type,
+            inGoodStanding: Boolean(summary.in_good_standing),
+            numDocs: Number(summary.num_docs),
+            numWorkspaces: Number(summary.num_workspaces),
+            numMembers: Number(summary.num_members),
+            lastActivity: normalizedDateTimeString(summary.last_activity),
+            earliestDocCreatedAt: normalizedDateTimeString(summary.earliest_doc_created_at),
+          },
+          full: {
+            stripePlanId: summary.stripe_plan_id,
+          },
+        });
+      });
+    }
+
+    if (this._telemetry.shouldLogEvent('siteMembership')) {
+      log.warn("logMetrics siteMembership starting");
+      const manager = this._dbManager.connection.manager;
+      const membershipSummaries = await this._getOrgMembershipSummaries(manager);
+      await forEachWithBreaks("logMetrics siteMembership progress", membershipSummaries, summary => {
+        this._telemetry.logEvent(null, 'siteMembership', {
+          limited: {
+            siteId: summary.site_id,
+            siteType: summary.site_type,
+            numOwners: Number(summary.num_owners),
+            numEditors: Number(summary.num_editors),
+            numViewers: Number(summary.num_viewers),
+          },
+        });
+      });
+    }
   }
 
   public addEndpoints(app: express.Application) {
@@ -130,7 +235,7 @@ export class Housekeeper {
     // Remove unlisted snapshots that are not recorded in inventory.
     // Once all such snapshots have been removed, there should be no
     // further need for this endpoint.
-    app.post('/api/housekeeping/docs/:docId/snapshots/clean', this._withSupport(async (docId, headers) => {
+    app.post('/api/housekeeping/docs/:docId/snapshots/clean', this._withSupport(async (_req, docId, headers) => {
       const url = await this._server.getHomeUrlByDocId(docId, `/api/docs/${docId}/snapshots/remove`);
       return fetch(url, {
         method: 'POST',
@@ -143,7 +248,7 @@ export class Housekeeper {
     // use, for allowing support to help users looking to purge some
     // information that leaked into document history that they'd
     // prefer not be there, until there's an alternative.
-    app.post('/api/housekeeping/docs/:docId/states/remove', this._withSupport(async (docId, headers) => {
+    app.post('/api/housekeeping/docs/:docId/states/remove', this._withSupport(async (_req, docId, headers) => {
       const url = await this._server.getHomeUrlByDocId(docId, `/api/docs/${docId}/states/remove`);
       return fetch(url, {
         method: 'POST',
@@ -154,7 +259,7 @@ export class Housekeeper {
 
     // Force a document to reload.  Can be useful during administrative
     // actions.
-    app.post('/api/housekeeping/docs/:docId/force-reload', this._withSupport(async (docId, headers) => {
+    app.post('/api/housekeeping/docs/:docId/force-reload', this._withSupport(async (_req, docId, headers) => {
       const url = await this._server.getHomeUrlByDocId(docId, `/api/docs/${docId}/force-reload`);
       return fetch(url, {
         method: 'POST',
@@ -164,13 +269,19 @@ export class Housekeeper {
 
     // Move a document to its assigned worker.  Can be useful during administrative
     // actions.
-    app.post('/api/housekeeping/docs/:docId/assign', this._withSupport(async (docId, headers) => {
-      const url = await this._server.getHomeUrlByDocId(docId, `/api/docs/${docId}/assign`);
-      return fetch(url, {
+    //
+    // Optionally accepts a `group` query param for updating the document's group prior
+    // to moving. A blank string unsets the current group, if any. This is useful for controlling
+    // which worker group the document is assigned a worker from.
+    app.post('/api/housekeeping/docs/:docId/assign', this._withSupport(async (req, docId, headers) => {
+      const url = new URL(await this._server.getHomeUrlByDocId(docId, `/api/docs/${docId}/assign`));
+      const group = optStringParam(req.query.group, 'group');
+      if (group !== undefined) { url.searchParams.set('group', group); }
+      return fetch(url.toString(), {
         method: 'POST',
         headers,
       });
-    }));
+    }, 'assign-doc'));
   }
 
   /**
@@ -178,7 +289,7 @@ export class Housekeeper {
    */
   public async testClearExclusivity(): Promise<void> {
     if (this._electionKey) {
-      await this._electionStore.removeElection('trash', this._electionKey);
+      await this._electionStore.removeElection('housekeeping', this._electionKey);
       this._electionKey = undefined;
     }
   }
@@ -196,7 +307,7 @@ export class Housekeeper {
   }
 
   private async _getWorkspacesToDelete() {
-    const docs = await this._dbManager.connection.createQueryBuilder()
+    const workspaces = await this._dbManager.connection.createQueryBuilder()
       .select('workspaces')
       .from(Workspace, 'workspaces')
       .leftJoin('workspaces.docs', 'docs')
@@ -206,7 +317,64 @@ export class Housekeeper {
       // wait for workspace to be empty
       .andWhere('docs.id IS NULL')
       .getMany();
-    return docs;
+    return workspaces;
+  }
+
+  private async _getForksToDelete() {
+    const forks = await this._dbManager.connection.createQueryBuilder()
+      .select('forks')
+      .from(Document, 'forks')
+      .where('forks.trunk_id IS NOT NULL')
+      .andWhere(`forks.updated_at <= ${this._getThreshold()}`)
+      .getMany();
+    return forks;
+  }
+
+  private async _getOrgUsageSummaries(manager: EntityManager) {
+    const orgs = await manager.createQueryBuilder()
+      .select('orgs.id', 'site_id')
+      .addSelect('products.name', 'site_type')
+      .addSelect('billing_accounts.in_good_standing', 'in_good_standing')
+      .addSelect('billing_accounts.stripe_plan_id', 'stripe_plan_id')
+      .addSelect('COUNT(DISTINCT docs.id)', 'num_docs')
+      .addSelect('COUNT(DISTINCT workspaces.id)', 'num_workspaces')
+      .addSelect('COUNT(DISTINCT org_member_users.id)', 'num_members')
+      .addSelect('MAX(docs.updated_at)', 'last_activity')
+      .addSelect('MIN(docs.created_at)', 'earliest_doc_created_at')
+      .from(Organization, 'orgs')
+      .leftJoin('orgs.workspaces', 'workspaces')
+      .leftJoin('workspaces.docs', 'docs')
+      .leftJoin('orgs.billingAccount', 'billing_accounts')
+      .leftJoin('billing_accounts.product', 'products')
+      .leftJoin('orgs.aclRules', 'acl_rules')
+      .leftJoin('acl_rules.group', 'org_groups')
+      .leftJoin('org_groups.memberUsers', 'org_member_users')
+      .where('org_member_users.id IS NOT NULL')
+      .groupBy('orgs.id')
+      .addGroupBy('products.id')
+      .addGroupBy('billing_accounts.id')
+      .getRawMany();
+    return orgs;
+  }
+
+  private async _getOrgMembershipSummaries(manager: EntityManager) {
+    const orgs = await manager.createQueryBuilder()
+      .select('orgs.id', 'site_id')
+      .addSelect('products.name', 'site_type')
+      .addSelect("SUM(CASE WHEN org_groups.name = 'owners' THEN 1 ELSE 0 END)", 'num_owners')
+      .addSelect("SUM(CASE WHEN org_groups.name = 'editors' THEN 1 ELSE 0 END)", 'num_editors')
+      .addSelect("SUM(CASE WHEN org_groups.name = 'viewers' THEN 1 ELSE 0 END)", 'num_viewers')
+      .from(Organization, 'orgs')
+      .leftJoin('orgs.billingAccount', 'billing_accounts')
+      .leftJoin('billing_accounts.product', 'products')
+      .leftJoin('orgs.aclRules', 'acl_rules')
+      .leftJoin('acl_rules.group', 'org_groups')
+      .leftJoin('org_groups.memberUsers', 'org_member_users')
+      .where('org_member_users.id IS NOT NULL')
+      .groupBy('orgs.id')
+      .addGroupBy('products.id')
+      .getRawMany();
+    return orgs;
   }
 
   /**
@@ -221,7 +389,8 @@ export class Housekeeper {
   // Call a document endpoint with a permit, cleaning up after the call.
   // Checks that the user is the support user.
   private _withSupport(
-    callback: (docId: string, headers: Record<string, string>) => Promise<Fetch.Response>
+    callback: (req: express.Request, docId: string, headers: Record<string, string>) => Promise<Fetch.Response>,
+    permitAction?: string,
   ): express.RequestHandler {
     return expressWrap(async (req, res) => {
       const userId = getAuthorizedUserId(req);
@@ -229,9 +398,9 @@ export class Housekeeper {
         throw new ApiError('access denied', 403);
       }
       const docId = stringParam(req.params.docId, 'docId');
-      const permitKey = await this._permitStore.setPermit({docId});
+      const permitKey = await this._permitStore.setPermit({docId, action: permitAction});
       try {
-        const result = await callback(docId, {
+        const result = await callback(req, docId, {
           Permit: permitKey,
           'Content-Type': 'application/json',
         });
@@ -243,4 +412,27 @@ export class Housekeeper {
       }
     });
   }
+}
+
+/**
+ * Call callback(item) for each item on the list, sleeping periodically to allow other works to
+ * happen. Any time work takes more than SYNC_WORK_LIMIT_MS, will sleep for SYNC_WORK_BREAK_MS.
+ * At each sleep will log a message with logText and progress info.
+ */
+async function forEachWithBreaks<T>(logText: string, items: T[], callback: (item: T) => void): Promise<void> {
+  const delayMs = SYNC_WORK_BREAK_MS;
+  const itemsTotal = items.length;
+  let itemsProcesssed = 0;
+  const start = Date.now();
+  let syncWorkStart = start;
+  for (const item of items) {
+    callback(item);
+    itemsProcesssed++;
+    if (Date.now() >= syncWorkStart + SYNC_WORK_LIMIT_MS) {
+      log.rawInfo(logText, {itemsProcesssed, itemsTotal, delayMs});
+      await delay(delayMs);
+      syncWorkStart = Date.now();
+    }
+  }
+  log.rawInfo(logText, {itemsProcesssed, itemsTotal, timeMs: Date.now() - start});
 }

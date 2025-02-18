@@ -1,5 +1,5 @@
 import * as gu from 'test/nbrowser/gristUtils';
-import { setupTestSuite } from 'test/nbrowser/testUtils';
+import { server, setupTestSuite } from 'test/nbrowser/testUtils';
 
 import { assert, driver, Key } from 'mocha-webdriver';
 
@@ -25,10 +25,10 @@ describe("DuplicateDocument", function() {
     assert.equal(await driver.find('.test-modal-confirm').getAttribute('disabled'), 'true');
     // As soon as the textbox is non-empty, the Save button should become enabled.
     await nameElem.sendKeys('a');
-    assert.equal(await driver.find('.test-modal-confirm').getAttribute('disabled'), null);
+    await driver.findWait('.test-modal-confirm:not(:disabled)', 5000);
 
     // Save a copy with a proper name.
-    await gu.completeCopy({destName: 'DuplicateTest1'});
+    await gu.completeCopy({destName: 'DuplicateTest1', destWorkspace: 'Test Workspace'});
 
     // check the breadcrumbs reflect new document name, and the doc is not empty.
     assert.equal(await driver.find('.test-bc-doc').value(), 'DuplicateTest1');
@@ -62,7 +62,7 @@ describe("DuplicateDocument", function() {
 
     await driver.find('.test-tb-share').click();
     await driver.find('.test-save-copy').click();
-    await gu.completeCopy({destName: 'DuplicateTest2'});
+    await gu.completeCopy({destName: 'DuplicateTest2', destWorkspace: 'Test Workspace'});
     urlId = (await gu.getCurrentUrlId())!;
 
     // check the breadcrumbs reflect new document name, and the doc contains our change.
@@ -71,6 +71,9 @@ describe("DuplicateDocument", function() {
   });
 
   it("should offer a choice of orgs when user is owner", async function() {
+    if (server.isExternalServer()) {
+      this.skip();
+    }
     await driver.find('.test-tb-share').click();
     await driver.find('.test-save-copy').click();
     await driver.findWait('.test-modal-dialog', 1000);
@@ -123,6 +126,9 @@ describe("DuplicateDocument", function() {
   });
 
   it("should offer a choice of orgs when doc is public", async function() {
+    if (server.isExternalServer()) {
+      this.skip();
+    }
     const session = await gu.session().teamSite.login();
     const api = session.createHomeApi();
     // But if the doc is public, then users can copy it out.
@@ -133,6 +139,12 @@ describe("DuplicateDocument", function() {
     await gu.session().teamSite2.createHomeApi().updateOrgPermissions('current', {users: {
       [session2.email]: 'owners',
     }});
+
+    // Reset tracking of the last visited site. We seem to need this now to get consistent
+    // behavior across Jenkins and local test runs. (May have something to do with newer
+    // versions of chromedriver and headless Chrome.)
+    await driver.executeScript('window.sessionStorage.clear();');
+
     await session2.login();
     await session2.loadDoc(`/doc/${urlId}`);
 
@@ -173,6 +185,9 @@ describe("DuplicateDocument", function() {
   });
 
   it("should allow saving a public doc to the personal org", async function() {
+    if (server.isExternalServer()) {
+      this.skip();
+    }
     const session2 = gu.session().teamSite.user('user2');
     await session2.login();
     await session2.loadDoc(`/doc/${urlId}`);
@@ -187,7 +202,6 @@ describe("DuplicateDocument", function() {
     await driver.find('.test-copy-dest-org .test-select-open').click();
     await driver.findContent('.test-select-menu li', 'Personal').click();
     await gu.waitForServer();
-    assert.equal(await driver.find('.test-copy-dest-workspace').isPresent(), false);
     assert.equal(await driver.find('.test-copy-warning').isPresent(), false);
     assert.equal(await driver.find('.test-modal-confirm').getAttribute('disabled'), null);
 
@@ -199,5 +213,28 @@ describe("DuplicateDocument", function() {
     assert.equal(await driver.find('.test-bc-workspace').getText(), 'Home');
     assert.equal(await gu.getCell({col: 'A', rowNum: 1}).getText(), 'hello to duplicates');
     assert.notEqual(await gu.getCurrentUrlId(), urlId);
+
+    // Remove document
+    await driver.find(".test-bc-workspace").click();
+    await gu.removeDoc(`DuplicateTest2 ${name} Copy`);
+  });
+
+  it("should not auto-start tour if a document with a tour is copied as a template", async function() {
+    const session = await gu.session().teamSite.login();
+    await session.tempDoc(cleanup, 'doctour.grist');
+    await session.tempWorkspace(cleanup, 'Test Workspace');
+    assert.isTrue(await driver.findWait('.test-onboarding-popup', 1000).isPresent());
+    await driver.find('.test-onboarding-close').click();
+    await gu.waitForServer();
+
+    await driver.find('.test-tb-share').click();
+    await driver.find('.test-save-copy').click();
+    await driver.findWait('.test-modal-dialog', 1000);
+    await driver.find('.test-save-as-template').click();
+    await gu.completeCopy({destName: 'DuplicateTest3', destWorkspace: 'Test Workspace'});
+
+    // Give it a second, just to be sure the tour doesn't appear.
+    await driver.sleep(1000);
+    assert.isFalse(await driver.find('.test-onboarding-popup').isPresent());
   });
 });

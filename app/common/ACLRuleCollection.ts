@@ -1,12 +1,17 @@
-import {parsePermissions} from 'app/common/ACLPermissions';
-import {ILogger} from 'app/common/BaseAPI';
+import {parsePermissions, permissionSetToText, splitSchemaEditPermissionSet} from 'app/common/ACLPermissions';
+import {AVAILABLE_BITS_COLUMNS, AVAILABLE_BITS_TABLES, trimPermissions} from 'app/common/ACLPermissions';
+import {ACLRulesReader} from 'app/common/ACLRulesReader';
+import {AclRuleProblem} from 'app/common/ActiveDocAPI';
 import {DocData} from 'app/common/DocData';
-import {AclMatchFunc, ParsedAclFormula, RulePart, RuleSet, UserAttributeRule} from 'app/common/GranularAccessClause';
-import {getSetMapValue} from 'app/common/gutil';
+import {RulePart, RuleSet, UserAttributeRule} from 'app/common/GranularAccessClause';
+import {getSetMapValue, isNonNullish} from 'app/common/gutil';
+import {CompiledPredicateFormula, ParsedPredicateFormula} from 'app/common/PredicateFormula';
 import {MetaRowRecord} from 'app/common/TableData';
-import sortBy = require('lodash/sortBy');
+import {decodeObject} from 'app/plugin/objtypes';
 
-const defaultMatchFunc: AclMatchFunc = () => true;
+export type ILogger = Pick<Console, 'log'|'debug'|'info'|'warn'|'error'>;
+
+const defaultMatchFunc: CompiledPredicateFormula = () => true;
 
 export const SPECIAL_RULES_TABLE_ID = '*SPECIAL';
 
@@ -16,12 +21,12 @@ const DEFAULT_RULE_SET: RuleSet = {
   colIds: '*',
   body: [{
     aclFormula: "user.Access in [EDITOR, OWNER]",
-    matchFunc:  (input) => ['editors', 'owners'].includes(String(input.user.Access)),
+    matchFunc: (input) => ['editors', 'owners'].includes(String(input.user!.Access)),
     permissions: parsePermissions('all'),
     permissionsText: 'all',
   }, {
     aclFormula: "user.Access in [VIEWER]",
-    matchFunc:  (input) => ['viewers'].includes(String(input.user.Access)),
+    matchFunc: (input) => ['viewers'].includes(String(input.user!.Access)),
     permissions: parsePermissions('+R-CUDS'),
     permissionsText: '+R',
   }, {
@@ -32,13 +37,34 @@ const DEFAULT_RULE_SET: RuleSet = {
   }],
 };
 
+// Check if the given resource is the special "SchemaEdit" resource, which only exists as a
+// frontend representation.
+export function isSchemaEditResource(resource: {tableId: string, colIds: string}): boolean {
+  return resource.tableId === SPECIAL_RULES_TABLE_ID && resource.colIds === 'SchemaEdit';
+}
+
 const SPECIAL_RULE_SETS: Record<string, RuleSet> = {
+  SchemaEdit: {
+    tableId: SPECIAL_RULES_TABLE_ID,
+    colIds: ['SchemaEdit'],
+    body: [{
+      aclFormula: "user.Access in [EDITOR, OWNER]",
+      matchFunc: (input) => ['editors', 'owners'].includes(String(input.user!.Access)),
+      permissions: parsePermissions('+S'),
+      permissionsText: '+S',
+    }, {
+      aclFormula: "",
+      matchFunc: defaultMatchFunc,
+      permissions: parsePermissions('-S'),
+      permissionsText: '-S',
+    }],
+  },
   AccessRules: {
     tableId: SPECIAL_RULES_TABLE_ID,
     colIds: ['AccessRules'],
     body: [{
       aclFormula: "user.Access in [OWNER]",
-      matchFunc:  (input) => ['owners'].includes(String(input.user.Access)),
+      matchFunc: (input) => ['owners'].includes(String(input.user!.Access)),
       permissions: parsePermissions('+R'),
       permissionsText: '+R',
     }, {
@@ -53,7 +79,7 @@ const SPECIAL_RULE_SETS: Record<string, RuleSet> = {
     colIds: ['FullCopies'],
     body: [{
       aclFormula: "user.Access in [OWNER]",
-      matchFunc:  (input) => ['owners'].includes(String(input.user.Access)),
+      matchFunc: (input) => ['owners'].includes(String(input.user!.Access)),
       permissions: parsePermissions('+R'),
       permissionsText: '+R',
     }, {
@@ -62,6 +88,11 @@ const SPECIAL_RULE_SETS: Record<string, RuleSet> = {
       permissions: parsePermissions('-R'),
       permissionsText: '-R',
     }],
+  },
+  SeedRule: {
+    tableId: SPECIAL_RULES_TABLE_ID,
+    colIds: ['SeedRule'],
+    body: [],
   }
 };
 
@@ -72,7 +103,7 @@ const EMERGENCY_RULE_SET: RuleSet = {
   colIds: '*',
   body: [{
     aclFormula: "user.Access in [OWNER]",
-    matchFunc:  (input) => ['owners'].includes(String(input.user.Access)),
+    matchFunc:  (input) => ['owners'].includes(String(input.user!.Access)),
     permissions: parsePermissions('all'),
     permissionsText: 'all',
   }, {
@@ -177,9 +208,28 @@ export class ACLRuleCollection {
         const specialType = String(ruleSet.colIds);
         const specialDefault = specialRuleSets.get(specialType);
         if (!specialDefault) {
-          throw new Error(`Invalid rule for ${ruleSet.tableId}:${ruleSet.colIds}`);
+          // Log that we are seeing an invalid rule, but don't fail.
+          // (Historically, older versions of the Grist app will attempt to
+          // open newer documents).
+          options.log.error(`Invalid rule for ${ruleSet.tableId}:${ruleSet.colIds}`);
+        } else {
+          specialRuleSets.set(specialType, {...ruleSet, body: [...ruleSet.body, ...specialDefault.body]});
         }
-        specialRuleSets.set(specialType, {...ruleSet, body: [...ruleSet.body, ...specialDefault.body]});
+      } else if (options.pullOutSchemaEdit && ruleSet.tableId === '*' && ruleSet.colIds === '*') {
+        // If pullOutSchemaEdit is requested, we move out rules with SchemaEdit permissions from
+        // the default resource into the ficticious "*SPECIAL:SchemaEdit" resource. This is used
+        // in the frontend only, to present those rules in a separate section.
+        const schemaParts = ruleSet.body.map(part => splitSchemaEditRulePart(part).schemaEdit).filter(isNonNullish);
+
+        if (schemaParts.length > 0) {
+          const specialType = 'SchemaEdit';
+          const specialDefault = specialRuleSets.get(specialType)!;
+          specialRuleSets.set(specialType, {
+            tableId: SPECIAL_RULES_TABLE_ID,
+            colIds: ['SchemaEdit'],
+            body: [...schemaParts, ...specialDefault.body]
+          });
+        }
       }
     }
 
@@ -192,9 +242,15 @@ export class ACLRuleCollection {
     for (const ruleSet of ruleSets) {
       if (ruleSet.tableId === '*') {
         if (ruleSet.colIds === '*') {
+          // If pullOutSchemaEdit is requested, skip the SchemaEdit rules for the default resource;
+          // those got pulled out earlier into the fictitious "*SPECIAL:SchemaEdit" resource.
+          const body = options.pullOutSchemaEdit ?
+            ruleSet.body.map(part => splitSchemaEditRulePart(part).nonSchemaEdit).filter(isNonNullish) :
+            ruleSet.body;
+
           defaultRuleSet = {
             ...ruleSet,
-            body: [...ruleSet.body, ...DEFAULT_RULE_SET.body],
+            body: [...body, ...DEFAULT_RULE_SET.body],
           };
         } else {
           // tableId of '*' cannot list particular columns.
@@ -231,6 +287,20 @@ export class ACLRuleCollection {
    * Check that all references to table and column IDs in ACL rules are valid.
    */
   public checkDocEntities(docData: DocData) {
+    const problems = this.findRuleProblems(docData);
+    if (problems.length === 0) { return; }
+    throw new Error(problems[0].comment);
+  }
+
+  /**
+   * Enumerate rule problems caused by table and column IDs that are not valid.
+   * Problems include:
+   *   - Rules for a table that does not exist
+   *   - Rules for columns that include a column that does not exist
+   *   - User attributes links to a column that does not exist
+   */
+  public findRuleProblems(docData: DocData): AclRuleProblem[] {
+    const problems: AclRuleProblem[] = [];
     const tablesTable = docData.getMetaTable('_grist_Tables');
     const columnsTable = docData.getMetaTable('_grist_Tables_column');
 
@@ -238,7 +308,12 @@ export class ACLRuleCollection {
     const validTableIds = new Set(tablesTable.getColValues('tableId'));
     const invalidTables = this.getAllTableIds().filter(t => !validTableIds.has(t));
     if (invalidTables.length > 0) {
-      throw new Error(`Invalid tables in rules: ${invalidTables.join(', ')}`);
+      problems.push({
+        tables: {
+          tableIds: invalidTables,
+        },
+        comment: `Invalid tables in rules: ${invalidTables.join(', ')}`,
+      });
     }
 
     // Collect valid columns, grouped by tableRef (rowId of table record).
@@ -248,15 +323,22 @@ export class ACLRuleCollection {
       getSetMapValue(validColumns, colTableRefs[i], () => new Set()).add(colId);
     }
 
-    // For each table, check that any explicitly mentioned columns are valid.
+    // For each valid table, check that any explicitly mentioned columns are valid.
     for (const tableId of this.getAllTableIds()) {
+      if (!validTableIds.has(tableId)) { continue; }
       const tableRef = tablesTable.findRow('tableId', tableId);
       const validTableCols = validColumns.get(tableRef);
       for (const ruleSet of this.getAllColumnRuleSets(tableId)) {
         if (Array.isArray(ruleSet.colIds)) {
           const invalidColIds = ruleSet.colIds.filter(c => !validTableCols?.has(c));
           if (invalidColIds.length > 0) {
-            throw new Error(`Invalid columns in rules for table ${tableId}: ${invalidColIds.join(', ')}`);
+            problems.push({
+              columns: {
+                tableId,
+                colIds: invalidColIds,
+              },
+              comment: `Invalid columns in rules for table ${tableId}: ${invalidColIds.join(', ')}`,
+            });
           }
         }
       }
@@ -264,16 +346,27 @@ export class ACLRuleCollection {
 
     // Check for valid tableId/lookupColId combinations in UserAttribute rules.
     const invalidUAColumns: string[] = [];
+    const names: string[] = [];
     for (const rule of this.getUserAttributeRules().values()) {
       const tableRef = tablesTable.findRow('tableId', rule.tableId);
-      const colRef = columnsTable.findMatchingRowId({parentId: tableRef, colId: rule.lookupColId});
+      const colRef = columnsTable.findMatchingRowId({
+        parentId: tableRef, colId: rule.lookupColId,
+      });
       if (!colRef) {
         invalidUAColumns.push(`${rule.tableId}.${rule.lookupColId}`);
+        names.push(rule.name);
       }
     }
     if (invalidUAColumns.length > 0) {
-      throw new Error(`Invalid columns in User Attribute rules: ${invalidUAColumns.join(', ')}`);
+      problems.push({
+        userAttributes: {
+          invalidUAColumns,
+          names,
+        },
+        comment: `Invalid columns in User Attribute rules: ${invalidUAColumns.join(', ')}`,
+      });
     }
+    return problems;
   }
 
   private _safeReadAclRules(docData: DocData, options: ReadAclOptions): ReadAclResults {
@@ -289,7 +382,19 @@ export class ACLRuleCollection {
 
 export interface ReadAclOptions {
   log: ILogger;     // For logging warnings during rule processing.
-  compile?: (parsed: ParsedAclFormula) => AclMatchFunc;
+  compile?: (parsed: ParsedPredicateFormula) => CompiledPredicateFormula;
+  // If true, add and modify access rules in some special ways.
+  // Specifically, call addHelperCols to add helper columns of restricted columns to rule sets,
+  // and use ACLShareRules to implement any special shares as access rules.
+  // Used in the server, but not in the client, because of at least the following:
+  // 1. Rules would show in the UI
+  // 2. Rules would be saved back after editing, causing them to accumulate
+  enrichRulesForImplementation?: boolean;
+
+  // If true, rules with 'schemaEdit' permission are moved out of the '*:*' resource into a
+  // fictitious '*SPECIAL:SchemaEdit' resource. This is used only on the client, to present
+  // schemaEdit as a separate checkbox. Such rules are saved back to the '*:*' resource.
+  pullOutSchemaEdit?: boolean;
 }
 
 export interface ReadAclResults {
@@ -298,27 +403,77 @@ export interface ReadAclResults {
 }
 
 /**
+ * For each column in colIds, return the colIds of any hidden helper columns it has,
+ * i.e. display columns of references, and conditional formatting rule columns.
+ */
+function getHelperCols(docData: DocData, tableId: string, colIds: string[], log: ILogger): string[] {
+  const tablesTable = docData.getMetaTable('_grist_Tables');
+  const columnsTable = docData.getMetaTable('_grist_Tables_column');
+  const fieldsTable = docData.getMetaTable('_grist_Views_section_field');
+
+  const tableRef = tablesTable.findRow('tableId', tableId);
+  if (!tableRef) {
+    return [];
+  }
+
+  const result: string[] = [];
+  for (const colId of colIds) {
+    const [column] = columnsTable.filterRecords({parentId: tableRef, colId});
+    if (!column) {
+      continue;
+    }
+
+    function addColsFromRefs(colRefs: unknown) {
+      if (!Array.isArray(colRefs)) {
+        return;
+      }
+      for (const colRef of colRefs) {
+        if (typeof colRef !== 'number') {
+          continue;
+        }
+        const extraCol = columnsTable.getRecord(colRef);
+        if (!extraCol) {
+          continue;
+        }
+        if (extraCol.colId.startsWith("gristHelper_") && extraCol.parentId === tableRef) {
+          result.push(extraCol.colId);
+        } else {
+          log.error(`Invalid helper column ${extraCol.colId} of ${tableId}:${colId}`);
+        }
+      }
+    }
+
+    function addColsFromMetaRecord(rec: MetaRowRecord<'_grist_Tables_column' | '_grist_Views_section_field'>) {
+      addColsFromRefs([rec.displayCol]);
+      addColsFromRefs(decodeObject(rec.rules));
+    }
+
+    addColsFromMetaRecord(column);
+    for (const field of fieldsTable.filterRecords({colRef: column.id})) {
+      addColsFromMetaRecord(field);
+    }
+  }
+  return result;
+}
+
+
+/**
  * Parse all ACL rules in the document from DocData into a list of RuleSets and of
  * UserAttributeRules. This is used by both client-side code and server-side.
  */
-function readAclRules(docData: DocData, {log, compile}: ReadAclOptions): ReadAclResults {
-  const resourcesTable = docData.getMetaTable('_grist_ACLResources');
-  const rulesTable = docData.getMetaTable('_grist_ACLRules');
-
+function readAclRules(docData: DocData, {log, compile, enrichRulesForImplementation}: ReadAclOptions): ReadAclResults {
   const ruleSets: RuleSet[] = [];
   const userAttributes: UserAttributeRule[] = [];
 
-  // Group rules by resource first, ordering by rulePos. Each group will become a RuleSet.
-  const rulesByResource = new Map<number, Array<MetaRowRecord<'_grist_ACLRules'>>>();
-  for (const ruleRecord of sortBy(rulesTable.getRecords(), 'rulePos')) {
-    getSetMapValue(rulesByResource, ruleRecord.resource, () => []).push(ruleRecord);
-  }
+  const aclRulesReader = new ACLRulesReader(docData, {
+    addShareRules: enrichRulesForImplementation,
+  });
 
-  for (const [resourceId, rules] of rulesByResource.entries()) {
-    const resourceRec = resourcesTable.getRecord(resourceId);
+  // Group rules by resource first, ordering by rulePos. Each group will become a RuleSet.
+  for (const [resourceId, rules] of aclRulesReader.entries()) {
+    const resourceRec = aclRulesReader.getResourceById(resourceId);
     if (!resourceRec) {
       throw new Error(`ACLRule ${rules[0].id} refers to an invalid ACLResource ${resourceId}`);
-      continue;
     }
     if (!resourceRec.tableId || !resourceRec.colIds) {
       // This should only be the case for the old-style default rule/resource, which we
@@ -327,6 +482,10 @@ function readAclRules(docData: DocData, {log, compile}: ReadAclOptions): ReadAcl
     }
     const tableId = resourceRec.tableId;
     const colIds = resourceRec.colIds === '*' ? '*' : resourceRec.colIds.split(',');
+
+    if (enrichRulesForImplementation && Array.isArray(colIds)) {
+      colIds.push(...getHelperCols(docData, tableId, colIds, log));
+    }
 
     const body: RulePart[] = [];
     for (const rule of rules) {
@@ -349,13 +508,18 @@ function readAclRules(docData: DocData, {log, compile}: ReadAclOptions): ReadAcl
         throw new Error(`ACLRule ${rule.id} invalid because missing its parsed formula`);
       } else {
         const aclFormulaParsed = rule.aclFormula && JSON.parse(String(rule.aclFormulaParsed));
+        let permissions = parsePermissions(String(rule.permissionsText));
+        if (tableId !== '*' && tableId !== SPECIAL_RULES_TABLE_ID) {
+          const availableBits = (colIds === '*') ? AVAILABLE_BITS_TABLES : AVAILABLE_BITS_COLUMNS;
+          permissions = trimPermissions(permissions, availableBits);
+        }
         body.push({
           origRecord: rule,
           aclFormula: String(rule.aclFormula),
           matchFunc: rule.aclFormula ? compile?.(aclFormulaParsed) : defaultMatchFunc,
-          memo: aclFormulaParsed && aclFormulaParsed[0] === 'Comment' && aclFormulaParsed[2],
-          permissions: parsePermissions(String(rule.permissionsText)),
-          permissionsText: String(rule.permissionsText),
+          memo: rule.memo,
+          permissions,
+          permissionsText: permissionSetToText(permissions)
         });
       }
     }
@@ -363,4 +527,38 @@ function readAclRules(docData: DocData, {log, compile}: ReadAclOptions): ReadAcl
     ruleSets.push(ruleSet);
   }
   return {ruleSets, userAttributes};
+}
+
+
+/**
+ * In the UI, we present SchemaEdit rules in a separate section, even though in reality they live
+ * as schemaEdit permission bits among the rules for the default resource. This function splits a
+ * RulePart into two: one containing the schemaEdit permission bit, and the other containing the
+ * other bits. If either part is empty, it will be returned as undefined, but if both are empty,
+ * nonSchemaEdit will be included as a rule with empty permission bits.
+ *
+ * It's possible for both parts to be non-empty (for rules created before the updated UI), in
+ * which case the schemaEdit one will have a fake origRecord, to cause it to be saved as a new
+ * record when saving.
+ */
+function splitSchemaEditRulePart(rulePart: RulePart): {schemaEdit?: RulePart, nonSchemaEdit?: RulePart} {
+  const p = splitSchemaEditPermissionSet(rulePart.permissions);
+  let schemaEdit: RulePart|undefined;
+  let nonSchemaEdit: RulePart|undefined;
+  if (p.schemaEdit) {
+    schemaEdit = {...rulePart,
+      permissions: p.schemaEdit,
+      permissionsText: permissionSetToText(p.schemaEdit),
+    };
+  }
+  if (p.nonSchemaEdit) {
+    nonSchemaEdit = {...rulePart,
+      permissions: p.nonSchemaEdit,
+      permissionsText: permissionSetToText(p.nonSchemaEdit),
+    };
+  }
+  if (schemaEdit && nonSchemaEdit) {
+    schemaEdit.origRecord = {id: -1} as MetaRowRecord<'_grist_ACLRules'>;
+  }
+  return {schemaEdit, nonSchemaEdit};
 }

@@ -3,40 +3,46 @@
  */
 import {aclColumnList} from 'app/client/aclui/ACLColumnList';
 import {aclFormulaEditor} from 'app/client/aclui/ACLFormulaEditor';
+import {aclMemoEditor} from 'app/client/aclui/ACLMemoEditor';
 import {aclSelect} from 'app/client/aclui/ACLSelect';
 import {ACLUsersPopup} from 'app/client/aclui/ACLUsers';
-import {PermissionKey, permissionsWidget} from 'app/client/aclui/PermissionsWidget';
+import {permissionsWidget} from 'app/client/aclui/PermissionsWidget';
 import {GristDoc} from 'app/client/components/GristDoc';
+import {logTelemetryEvent} from 'app/client/lib/telemetry';
 import {reportError, UserError} from 'app/client/models/errors';
 import {TableData} from 'app/client/models/TableData';
+import {withInfoTooltip} from 'app/client/ui/tooltips';
 import {shadowScroll} from 'app/client/ui/shadowScroll';
 import {bigBasicButton, bigPrimaryButton} from 'app/client/ui2018/buttons';
 import {squareCheckbox} from 'app/client/ui2018/checkbox';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {testId, theme} from 'app/client/ui2018/cssVars';
 import {textInput} from 'app/client/ui2018/editableLabel';
 import {cssIconButton, icon} from 'app/client/ui2018/icons';
 import {menu, menuItemAsync} from 'app/client/ui2018/menus';
 import {
+  AVAILABLE_BITS_COLUMNS,
+  AVAILABLE_BITS_TABLES,
   emptyPermissionSet,
   MixedPermissionValue,
   parsePermissions,
   PartialPermissionSet,
+  PermissionKey,
   permissionSetToText,
   summarizePermissions,
-  summarizePermissionSet
+  summarizePermissionSet,
+  trimPermissions
 } from 'app/common/ACLPermissions';
-import {ACLRuleCollection, SPECIAL_RULES_TABLE_ID} from 'app/common/ACLRuleCollection';
-import {AclTableDescription, getTableTitle} from 'app/common/ActiveDocAPI';
+import {ACLRuleCollection, isSchemaEditResource, SPECIAL_RULES_TABLE_ID} from 'app/common/ACLRuleCollection';
+import {AclRuleProblem, AclTableDescription, getTableTitle} from 'app/common/ActiveDocAPI';
 import {BulkColValues, getColValues, RowRecord, UserAction} from 'app/common/DocActions';
 import {
-  FormulaProperties,
-  getFormulaProperties,
   RulePart,
   RuleSet,
   UserAttributeRule
 } from 'app/common/GranularAccessClause';
 import {isHiddenCol} from 'app/common/gristTypes';
-import {isNonNullish} from 'app/common/gutil';
+import {isNonNullish, unwrap} from 'app/common/gutil';
+import {getPredicateFormulaProperties, PredicateFormulaProperties} from 'app/common/PredicateFormula';
 import {SchemaTypes} from 'app/common/schema';
 import {MetaRowRecord} from 'app/common/TableData';
 import {
@@ -44,6 +50,7 @@ import {
   Computed,
   Disposable,
   dom,
+  DomContents,
   DomElementArg,
   IDisposableOwner,
   MutableObsArray,
@@ -51,7 +58,10 @@ import {
   Observable,
   styled
 } from 'grainjs';
+import {makeT} from 'app/client/lib/localization';
 import isEqual = require('lodash/isEqual');
+
+const t = makeT('AccessRules');
 
 // tslint:disable:max-classes-per-file no-console
 
@@ -94,7 +104,10 @@ export class AccessRules extends Disposable {
   private _docDefaultRuleSet = Observable.create<DefaultObsRuleSet|null>(this, null);
 
   // Special document-level rules, for resources of the form ("*SPECIAL:<RuleType>").
-  private _specialRules = Observable.create<SpecialRules|null>(this, null);
+  // These rules are shown in different places - currently most are shown as a separate
+  // section, and one is folded into the default rule section (for SeedRule).
+  private _specialRulesWithDefault = Observable.create<SpecialRules|null>(this, null);
+  private _specialRulesSeparate = Observable.create<SpecialRules|null>(this, null);
 
   // Array of all UserAttribute rules.
   private _userAttrRules = this.autoDispose(obsArray<ObsUserAttributeRule>());
@@ -109,17 +122,21 @@ export class AccessRules extends Disposable {
   // Error or warning message to show next to Save/Reset buttons if non-empty.
   private _errorMessage = Observable.create(this, '');
 
+  // Details of rule problems, for offering solutions to the user.
+  private _ruleProblems = this.autoDispose(obsArray<AclRuleProblem>());
+
   // Map of tableId to basic metadata for all tables in the document.
-  private _aclResources: {[tableId: string]: AclTableDescription} = {};
+  private _aclResources = new Map<string, AclTableDescription>();
 
-  private _aclUsersPopup = ACLUsersPopup.create(this);
+  private _aclUsersPopup = ACLUsersPopup.create(this, this.gristDoc.docPageModel);
 
-  constructor(private _gristDoc: GristDoc) {
+  constructor(public gristDoc: GristDoc) {
     super();
     this._ruleStatus = Computed.create(this, (use) => {
       const defRuleSet = use(this._docDefaultRuleSet);
       const tableRules = use(this._tableRules);
-      const specialRules = use(this._specialRules);
+      const specialRulesWithDefault = use(this._specialRulesWithDefault);
+      const specialRulesSeparate = use(this._specialRulesSeparate);
       const userAttr = use(this._userAttrRules);
       return Math.max(
         defRuleSet ? use(defRuleSet.ruleStatus) : RuleStatus.Unchanged,
@@ -127,9 +144,10 @@ export class AccessRules extends Disposable {
         // there were only removals, then length will be reduced.
         getChangedStatus(tableRules.length < this._ruleCollection.getAllTableIds().length),
         getChangedStatus(userAttr.length < this._ruleCollection.getUserAttributeRules().size),
-        ...tableRules.map(t => use(t.ruleStatus)),
+        ...tableRules.map(tr => use(tr.ruleStatus)),
         ...userAttr.map(u => use(u.ruleStatus)),
-        specialRules ? use(specialRules.ruleStatus) : RuleStatus.Unchanged,
+        specialRulesWithDefault ? use(specialRulesWithDefault.ruleStatus) : RuleStatus.Unchanged,
+        specialRulesSeparate ? use(specialRulesSeparate.ruleStatus) : RuleStatus.Unchanged,
       );
     });
 
@@ -146,6 +164,7 @@ export class AccessRules extends Disposable {
         {ruleIndex: -1, value: 'user.Origin'},
         {ruleIndex: -1, value: 'user.SessionID'},
         {ruleIndex: -1, value: 'user.IsLoggedIn'},
+        {ruleIndex: -1, value: 'user.UserRef'},
       ];
       for (const [i, rule] of rules.entries()) {
         const tableId = use(rule.tableId);
@@ -161,20 +180,22 @@ export class AccessRules extends Disposable {
     // changes). Instead, react deliberately if rules change. Note that table/column renames would
     // trigger changes to rules, so we don't need to listen for those separately.
     for (const tableId of ['_grist_ACLResources', '_grist_ACLRules']) {
-      const tableData = this._gristDoc.docData.getTable(tableId)!;
+      const tableData = this.gristDoc.docData.getTable(tableId)!;
       this.autoDispose(tableData.tableActionEmitter.addListener(this._onChange, this));
     }
-    this.autoDispose(this._gristDoc.docPageModel.currentDoc.addListener(this._updateDocAccessData, this));
+    this.autoDispose(this.gristDoc.docPageModel.currentDoc.addListener(this._updateDocAccessData, this));
 
     this.update().catch((e) => this._errorMessage.set(e.message));
   }
 
-  public get allTableIds() { return Object.keys(this._aclResources).sort(); }
+  public get allTableIds() { return Array.from(this._aclResources.keys()).sort(); }
   public get userAttrRules() { return this._userAttrRules; }
   public get userAttrChoices() { return this._userAttrChoices; }
 
   public getTableTitle(tableId: string) {
-    return getTableTitle(this._aclResources[tableId]);
+    const table = this._aclResources.get(tableId);
+    if (!table) { return `#Invalid (${tableId})`; }
+    return getTableTitle(table);
   }
 
   /**
@@ -185,11 +206,13 @@ export class AccessRules extends Disposable {
     this._errorMessage.set('');
     const rules = this._ruleCollection;
 
-    [ , , this._aclResources] = await Promise.all([
-      rules.update(this._gristDoc.docData, {log: console}),
+    const [ , , aclResources] = await Promise.all([
+      rules.update(this.gristDoc.docData, {log: console, pullOutSchemaEdit: true}),
       this._updateDocAccessData(),
-      this._gristDoc.docComm.getAclResources(),
+      this.gristDoc.docComm.getAclResources(),
     ]);
+    this._aclResources = new Map(Object.entries(aclResources.tables));
+    this._ruleProblems.set(aclResources.problems);
     if (this.isDisposed()) { return; }
 
     this._tableRules.set(
@@ -199,10 +222,17 @@ export class AccessRules extends Disposable {
           tableId, this, rules.getAllColumnRuleSets(tableId), rules.getTableDefaultRuleSet(tableId)))
     );
 
-    SpecialRules.create(this._specialRules, SPECIAL_RULES_TABLE_ID, this,
-      rules.getAllColumnRuleSets(SPECIAL_RULES_TABLE_ID),
-      rules.getTableDefaultRuleSet(SPECIAL_RULES_TABLE_ID));
+    const withDefaultRules = ['SeedRule'];
+    const separateRules = ['SchemaEdit', 'FullCopies', 'AccessRules'];
 
+    SpecialRules.create(
+      this._specialRulesWithDefault, SPECIAL_RULES_TABLE_ID, this,
+      filterRuleSets(withDefaultRules, rules.getAllColumnRuleSets(SPECIAL_RULES_TABLE_ID)),
+      filterRuleSet(withDefaultRules, rules.getTableDefaultRuleSet(SPECIAL_RULES_TABLE_ID)));
+    SpecialRules.create(
+      this._specialRulesSeparate, SPECIAL_RULES_TABLE_ID, this,
+      filterRuleSets(separateRules, rules.getAllColumnRuleSets(SPECIAL_RULES_TABLE_ID)),
+      filterRuleSet(separateRules, rules.getTableDefaultRuleSet(SPECIAL_RULES_TABLE_ID)));
     DefaultObsRuleSet.create(this._docDefaultRuleSet, this, null, undefined, rules.getDocDefaultRuleSet());
     this._userAttrRules.set(
       Array.from(rules.getUserAttributeRules().values(), userAttr =>
@@ -219,19 +249,28 @@ export class AccessRules extends Disposable {
     // Note that if anything has changed, we apply changes relative to the current state of the
     // ACL tables (they may have changed by other users). So our changes will win.
 
-    const docData = this._gristDoc.docData;
+    const docData = this.gristDoc.docData;
     const resourcesTable = docData.getMetaTable('_grist_ACLResources');
     const rulesTable = docData.getMetaTable('_grist_ACLRules');
 
     // Add/remove resources to have just the ones we need.
     const newResources: MetaRowRecord<'_grist_ACLResources'>[] = flatten(
       [{tableId: '*', colIds: '*'}],
-      this._specialRules.get()?.getResources() || [],
-      ...this._tableRules.get().map(t => t.getResources()))
-      .map(r => ({id: -1, ...r}));
+      this._specialRulesWithDefault.get()?.getResources() || [],
+      this._specialRulesSeparate.get()?.getResources() || [],
+      ...this._tableRules.get().map(tr => tr.getResources())
+    )
+    // Skip the fake "*SPECIAL:SchemaEdit" resource (frontend-specific); these rules are saved to the default resource.
+    .filter(resource => !isSchemaEditResource(resource))
+    .map(r => ({id: -1, ...r}));
 
     // Prepare userActions and a mapping of serializedResource to rowIds.
     const resourceSync = syncRecords(resourcesTable, newResources, serializeResource);
+
+    const defaultResourceRowId = resourceSync.rowIdMap.get(serializeResource({id: -1, tableId: '*', colIds: '*'}));
+    if (!defaultResourceRowId) {
+      throw new Error('Default resource missing in resource map');
+    }
 
     // For syncing rules, we'll go by rowId that we store with each RulePart and with the RuleSet.
     const newRules: RowRecord[] = [];
@@ -242,10 +281,16 @@ export class AccessRules extends Disposable {
       }
 
       // Look up the rowId for the resource.
-      const resourceKey = serializeResource(rule.resourceRec as RowRecord);
-      const resourceRowId = resourceSync.rowIdMap.get(resourceKey);
-      if (!resourceRowId) {
-        throw new Error(`Resource missing in resource map: ${resourceKey}`);
+      let resourceRowId: number|undefined;
+      // Assign the rules for the fake "*SPECIAL:SchemaEdit" resource to the default resource where they belong.
+      if (isSchemaEditResource(rule.resourceRec!)) {
+        resourceRowId = defaultResourceRowId;
+      } else {
+        const resourceKey = serializeResource(rule.resourceRec as RowRecord);
+        resourceRowId = resourceSync.rowIdMap.get(resourceKey);
+        if (!resourceRowId) {
+          throw new Error(`Resource missing in resource map: ${resourceKey}`);
+        }
       }
       newRules.push({
         id: rule.id || -1,
@@ -253,14 +298,11 @@ export class AccessRules extends Disposable {
         aclFormula: rule.aclFormula!,
         permissionsText: rule.permissionsText!,
         rulePos: rule.rulePos || null,
+        memo: rule.memo ?? '',
       });
     }
 
     // UserAttribute rules are listed in the same rulesTable.
-    const defaultResourceRowId = resourceSync.rowIdMap.get(serializeResource({id: -1, tableId: '*', colIds: '*'}));
-    if (!defaultResourceRowId) {
-      throw new Error('Default resource missing in resource map');
-    }
     for (const userAttr of this._userAttrRules.get()) {
       const rule = userAttr.getRule();
       newRules.push({
@@ -270,6 +312,13 @@ export class AccessRules extends Disposable {
         userAttributes: rule.userAttributes,
       });
     }
+
+    logTelemetryEvent('changedAccessRules', {
+      full: {
+        docIdDigest: this.gristDoc.docId(),
+        ruleCount: newRules.length,
+      },
+    });
 
     // We need to fill in rulePos values. We'll add them in the order the rules are listed (since
     // this.getRules() returns them in a suitable order), keeping rulePos unchanged when possible.
@@ -309,56 +358,68 @@ export class AccessRules extends Disposable {
 
   public buildDom() {
     return cssOuter(
+      dom('div', this.gristDoc.behavioralPromptsManager.attachPopup('accessRules', {
+        hideArrow: true,
+      })),
       cssAddTableRow(
         bigBasicButton({disabled: true}, dom.hide(this._savingEnabled),
           dom.text((use) => {
             const s = use(this._ruleStatus);
-            return s === RuleStatus.CheckPending ? 'Checking...' :
-              s === RuleStatus.Unchanged ? 'Saved' : 'Invalid';
+            return s === RuleStatus.CheckPending ? t("Checking...") :
+              s === RuleStatus.Unchanged ? t("Saved") : t("Invalid");
           }),
           testId('rules-non-save')
         ),
-        bigPrimaryButton('Save', dom.show(this._savingEnabled),
+        bigPrimaryButton(t("Save"), dom.show(this._savingEnabled),
           dom.on('click', () => this.save()),
           testId('rules-save'),
         ),
-        bigBasicButton('Reset', dom.show(use => use(this._ruleStatus) !== RuleStatus.Unchanged),
+        bigBasicButton(t("Reset"), dom.show(use => use(this._ruleStatus) !== RuleStatus.Unchanged),
           dom.on('click', () => this.update()),
           testId('rules-revert'),
         ),
 
-        bigBasicButton('Add Table Rules', cssDropdownIcon('Dropdown'), {style: 'margin-left: auto'},
+        bigBasicButton(t("Add Table Rules"), cssDropdownIcon('Dropdown'), {style: 'margin-left: auto'},
           menu(() =>
             this.allTableIds.map((tableId) =>
               // Add the table on a timeout, to avoid disabling the clicked menu item
               // synchronously, which prevents the menu from closing on click.
               menuItemAsync(() => this._addTableRules(tableId),
                 this.getTableTitle(tableId),
-                dom.cls('disabled', (use) => use(this._tableRules).some(t => t.tableId === tableId)),
+                dom.cls('disabled', (use) => use(this._tableRules).some(tr => tr.tableId === tableId)),
               )
             ),
           ),
         ),
-        bigBasicButton('Add User Attributes', dom.on('click', () => this._addUserAttributes())),
-        bigBasicButton('Users', cssDropdownIcon('Dropdown'), elem => this._aclUsersPopup.attachPopup(elem),
+        bigBasicButton(t('Add User Attributes'), dom.on('click', () => this._addUserAttributes())),
+        bigBasicButton(t('View As'), cssDropdownIcon('Dropdown'),
+          elem => this._aclUsersPopup.attachPopup(elem, {placement: 'bottom-end', resetDocPage: true}),
           dom.style('visibility', use => use(this._aclUsersPopup.isInitialized) ? '' : 'hidden')),
       ),
       cssConditionError({style: 'margin-left: 16px'},
         dom.text(this._errorMessage),
         testId('access-rules-error')
       ),
+
+      dom.maybe(use => {
+        const ruleProblems = use(this._ruleProblems);
+        return ruleProblems.length > 0 ? ruleProblems : null;
+      }, ruleProblems =>
+        cssSection(
+          cssRuleProblems(
+            this.buildRuleProblemsDom(ruleProblems)))),
       shadowScroll(
         dom.maybe(use => use(this._userAttrRules).length, () =>
           cssSection(
-            cssSectionHeading('User Attributes'),
+            cssSectionHeading(t("User Attributes")),
             cssTableRounded(
               cssTableHeaderRow(
                 cssCell1(cssCell.cls('-rborder'), cssCell.cls('-center'), cssColHeaderCell('Name')),
                 cssCell4(
                   cssColumnGroup(
-                    cssCell1(cssColHeaderCell('Attribute to Look Up')),
-                    cssCell1(cssColHeaderCell('Lookup Table')),
-                    cssCell1(cssColHeaderCell('Lookup Column')),
+                    cssCell1(cssColHeaderCell(t("Attribute to Look Up"))),
+                    cssCell1(cssColHeaderCell(t("Lookup Table"))),
+                    cssCell1(cssColHeaderCell(t("Lookup Column"))),
                     cssCellIcon(),
                   ),
                 ),
@@ -369,15 +430,18 @@ export class AccessRules extends Disposable {
         ),
         dom.forEach(this._tableRules, (tableRules) => tableRules.buildDom()),
         cssSection(
-          cssSectionHeading('Default Rules', testId('rule-table-header')),
+          cssSectionHeading(t("Default Rules"), testId('rule-table-header')),
+          dom.maybe(this._specialRulesWithDefault, tableRules => cssSeedRule(
+            tableRules.buildCheckBoxes())),
           cssTableRounded(
             cssTableHeaderRow(
               cssCell1(cssCell.cls('-rborder'), cssCell.cls('-center'), cssColHeaderCell('Columns')),
               cssCell4(
                 cssColumnGroup(
                   cssCellIcon(),
-                  cssCell2(cssColHeaderCell('Condition')),
-                  cssCell1(cssColHeaderCell('Permissions')),
+                  cssCell2(cssColHeaderCell(t('Condition'))),
+                  cssCell1(cssColHeaderCell(t('Permissions'))),
+                  cssCellIconWithMargins(),
                   cssCellIcon(),
                 )
               )
@@ -386,9 +450,29 @@ export class AccessRules extends Disposable {
           ),
           testId('rule-table'),
         ),
-        dom.maybe(this._specialRules, tableRules => tableRules.buildDom()),
+        dom.maybe(this._specialRulesSeparate, tableRules => tableRules.buildDom()),
       ),
     );
+  }
+
+  public buildRuleProblemsDom(ruleProblems: AclRuleProblem[]) {
+    const buttons: Array<HTMLAnchorElement | HTMLButtonElement> = [];
+    for (const problem of ruleProblems) {
+      // Is the problem a missing table?
+      if (problem.tables) {
+        this._addButtonsForMissingTables(buttons, problem.tables.tableIds);
+      }
+      // Is the problem a missing column?
+      if (problem.columns) {
+        this._addButtonsForMissingColumns(buttons, problem.columns.tableId, problem.columns.colIds);
+      }
+      // Is the problem a misconfigured user attribute?
+      if (problem.userAttributes) {
+        const names = problem.userAttributes.names;
+        this._addButtonsForMisconfiguredUserAttributes(buttons, names);
+      }
+    }
+    return buttons.map(button => dom('span', button));
   }
 
   /**
@@ -396,8 +480,9 @@ export class AccessRules extends Disposable {
    */
   public getRules(): RuleRec[] {
     return flatten(
-      ...this._tableRules.get().map(t => t.getRules()),
-      this._specialRules.get()?.getRules() || [],
+      ...this._tableRules.get().map(tr => tr.getRules()),
+      this._specialRulesWithDefault.get()?.getRules() || [],
+      this._specialRulesSeparate.get()?.getRules() || [],
       this._docDefaultRuleSet.get()?.getRules('*') || []
     );
   }
@@ -410,9 +495,9 @@ export class AccessRules extends Disposable {
     removeItem(this._userAttrRules, userAttr);
   }
 
-  public async checkAclFormula(text: string): Promise<FormulaProperties> {
+  public async checkAclFormula(text: string): Promise<PredicateFormulaProperties> {
     if (text) {
-      return this._gristDoc.docComm.checkAclFormula(text);
+      return this.gristDoc.docComm.checkAclFormula(text);
     }
     return {};
   }
@@ -421,7 +506,7 @@ export class AccessRules extends Disposable {
   // Returns '' if valid, or an error string if not. Exempt colIds will not trigger an error.
   public checkTableColumns(tableId: string, colIds?: string[], exemptColIds?: string[]): string {
     if (!tableId || tableId === SPECIAL_RULES_TABLE_ID) { return ''; }
-    const tableColIds = this._aclResources[tableId].colIds;
+    const tableColIds = this._aclResources.get(tableId)?.colIds;
     if (!tableColIds) { return `Invalid table: ${tableId}`; }
     if (colIds) {
       const validColIds = new Set([...tableColIds, ...exemptColIds || []]);
@@ -434,15 +519,23 @@ export class AccessRules extends Disposable {
 
   // Returns a list of valid colIds for the given table, or undefined if the table isn't valid.
   public getValidColIds(tableId: string): string[]|undefined {
-    return this._aclResources[tableId]?.colIds.filter(id => !isHiddenCol(id)).sort();
+    return this._aclResources.get(tableId)?.colIds.filter(id => !isHiddenCol(id)).sort();
+  }
+
+  // Get rules to use for seeding any new set of table/column rules, e.g. to give owners
+  // broad rights over the table/column contents.
+  public getSeedRules(): ObsRulePart[] {
+    return this._specialRulesWithDefault.get()?.getCustomRules('SeedRule') || [];
   }
 
   private _addTableRules(tableId: string) {
-    if (this._tableRules.get().some(t => t.tableId === tableId)) {
+    if (this._tableRules.get().some(tr => tr.tableId === tableId)) {
       throw new Error(`Trying to add TableRules for existing table ${tableId}`);
     }
     const defRuleSet: RuleSet = {tableId, colIds: '*', body: []};
-    this._tableRules.push(TableRules.create(this._tableRules, tableId, this, undefined, defRuleSet));
+    const tableRules = TableRules.create(this._tableRules, tableId, this, undefined, defRuleSet);
+    this._tableRules.push(tableRules);
+    tableRules.addDefaultRules(this.getSeedRules());
   }
 
   private _addUserAttributes() {
@@ -461,13 +554,64 @@ export class AccessRules extends Disposable {
   }
 
   private async _updateDocAccessData() {
-    const pageModel = this._gristDoc.docPageModel;
-    const doc = pageModel.currentDoc.get();
+    await this._aclUsersPopup.load();
+  }
 
-    const permissionData = doc && await this._gristDoc.docComm.getUsersForViewAs();
-    if (this.isDisposed()) { return; }
+  private _addButtonsForMissingTables(buttons: Array<HTMLAnchorElement | HTMLButtonElement>, tableIds: string[]) {
+    for (const tableId of tableIds) {
+      // We don't know what the table's name was, just its tableId.
+      // Hopefully, the user will understand.
+      const title = t('Remove {{- tableId }} rules', { tableId });
+      const button = bigBasicButton(title, cssRemoveIcon('Remove'), dom.on('click', async () => {
+        await Promise.all(this._tableRules.get()
+          .filter(rules => rules.tableId === tableId)
+          .map(rules => rules.remove()));
+        button.style.display = 'none';
+      }));
+      buttons.push(button);
+    }
+  }
 
-    this._aclUsersPopup.init(pageModel, permissionData);
+  private _addButtonsForMissingColumns(buttons: Array<HTMLAnchorElement | HTMLButtonElement>,
+                                       tableId: string, colIds: string[]) {
+    const removeColRules = (rules: TableRules, colId: string) => {
+      for (const rule of rules.columnRuleSets.get()) {
+        const ruleColIds = new Set(rule.getColIdList());
+        if (!ruleColIds.has(colId)) { continue; }
+        if (ruleColIds.size === 1) {
+          rule.remove();
+        } else {
+          rule.removeColId(colId);
+        }
+      }
+    };
+    for (const colId of colIds) {
+      // TODO: we could translate tableId to table name in this case.
+      const title = t('Remove column {{- colId }} from {{- tableId }} rules', { tableId, colId });
+      const button = bigBasicButton(title, cssRemoveIcon('Remove'), dom.on('click', async () => {
+        await Promise.all(this._tableRules.get()
+          .filter(rules => rules.tableId === tableId)
+          .map(rules => removeColRules(rules, colId)));
+        button.style.display = 'none';
+      }));
+      buttons.push(button);
+    }
+  }
+
+  private _addButtonsForMisconfiguredUserAttributes(
+    buttons: Array<HTMLAnchorElement | HTMLButtonElement>,
+    names: string[]
+  ) {
+    for (const name of names) {
+      const title = t('Remove {{- name }} user attribute', {name});
+      const button = bigBasicButton(title, cssRemoveIcon('Remove'), dom.on('click', async () => {
+        await Promise.all(this._userAttrRules.get()
+          .filter(rule => rule.name.get() === name)
+          .map(rule => rule.remove()));
+        button.style.display = 'none';
+      }));
+      buttons.push(button);
+    }
   }
 }
 
@@ -498,7 +642,7 @@ class TableRules extends Disposable {
     } else if (this._defRuleSet) {
       DefaultObsRuleSet.create(this._defaultRuleSet, this._accessRules, this, this._haveColumnRules,
         this._defRuleSet);
-    }
+   }
 
     this.ruleStatus = Computed.create(this, (use) => {
       const columnRuleSets = use(this._columnRuleSets);
@@ -514,16 +658,44 @@ class TableRules extends Disposable {
     });
   }
 
+  /**
+   * Get all custom rules for the specific column. Used to gather the current
+   * setting of a special rule. Returns an empty list for unknown columns.
+   */
+  public getCustomRules(colId: string): ObsRulePart[] {
+    for (const ruleSet of this._columnRuleSets.get()) {
+      if (ruleSet.getColIds() === colId) {
+        return ruleSet.getCustomRules();
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Add the provided rules, copying their formula, permissions, and memo.
+   */
+  public addDefaultRules(rules: ObsRulePart[]) {
+    const ruleSet = this._defaultRuleSet.get();
+    ruleSet?.addRuleParts(rules, {foldEveryoneRule: true});
+  }
+
+  public remove() {
+    this._accessRules.removeTableRules(this);
+  }
+
+  public get columnRuleSets() {
+    return this._columnRuleSets;
+  }
+
   public buildDom() {
     return cssSection(
       cssSectionHeading(
-        dom('span', 'Rules for table ', cssTableName(this._accessRules.getTableTitle(this.tableId))),
+        dom('span', t("Rules for table "), cssTableName(this._accessRules.getTableTitle(this.tableId))),
         cssIconButton(icon('Dots'), {style: 'margin-left: auto'},
           menu(() => [
-            menuItemAsync(() => this._addColumnRuleSet(), 'Add Column Rule'),
-            menuItemAsync(() => this._addDefaultRuleSet(), 'Add Default Rule',
-              dom.cls('disabled', use => Boolean(use(this._defaultRuleSet)))),
-            menuItemAsync(() => this._accessRules.removeTableRules(this), 'Delete Table Rules'),
+            menuItemAsync(() => this._addColumnRuleSet(), t("Add Column Rule")),
+            menuItemAsync(() => this._addDefaultRuleSet(), t("Add Table-wide Rule")),
+            menuItemAsync(() => this._accessRules.removeTableRules(this), t("Delete Table Rules")),
           ]),
           testId('rule-table-menu-btn'),
         ),
@@ -535,8 +707,9 @@ class TableRules extends Disposable {
           cssCell4(
             cssColumnGroup(
               cssCellIcon(),
-              cssCell2(cssColHeaderCell('Condition')),
-              cssCell1(cssColHeaderCell('Permissions')),
+              cssCell2(cssColHeaderCell(t('Condition'))),
+              cssCell1(cssColHeaderCell(t('Permissions'))),
+              cssCellIconWithMargins(),
               cssCellIcon(),
             )
           ),
@@ -637,12 +810,19 @@ class TableRules extends Disposable {
   }
 
   private _addColumnRuleSet() {
-    this._columnRuleSets.push(ColumnObsRuleSet.create(this._columnRuleSets, this._accessRules, this, undefined, []));
+    const ruleSet = ColumnObsRuleSet.create(this._columnRuleSets, this._accessRules, this, undefined, []);
+    this._columnRuleSets.push(ruleSet);
+    ruleSet.addRuleParts(this._accessRules.getSeedRules(), {foldEveryoneRule: true});
   }
 
   private _addDefaultRuleSet() {
-    if (!this._defaultRuleSet.get()) {
+    const ruleSet = this._defaultRuleSet.get();
+    if (!ruleSet) {
       DefaultObsRuleSet.create(this._defaultRuleSet, this._accessRules, this, this._haveColumnRules);
+      this.addDefaultRules(this._accessRules.getSeedRules());
+    } else {
+      const part = ruleSet.addRulePart(ruleSet.getDefaultCondition());
+      setTimeout(() => part.focusEditor?.(), 0);
     }
   }
 }
@@ -650,11 +830,19 @@ class TableRules extends Disposable {
 class SpecialRules extends TableRules {
   public buildDom() {
     return cssSection(
-      cssSectionHeading('Special Rules', testId('rule-table-header')),
-      this.buildColumnRuleSets(),
-      this.buildErrors(),
+      cssSectionHeading(t('Special Rules'), testId('rule-table-header')),
+      this.buildCheckBoxes(),
       testId('rule-table'),
     );
+  }
+
+  // Build dom with checkboxes, without a section wrapping it.
+  // Used for folding a special rule into another section.
+  public buildCheckBoxes() {
+    return [
+      this.buildColumnRuleSets(),
+      this.buildErrors(),
+    ];
   }
 
   public getResources(): ResourceRec[] {
@@ -667,7 +855,12 @@ class SpecialRules extends TableRules {
     owner: IDisposableOwner, accessRules: AccessRules, tableRules: TableRules,
     ruleSet: RuleSet|undefined, initialColIds: string[],
   ): ColumnObsRuleSet {
-    return SpecialObsRuleSet.create(owner, accessRules, tableRules, ruleSet, initialColIds);
+    if (isEqual(ruleSet?.colIds, ['SchemaEdit'])) {
+      // The special rule for "schemaEdit" permissions.
+      return SpecialSchemaObsRuleSet.create(owner, accessRules, tableRules, ruleSet, initialColIds);
+    } else {
+      return SpecialObsRuleSet.create(owner, accessRules, tableRules, ruleSet, initialColIds);
+    }
   }
 }
 
@@ -684,20 +877,26 @@ abstract class ObsRuleSet extends Disposable {
   // ruleSet is omitted for a new ObsRuleSet added by the user.
   constructor(public accessRules: AccessRules, protected _tableRules: TableRules|null, private _ruleSet?: RuleSet) {
     super();
-    if (this._ruleSet) {
-      this._body.set(this._ruleSet.body.map(part => ObsRulePart.create(this._body, this, part)));
-    } else {
-      // If creating a new RuleSet, start with just a default permission part.
-      this._body.set([ObsRulePart.create(this._body, this, undefined)]);
+    const parts = this._ruleSet?.body.map(part => ObsRulePart.create(this._body, this, part)) || [];
+    if (parts.length === 0) {
+      // If creating a new RuleSet, or if there are no rules,
+      // start with just a default permission part.
+      parts.push(ObsRulePart.create(this._body, this, undefined));
     }
+    this._body.set(parts);
 
     this.ruleStatus = Computed.create(this, this._body, (use, body) => {
       // If anything was changed or added, some part.ruleStatus will be other than Unchanged. If
       // there were only removals, then body.length will have changed.
+      // Ignore empty rules.
       return Math.max(
-        getChangedStatus(body.length < (this._ruleSet?.body?.length || 0)),
+        getChangedStatus(body.filter(part => !part.isEmpty(use)).length < (this._ruleSet?.body?.length || 0)),
         ...body.map(part => use(part.ruleStatus)));
     });
+  }
+
+  public remove() {
+    this._tableRules?.removeRuleSet(this);
   }
 
   public getRules(tableId: string): RuleRec[] {
@@ -757,10 +956,61 @@ abstract class ObsRuleSet extends Disposable {
     }
   }
 
-  public addRulePart(beforeRule: ObsRulePart|null) {
+  public addRulePart(beforeRule: ObsRulePart|null,
+                     content?: RulePart,
+                     isNew: boolean = false): ObsRulePart {
     const body = this._body.get();
     const i = beforeRule ? body.indexOf(beforeRule) : body.length;
-    this._body.splice(i, 0, ObsRulePart.create(this._body, this, undefined));
+    const part = ObsRulePart.create(this._body, this, content, isNew);
+    this._body.splice(i, 0, part);
+    return part;
+  }
+
+  /**
+   * Add a sequence of rules, taking priority over existing rules.
+   * optionally, if lowest-priority rule being added applies to
+   * everyone, and the existing rule also applies to everyone,
+   * fold those rules into one.
+   * This method is currently only called on newly created rule
+   * sets, so there's no need to check permissions and memos.
+   */
+  public addRuleParts(newParts: ObsRulePart[], options: {foldEveryoneRule?: boolean}) {
+    // Check if we need to consider folding rules that apply to everyone.
+    if (options.foldEveryoneRule) {
+      const oldParts = this._body.get();
+      const myEveryonePart = (oldParts.length === 1 && !oldParts[0].getRulePart().aclFormula) ? oldParts[0] : null;
+      const newEveryonePart = newParts[newParts.length - 1]?.getRulePart().aclFormula ? null :
+        newParts[newParts.length - 1];
+       if (myEveryonePart && newEveryonePart) {
+         // It suffices to remove the existing rule that applies to everyone,
+         // which is just an empty default from rule set creation.
+         removeItem(this._body, myEveryonePart);
+       }
+    }
+    for (const part of [...newParts].reverse()) {
+      const {permissionsText, aclFormula, memo} = part.getRulePart();
+      if (permissionsText === undefined || aclFormula === undefined) {
+        // Should not happen.
+        continue;
+      }
+
+      // Include only the permissions for the bits that this RuleSet supports. E.g. this matters
+      // for seed rules, which may include create/delete bits which shouldn't apply to columns.
+      const origPermissions = parsePermissions(permissionsText);
+      const trimmedPermissions = trimPermissions(origPermissions, this.getAvailableBits());
+      const trimmedPermissionsText = permissionSetToText(trimmedPermissions);
+
+      this.addRulePart(
+        this.getFirst() || null,
+        {
+          aclFormula,
+          permissionsText: trimmedPermissionsText,
+          permissions: trimmedPermissions,
+          memo,
+        },
+        true,
+      );
+    }
   }
 
   /**
@@ -769,6 +1019,11 @@ abstract class ObsRuleSet extends Disposable {
    */
   public getFirstBuiltIn(): ObsRulePart|undefined {
     return this._body.get().find(p => p.isBuiltIn());
+  }
+
+  // Get first rule part, built-in or not.
+  public getFirst(): ObsRulePart|undefined {
+    return this._body.get()[0];
   }
 
   /**
@@ -793,16 +1048,17 @@ abstract class ObsRuleSet extends Disposable {
     return body.length > 0 && body[body.length - 1].hasEmptyCondition(use);
   }
 
+  public getDefaultCondition(): ObsRulePart|null {
+    const body = this._body.get();
+    const last = body.length > 0 ? body[body.length - 1] : null;
+    return last?.hasEmptyCondition(unwrap) ? last : null;
+  }
+
   /**
    * Which permission bits to allow the user to set.
    */
   public getAvailableBits(): PermissionKey[] {
-    if (this._tableRules) {
-      return ['read', 'update', 'create', 'delete'];
-    } else {
-      // For the doc-wide rule set, expose the schemaEdit bit too.
-      return ['read', 'update', 'create', 'delete', 'schemaEdit'];
-    }
+    return AVAILABLE_BITS_TABLES;
   }
 
   /**
@@ -822,6 +1078,21 @@ abstract class ObsRuleSet extends Disposable {
 
   public hasOnlyBuiltInRules() {
     return this._body.get().every(rule => rule.isBuiltIn());
+  }
+
+  // Get rule parts that are neither built-in nor empty.
+  public getCustomRules(): ObsRulePart[] {
+    return this._body.get().filter(rule => !rule.isBuiltInOrEmpty());
+  }
+
+  /**
+   * If the set applies to a special column, return its name.
+   */
+  public getSpecialColumn(): string|undefined {
+    if (this._ruleSet?.tableId === SPECIAL_RULES_TABLE_ID &&
+        this._ruleSet.colIds.length === 1) {
+      return this._ruleSet.colIds[0];
+    }
   }
 }
 
@@ -850,11 +1121,15 @@ class ColumnObsRuleSet extends ObsRuleSet {
   }
 
   public buildResourceDom(): DomElementArg {
-    return aclColumnList(this._colIds, this.getValidColIds());
+    return aclColumnList(this._colIds, this._getValidColIdsList());
   }
 
   public getColIdList(): string[] {
     return this._colIds.get();
+  }
+
+  public removeColId(colId: string) {
+    this._colIds.set(this._colIds.get().filter(c => (c !== colId)));
   }
 
   public getColIds(): string {
@@ -862,12 +1137,15 @@ class ColumnObsRuleSet extends ObsRuleSet {
   }
 
   public getAvailableBits(): PermissionKey[] {
-    // Create/Delete bits can't be set on a column-specific rule.
-    return ['read', 'update'];
+    return AVAILABLE_BITS_COLUMNS;
   }
 
   public hasColumns() {
     return true;
+  }
+
+  private _getValidColIdsList(): string[] {
+    return this.getValidColIds().filter(id => id !== 'id');
   }
 }
 
@@ -880,70 +1158,136 @@ class DefaultObsRuleSet extends ObsRuleSet {
     return [
       cssCenterContent.cls(''),
       cssDefaultLabel(
-        dom.text(use => this._haveColumnRules && use(this._haveColumnRules) ? 'All Other' : 'All'),
-      )
+        dom.domComputed(use => this._haveColumnRules && use(this._haveColumnRules), (haveColRules) =>
+          haveColRules ? withInfoTooltip('All', 'accessRulesTableWide') : 'All')
+      ),
     ];
   }
 }
 
-function getSpecialRuleDescription(type: string): string {
-  switch (type) {
-    case 'AccessRules':
-      return 'Allow everyone to view Access Rules.';
-    case 'FullCopies':
-      return 'Allow everyone to copy the entire document, or view it in full in fiddle mode.\n' +
-        'Useful for examples and templates, but not for sensitive data.';
-    default: return type;
-  }
+interface SpecialRuleBody {
+  permissions: string;
+  formula: string;
 }
 
-function getSpecialRuleName(type: string): string {
-  switch (type) {
-    case 'AccessRules': return 'Permission to view Access Rules';
-    case 'FullCopies': return 'Permission to access the document in full when needed';
-    default: return type;
-  }
+/**
+ * Properties we need to know about how a special rule should function and
+ * be rendered.
+ */
+interface SpecialRuleProperties extends SpecialRuleBody {
+  description: string;
+  name: string;
+  availableBits: PermissionKey[];
+}
+
+const schemaEditRules: {[key: string]: SpecialRuleBody} = {
+  allowEditors: {
+    permissions: '+S',
+    formula: 'user.Access == EDITOR',
+  },
+  denyEditors: {
+    permissions: '-S',
+    formula: 'user.Access != OWNER',
+  },
+};
+
+const specialRuleProperties: Record<string, SpecialRuleProperties> = {
+  AccessRules: {
+    name: t('Permission to view Access Rules'),
+    description: t('Allow everyone to view Access Rules.'),
+    availableBits: ['read'],
+    permissions: '+R',
+    formula: 'True',
+  },
+  FullCopies: {
+    name: t('Permission to access the document in full when needed'),
+    description: t(`Allow everyone to copy the entire document, or view it in full in fiddle mode.
+Useful for examples and templates, but not for sensitive data.`),
+    availableBits: ['read'],
+    permissions: '+R',
+    formula: 'True',
+  },
+  SeedRule: {
+    name: t('Seed rules'),
+    description: t('When adding table rules, automatically add a rule to grant OWNER full access.'),
+    availableBits: ['read', 'create', 'update', 'delete'],
+    permissions: '+CRUD',
+    formula: 'user.Access in [OWNER]',
+  },
+  SchemaEdit: {
+    name: t("Permission to edit document structure"),
+    description: t("Allow editors to edit structure (e.g. modify and delete tables, columns, \
+layouts), and to write formulas, which give access to all data regardless of read restrictions."),
+    availableBits: ['schemaEdit'],
+    ...schemaEditRules.denyEditors,
+  },
+};
+
+function getSpecialRuleProperties(name: string): SpecialRuleProperties {
+  return specialRuleProperties[name] || {
+    ...specialRuleProperties.AccessRules,
+    name,
+    description: name,
+  };
 }
 
 class SpecialObsRuleSet extends ColumnObsRuleSet {
+  private _isExpanded = Observable.create<boolean>(this, false);
+
+  public get props() {
+    return getSpecialRuleProperties(this.getColIds());
+  }
+
   public buildRuleSetDom() {
-    const isNonStandard: Observable<boolean> = Computed.create(null, this._body, (use, body) =>
-      !body.every(rule => rule.isBuiltIn() || rule.matches(use, 'True', '+R')));
-
-    const allowEveryone: Observable<boolean> = Computed.create(null, this._body,
-      (use, body) => !use(isNonStandard) && !body.every(rule => rule.isBuiltIn()))
-      .onWrite(val => this._allowEveryone(val));
-
-    const isExpanded = Observable.create<boolean>(null, isNonStandard.get());
+    const isNonStandard = this._createIsNonStandardObs();
+    const isChecked = this._createIsCheckedObs(isNonStandard);
+    if (isNonStandard.get()) {
+      this._isExpanded.set(true);
+    }
 
     return dom('div',
-      dom.autoDispose(isExpanded),
-      dom.autoDispose(allowEveryone),
+      dom.autoDispose(isChecked),
+      dom.autoDispose(isNonStandard),
       cssRuleDescription(
-        {style: 'white-space: pre-line;'},  // preserve line breaks in long descriptions
         cssIconButton(icon('Expand'),
-          dom.style('transform', (use) => use(isExpanded) ? 'rotate(90deg)' : ''),
-          dom.on('click', () => isExpanded.set(!isExpanded.get())),
+          dom.style('transform', (use) => use(this._isExpanded) ? 'rotate(90deg)' : ''),
+          dom.on('click', () => this._isExpanded.set(!this._isExpanded.get())),
           testId('rule-special-expand'),
+          {style: 'margin: -4px'},  // subtract padding to align better.
         ),
-        squareCheckbox(allowEveryone,
+        cssCheckbox(isChecked,
           dom.prop('disabled', isNonStandard),
           testId('rule-special-checkbox'),
         ),
-        getSpecialRuleDescription(this.getColIds()),
+        this.props.description,
       ),
-      dom.maybe(isExpanded, () =>
+      this._buildDomWarning(),
+      dom.maybe(this._isExpanded, () =>
         cssTableRounded(
           {style: 'margin-left: 56px'},
           cssTableHeaderRow(
             cssCellIcon(),
-            cssCell4(cssColHeaderCell(getSpecialRuleName(this.getColIds()))),
+            cssCell4(cssColHeaderCell(this.props.name)),
             cssCell1(cssColHeaderCell('Permissions')),
+            cssCellIconWithMargins(),
             cssCellIcon(),
           ),
           cssTableRow(
             cssRuleBody.cls(''),
             dom.forEach(this._body, part => part.buildRulePartDom(true)),
+            dom.maybe(use => !this.hasDefaultCondition(use), () =>
+              cssColumnGroup(
+                {style: 'min-height: 28px'},
+                cssCellIcon(
+                  cssIconButton(
+                    icon('Plus'),
+                    dom.on('click', () => this.addRulePart(null)),
+                    testId('rule-add'),
+                  )
+                ),
+                testId('rule-extra-add'),
+              )
+            ),
           ),
           testId('rule-set'),
         )
@@ -954,19 +1298,102 @@ class SpecialObsRuleSet extends ColumnObsRuleSet {
   }
 
   public getAvailableBits(): PermissionKey[] {
-    return ['read'];
+    return this.props.availableBits;
+  }
+
+  public removeRulePart(rulePart: ObsRulePart) {
+    removeItem(this._body, rulePart);
+    if (this._body.get().length === 0) {
+      this._isExpanded.set(false);
+      this._allowEveryone(false);
+    }
+  }
+
+  protected _buildDomWarning(): DomContents {
+    return null;
+  }
+
+  // Observable for whether this ruleSet is "standard", i.e. checked or unchecked state, without
+  // any strange rules that need to be shown expanded with the checkbox greyed out.
+  protected _createIsNonStandardObs(): Observable<boolean> {
+    return Computed.create(null, this._body, (use, body) =>
+      !body.every(rule => rule.isBuiltInOrEmpty(use) || rule.matches(use, this.props.formula, this.props.permissions)));
+  }
+
+  // Observable for whether the checkbox should be shown as checked. Writing to it will update
+  // rules so as to toggle the checkbox.
+  protected _createIsCheckedObs(isNonStandard: Observable<boolean>): Observable<boolean> {
+    return Computed.create(null, this._body,
+      (use, body) => !use(isNonStandard) && !body.every(rule => rule.isBuiltInOrEmpty(use)))
+      .onWrite(val => this._allowEveryone(val));
   }
 
   private _allowEveryone(value: boolean) {
     const builtInRules = this._body.get().filter(r => r.isBuiltIn());
-    if (value === true) {
-      const rulePart: RulePart = {
-        aclFormula: 'True',
-        permissionsText: '+R',
-        permissions: parsePermissions('+R'),
-      };
+    if (value) {
+      const rulePart = makeRulePart(this.props);
       this._body.set([ObsRulePart.create(this._body, this, rulePart, true), ...builtInRules]);
-    } else if (value === false) {
+    } else {
+      this._body.set(builtInRules);
+      if (builtInRules.length === 0) {
+        this._body.push(ObsRulePart.create(this._body, this, undefined));
+      }
+    }
+  }
+}
+
+function makeRulePart({permissions, formula}: SpecialRuleBody): RulePart {
+  const rulePart: RulePart = {
+    aclFormula: formula,
+    permissionsText: permissions,
+    permissions: parsePermissions(permissions),
+  };
+  return rulePart;
+}
+
+/**
+ * SchemaEdit permissions are moved out to a special fake resource "*SPECIAL:SchemaEdit" in the
+ * frontend, to be presented under their own checkbox option. Its behaviors are a bit different
+ * from other checkbox options; the differences are in the overridden methods here.
+ */
+class SpecialSchemaObsRuleSet extends SpecialObsRuleSet {
+  protected _buildDomWarning(): DomContents {
+    return dom.maybe(
+      (use) => use(this._body).every(rule => rule.isBuiltInOrEmpty(use)),
+      () => cssError(
+        t("This default should be changed if editors' access is to be limited. "),
+        dom('a', {style: 'color: inherit; text-decoration: underline'},
+          'Dismiss', dom.on('click', () => this._allowEditors('confirm'))),
+        testId('rule-schema-edit-warning'),
+      )
+    );
+  }
+
+  // SchemaEdit rules support an extra "standard" state, where a no-op rule exists (explicit rule
+  // allowing EDITORs SchemaEdit permission), in which case we don't show a warning.
+  protected _createIsNonStandardObs(): Observable<boolean> {
+    return Computed.create(null, this._body, (use, body) =>
+      !body.every(rule => rule.isBuiltInOrEmpty(use) || rule.matches(use, this.props.formula, this.props.permissions)
+        || rule.matches(use, schemaEditRules.allowEditors.formula, schemaEditRules.allowEditors.permissions)));
+  }
+
+  protected _createIsCheckedObs(isNonStandard: Observable<boolean>): Observable<boolean> {
+    return Computed.create(null, this._body,
+      (use, body) => body.every(rule => rule.isBuiltInOrEmpty(use)
+        || rule.matches(use, schemaEditRules.allowEditors.formula, schemaEditRules.allowEditors.permissions)))
+      .onWrite(val => this._allowEditors(val));
+  }
+
+  // The third "confirm" option is used by the "Dismiss" link in the warning.
+  private _allowEditors(value: boolean|'confirm') {
+    const builtInRules = this._body.get().filter(r => r.isBuiltIn());
+    if (value === 'confirm') {
+      const rulePart = makeRulePart(schemaEditRules.allowEditors);
+      this._body.set([ObsRulePart.create(this._body, this, rulePart, true), ...builtInRules]);
+    } else if (!value) {
+      const rulePart = makeRulePart(schemaEditRules.denyEditors);
+      this._body.set([ObsRulePart.create(this._body, this, rulePart, true), ...builtInRules]);
+    } else {
       this._body.set(builtInRules);
     }
   }
@@ -1025,6 +1452,10 @@ class ObsUserAttributeRule extends Disposable {
     });
   }
 
+  public remove() {
+    this._accessRules.removeUserAttributes(this);
+  }
+
   public get name() { return this._name; }
   public get tableId() { return this._tableId; }
 
@@ -1033,7 +1464,7 @@ class ObsUserAttributeRule extends Disposable {
       cssCell1(cssCell.cls('-rborder'),
         cssCellContent(
           cssInput(this._name, async (val) => this._name.set(val),
-            {placeholder: 'Attribute name'},
+            {placeholder: t("Attribute name")},
             (this._options.focus ? (elem) => { setTimeout(() => elem.focus(), 0); } : null),
             testId('rule-userattr-name'),
           ),
@@ -1142,6 +1573,8 @@ class ObsRulePart extends Disposable {
   // Whether the rule part, and if it's valid or being checked.
   public ruleStatus: Computed<RuleStatus>;
 
+  public focusEditor: (() => void)|undefined;
+
   // Formula to show in the formula editor.
   private _aclFormula = Observable.create<string>(this, this._rulePart?.aclFormula || "");
 
@@ -1149,6 +1582,7 @@ class ObsRulePart extends Disposable {
   private _completions = Computed.create<string[]>(this, (use) => [
     ...use(this._ruleSet.accessRules.userAttrChoices).map(opt => opt.value),
     ...this._ruleSet.getValidColIds().map(colId => `rec.${colId}`),
+    ...this._ruleSet.getValidColIds().map(colId => `$${colId}`),
     ...this._ruleSet.getValidColIds().map(colId => `newRec.${colId}`),
   ]);
 
@@ -1156,27 +1590,44 @@ class ObsRulePart extends Disposable {
   private _permissions = Observable.create<PartialPermissionSet>(
     this, this._rulePart?.permissions || emptyPermissionSet());
 
+  // The memo text. Updated whenever changes are made within `_memoEditor`.
+  private _memo: Observable<string>;
+
+  // Reference to the memo editor element, for triggering focus. Shown when
+  // `_showMemoEditor` is true.
+  private _memoEditor: HTMLInputElement | undefined;
+
+  // Is the memo editor visible? Initialized to true if a saved memo exists for this rule.
+  private _showMemoEditor: Observable<boolean>;
+
   // Whether the rule is being checked after a change. Saving will wait for such checks to finish.
   private _checkPending = Observable.create(this, false);
 
   // If the formula failed validation, the error message to show. Blank if valid.
   private _formulaError = Observable.create(this, '');
 
-  private _formulaProperties = Observable.create<FormulaProperties>(this, getAclFormulaProperties(this._rulePart));
+  private _formulaProperties = Observable.create<PredicateFormulaProperties>(this,
+    getAclFormulaProperties(this._rulePart));
 
   // Error message if any validation failed.
   private _error: Computed<string>;
 
-  // rulePart is omitted for a new ObsRulePart added by the user. If given, isNew may be set to
-  // treat the rule as new and only use the rulePart for its initialization.
   constructor(private _ruleSet: ObsRuleSet, private _rulePart?: RulePart, isNew = false) {
     super();
+    this._memo = Observable.create(this, _rulePart?.memo ?? '');
+
     if (_rulePart && isNew) {
+      // rulePart is omitted for a new ObsRulePart added by the user. If given, isNew may be set to
+      // treat the rule as new and only use the rulePart for its initialization.
       this._rulePart = undefined;
     }
+
+    // If this rule has a blank memo, don't show the editor.
+    this._showMemoEditor = Observable.create(this, !this.isBuiltIn() && this._memo.get() !== '');
+
     this._error = Computed.create(this, (use) => {
       return use(this._formulaError) ||
-        this._warnInvalidColIds(use(this._formulaProperties).usedColIds) ||
+        this._warnInvalidColIds(use(this._formulaProperties).recColIds) ||
         ( !this._ruleSet.isLastCondition(use, this) &&
           use(this._aclFormula) === '' &&
           permissionSetToText(use(this._permissions)) !== '' ?
@@ -1184,14 +1635,24 @@ class ObsRulePart extends Disposable {
         );
     });
 
+    const emptyPerms = emptyPermissionSet();
     this.ruleStatus = Computed.create(this, (use) => {
       if (use(this._error)) { return RuleStatus.Invalid; }
       if (use(this._checkPending)) { return RuleStatus.CheckPending; }
       return getChangedStatus(
-        use(this._aclFormula) !== this._rulePart?.aclFormula ||
-        !isEqual(use(this._permissions), this._rulePart?.permissions)
+        use(this._aclFormula) !== (this._rulePart?.aclFormula ?? '') ||
+        use(this._memo) !== (this._rulePart?.memo ?? '') ||
+        !isEqual(use(this._permissions), this._rulePart?.permissions ?? emptyPerms)
       );
     });
+    // The formula may be invalid from the beginning. Make sure we show errors in this
+    // case.
+    const text = this._aclFormula.get();
+    if (text) {
+      this._setAclFormula(text, true).catch(e => {
+        console.error(e);
+      });
+    }
   }
 
   public getRulePart(): RuleRec {
@@ -1202,6 +1663,7 @@ class ObsRulePart extends Disposable {
       aclFormula: this._aclFormula.get(),
       permissionsText: permissionSetToText(this._permissions.get()),
       rulePos: this._rulePart?.origRecord?.rulePos as number|undefined,
+      memo: this._memo.get(),
     };
   }
 
@@ -1231,50 +1693,99 @@ class ObsRulePart extends Disposable {
   }
 
   public buildRulePartDom(wide: boolean = false) {
-    return cssColumnGroup(
-      cssCellIcon(
-        (this._isNonFirstBuiltIn() ?
-          null :
-          cssIconButton(icon('Plus'),
-            dom.on('click', () => this._ruleSet.addRulePart(this)),
-            testId('rule-add'),
-          )
+    return cssRulePartAndMemo(
+      cssColumnGroup(
+        cssCellIcon(
+          (this._isNonFirstBuiltIn() ?
+            null :
+            cssIconButton(icon('Plus'),
+              dom.on('click', () => this._ruleSet.addRulePart(this)),
+              testId('rule-add'),
+            )
+          ),
         ),
-      ),
-      cssCell2(
-        wide ? cssCell4.cls('') : null,
-        aclFormulaEditor({
-          initialValue: this._aclFormula.get(),
-          readOnly: this.isBuiltIn(),
-          setValue: (value) => this._setAclFormula(value),
-          placeholder: dom.text((use) => {
-            return (
-              this._ruleSet.isSoleCondition(use, this) ? 'Everyone' :
-              this._ruleSet.isLastCondition(use, this) ? 'Everyone Else' :
-              'Enter Condition'
-            );
+        cssCell2(
+          wide ? cssCell4.cls('') : null,
+          aclFormulaEditor({
+            initialValue: this._aclFormula.get(),
+            readOnly: this.isBuiltIn(),
+            setValue: (value) => this._setAclFormula(value),
+            placeholder: dom.text((use) => {
+              return (
+                this._ruleSet.isSoleCondition(use, this) ? t('Everyone') :
+                this._ruleSet.isLastCondition(use, this) ? t('Everyone Else') :
+                t('Enter Condition')
+              );
+            }),
+            getSuggestions: (prefix) => this._completions.get(),
+            customiseEditor: (editor) => { this.focusEditor = () => editor.focus(); },
           }),
-          getSuggestions: (prefix) => this._completions.get(),
-        }),
-        testId('rule-acl-formula'),
+          testId('rule-acl-formula'),
+        ),
+        cssCell1(cssCell.cls('-stretch'),
+          permissionsWidget(this._ruleSet.getAvailableBits(), this._permissions,
+            {disabled: this.isBuiltIn(), sanityCheck: (pset) => this.sanityCheck(pset)},
+            testId('rule-permissions')
+          ),
+        ),
+        cssCellIconWithMargins(
+          dom.maybe(use => !this.isBuiltIn() && !use(this._showMemoEditor), () =>
+            cssIconButton(icon('Memo'),
+              dom.on('click', () => {
+                this._showMemoEditor.set(true);
+                // Note that focus is set when the memo icon is clicked, and not when
+                // the editor is attached to the DOM; because rules with non-blank
+                // memos have their editors visible by default when the page is first
+                // loaded, focusing on creation could cause unintended focusing.
+                setTimeout(() => this._memoEditor?.focus(), 0);
+              }),
+              testId('rule-memo-add'),
+            )
+          ),
+        ),
+        cssCellIcon(
+          (this.isBuiltIn() ?
+            null :
+            cssIconButton(icon('Remove'),
+              dom.on('click', () => this._ruleSet.removeRulePart(this)),
+              testId('rule-remove'),
+            )
+          ),
+        ),
+        dom.maybe(this._error, (msg) => cssConditionError(msg, testId('rule-error'))),
+        testId('rule-part'),
       ),
-      cssCell1(cssCell.cls('-stretch'),
-        permissionsWidget(this._ruleSet.getAvailableBits(), this._permissions,
-          {disabled: this.isBuiltIn(), sanityCheck: (pset) => this.sanityCheck(pset)},
-          testId('rule-permissions')
+      dom.maybe(this._showMemoEditor, () =>
+        cssMemoColumnGroup(
+          cssCellIcon(),
+          cssMemoIcon('Memo'),
+          cssCell2(
+            wide ? cssCell4.cls('') : null,
+            this._memoEditor = aclMemoEditor(this._memo,
+              {
+                placeholder: t("Type a message..."),
+              },
+              dom.onKeyDown({
+                // Match the behavior of the formula editor.
+                Enter: (_ev, el) => el.blur(),
+              }),
+            ),
+            testId('rule-memo-editor'),
+          ),
+          cssCellIconWithMargins(),
+          cssCellIcon(
+            cssIconButton(icon('Remove'),
+              dom.on('click', () => {
+                this._showMemoEditor.set(false);
+                this._memo.set('');
+              }),
+              testId('rule-memo-remove'),
+            ),
+          ),
+          testId('rule-memo'),
         ),
       ),
-      cssCellIcon(
-        (this.isBuiltIn() ?
-          null :
-          cssIconButton(icon('Remove'),
-            dom.on('click', () => this._ruleSet.removeRulePart(this)),
-            testId('rule-remove'),
-          )
-        ),
-      ),
-      dom.maybe(this._error, (msg) => cssConditionError(msg, testId('rule-error'))),
-      testId('rule-part'),
+      testId('rule-part-and-memo'),
     );
   }
 
@@ -1282,12 +1793,23 @@ class ObsRulePart extends Disposable {
     return this._rulePart ? !this._rulePart.origRecord?.id : false;
   }
 
+  // return true if formula, permissions, and memo are all empty.
+  public isEmpty(use: UseCB = unwrap): boolean {
+    return use(this._aclFormula) === '' &&
+      isEqual(use(this._permissions), emptyPermissionSet()) &&
+      use(this._memo) === '';
+  }
+
+  public isBuiltInOrEmpty(use: UseCB = unwrap): boolean {
+    return this.isBuiltIn() || this.isEmpty(use);
+  }
+
   private _isNonFirstBuiltIn(): boolean {
     return this.isBuiltIn() && this._ruleSet.getFirstBuiltIn() !== this;
   }
 
-  private async _setAclFormula(text: string) {
-    if (text === this._aclFormula.get()) { return; }
+  private async _setAclFormula(text: string, initial: boolean = false) {
+    if (text === this._aclFormula.get() && !initial) { return; }
     this._aclFormula.set(text);
     this._checkPending.set(true);
     this._formulaProperties.set({});
@@ -1305,6 +1827,12 @@ class ObsRulePart extends Disposable {
   private _warnInvalidColIds(colIds?: string[]) {
     if (!colIds || !colIds.length) { return false; }
     const allValid = new Set(this._ruleSet.getValidColIds());
+    const specialColumn = this._ruleSet.getSpecialColumn();
+    if (specialColumn === 'SeedRule') {
+      // We allow seed rules to refer to columns without checking
+      // them (until the seed rules are used).
+      return false;
+    }
     const invalid = colIds.filter(c => !allValid.has(c));
     if (invalid.length > 0) {
       return `Invalid columns: ${invalid.join(', ')}`;
@@ -1407,16 +1935,32 @@ function getChangedStatus(value: boolean): RuleStatus {
   return value ? RuleStatus.ChangedValid : RuleStatus.Unchanged;
 }
 
-function getAclFormulaProperties(part?: RulePart): FormulaProperties {
+function getAclFormulaProperties(part?: RulePart): PredicateFormulaProperties {
   const aclFormulaParsed = part?.origRecord?.aclFormulaParsed;
-  return aclFormulaParsed ? getFormulaProperties(JSON.parse(String(aclFormulaParsed))) : {};
+  return aclFormulaParsed ? getPredicateFormulaProperties(JSON.parse(String(aclFormulaParsed))) : {};
+}
+
+// Return a rule set if it applies to one of the specified columns.
+function filterRuleSet(colIds: string[], ruleSet?: RuleSet): RuleSet|undefined {
+  if (!ruleSet) { return undefined; }
+  if (ruleSet.colIds === '*') { return ruleSet; }
+  for (const colId of ruleSet.colIds) {
+    if (colIds.includes(colId)) { return ruleSet; }
+  }
+  return undefined;
+}
+
+// Filter an array of rule sets for just those that apply to one of the specified
+// columns.
+function filterRuleSets(colIds: string[], ruleSets: RuleSet[]): RuleSet[] {
+  return ruleSets.map(ruleSet => filterRuleSet(colIds, ruleSet)).filter(rs => rs) as RuleSet[];
 }
 
 const cssOuter = styled('div', `
   flex: auto;
   height: 100%;
   width: 100%;
-  max-width: 800px;
+  max-width: 1500px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -1433,6 +1977,10 @@ const cssDropdownIcon = styled(icon, `
   margin: -2px -2px 0 4px;
 `);
 
+const cssRemoveIcon = styled(icon, `
+  margin: -2px -2px 0 4px;
+`);
+
 const cssSection = styled('div', `
   margin: 16px 16px 24px 16px;
 `);
@@ -1442,45 +1990,57 @@ const cssSectionHeading = styled('div', `
   align-items: center;
   margin-bottom: 8px;
   font-weight: bold;
-  color: ${colors.slate};
+  color: ${theme.lightText};
 `);
 
 const cssTableName = styled('span', `
-  color: ${colors.dark};
+  color: ${theme.text};
 `);
 
 const cssInput = styled(textInput, `
+  color: ${theme.inputFg};
+  background-color: ${theme.inputBg};
   width: 100%;
   border: 1px solid transparent;
   cursor: pointer;
 
   &:hover {
-    border: 1px solid ${colors.darkGrey};
+    border: 1px solid ${theme.inputBorder};
   }
   &:focus {
-    box-shadow: inset 0 0 0 1px ${colors.cursor};
-    border-color: ${colors.cursor};
+    box-shadow: inset 0 0 0 1px ${theme.controlFg};
+    border-color: ${theme.controlFg};
     cursor: unset;
   }
   &[disabled] {
-    color: ${colors.dark};
-    background-color: ${colors.mediumGreyOpaque};
+    color: ${theme.inputDisabledFg};
+    background-color: ${theme.inputDisabledBg};
     box-shadow: unset;
     border-color: transparent;
   }
+  &::placeholder {
+    color: ${theme.inputPlaceholderFg};
+  }
+`);
+
+const cssError = styled('div', `
+  color: ${theme.errorText};
+  margin-left: 56px;
+  margin-bottom: 8px;
+  margin-top: 4px;
 `);
 
 const cssConditionError = styled('div', `
+  color: ${theme.errorText};
   margin-top: 4px;
   width: 100%;
-  color: ${colors.error};
 `);
 
 /**
  * Fairly general table styles.
  */
 const cssTableRounded = styled('div', `
-  border: 1px solid ${colors.slate};
+  border: 1px solid ${theme.accessRulesTableBorder};
   border-radius: 8px;
   overflow: hidden;
 `);
@@ -1488,7 +2048,7 @@ const cssTableRounded = styled('div', `
 // Row with a border
 const cssTableRow = styled('div', `
   display: flex;
-  border-bottom: 1px solid ${colors.slate};
+  border-bottom: 1px solid ${theme.accessRulesTableBorder};
   &:last-child {
     border-bottom: none;
   }
@@ -1496,8 +2056,8 @@ const cssTableRow = styled('div', `
 
 // Darker table header
 const cssTableHeaderRow = styled(cssTableRow, `
-  background-color: ${colors.mediumGrey};
-  color: ${colors.dark};
+  background-color: ${theme.accessRulesTableHeaderBg};
+  color: ${theme.accessRulesTableHeaderFg};
 `);
 
 // Cell for table column header.
@@ -1514,7 +2074,7 @@ const cssCell = styled('div', `
   overflow: hidden;
 
   &-rborder {
-    border-right: 1px solid ${colors.slate};
+    border-right: 1px solid ${theme.accessRulesTableBorder};
   }
   &-center {
     text-align: center;
@@ -1527,6 +2087,7 @@ const cssCell = styled('div', `
 
 // Variations on columns of different widths.
 const cssCellIcon = styled(cssCell, `flex: none; width: 24px;`);
+const cssCellIconWithMargins = styled(cssCellIcon, `margin: 0px 8px;`);
 const cssCell1 = styled(cssCell, `flex: 1;`);
 const cssCell2 = styled(cssCell, `flex: 2;`);
 const cssCell4 = styled(cssCell, `flex: 4;`);
@@ -1548,10 +2109,16 @@ const cssRuleBody = styled('div', `
 `);
 
 const cssRuleDescription = styled('div', `
+  color: ${theme.text};
   display: flex;
-  align-items: center;
+  align-items: top;
   margin: 16px 0 8px 0;
-  gap: 8px;
+  gap: 12px;
+  white-space: pre-line;  /* preserve line breaks in long descriptions */
+`);
+
+const cssCheckbox = styled(squareCheckbox, `
+  flex: none;
 `);
 
 const cssCellContent = styled('div', `
@@ -1565,6 +2132,36 @@ const cssCenterContent = styled('div', `
 `);
 
 const cssDefaultLabel = styled('div', `
-  color: ${colors.slate};
+  color: ${theme.accessRulesTableBodyFg};
   font-weight: bold;
+`);
+
+const cssRuleProblems = styled('div', `
+  flex: auto;
+  height: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 8px;
+`);
+
+const cssRulePartAndMemo = styled('div', `
+  display: flex;
+  flex-direction: column;
+  row-gap: 4px;
+`);
+
+const cssMemoColumnGroup = styled(cssColumnGroup, `
+  margin-bottom: 8px;
+`);
+
+const cssMemoIcon = styled(icon, `
+  --icon-color: ${theme.accentIcon};
+  margin-left: 8px;
+  margin-right: 8px;
+`);
+
+const cssSeedRule = styled('div', `
+  margin-bottom: 16px;
 `);

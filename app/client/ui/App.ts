@@ -14,6 +14,7 @@ import {setUpErrorHandling} from 'app/client/models/errors';
 import {createAppUI} from 'app/client/ui/AppUI';
 import {addViewportTag} from 'app/client/ui/viewport';
 import {attachCssRootVars} from 'app/client/ui2018/cssVars';
+import {attachTheme} from 'app/client/ui2018/theme';
 import {BaseAPI} from 'app/common/BaseAPI';
 import {CommDocError} from 'app/common/CommTypes';
 import {DisposableWithEvents} from 'app/common/DisposableWithEvents';
@@ -21,6 +22,9 @@ import {fetchFromHome} from 'app/common/urlUtils';
 import {ISupportedFeatures} from 'app/common/UserConfig';
 import {dom} from 'grainjs';
 import * as ko from 'knockout';
+import {makeT} from 'app/client/lib/localization';
+
+const t = makeT('App');
 
 // tslint:disable:no-console
 
@@ -81,7 +85,7 @@ export class App extends DisposableWithEvents {
 
     const isHelpPaneVisible = ko.observable(false);
 
-    G.document.querySelector('#grist-logo-wrapper').remove();
+    G.document.querySelector('#grist-logo-wrapper')?.remove();
 
     // Help pop-up pane
     const helpDiv = document.body.appendChild(
@@ -90,20 +94,20 @@ export class App extends DisposableWithEvents {
         dom('table.g-help-table',
           dom('thead',
             dom('tr',
-              dom('th', 'Key'),
-              dom('th', 'Description')
+              dom('th', t("Key")),
+              dom('th', t("Description"))
             )
           ),
-          dom.forEach(commandList.groups, (group: any) => {
-            const cmds = group.commands.filter((cmd: any) => Boolean(cmd.desc && cmd.keys.length));
+          dom.forEach(commandList.groups, (group) => {
+            const cmds = group.commands.filter((cmd) => Boolean(cmd.desc && cmd.keys.length && !cmd.deprecated));
             return cmds.length > 0 ?
               dom('tbody',
                 dom('tr',
-                  dom('td', {colspan: 2}, group.group)
+                  dom('td', {colspan: '2'}, group.group)
                 ),
-                dom.forEach(cmds, (cmd: any) =>
+                dom.forEach(cmds, (cmd) =>
                   dom('tr',
-                    dom('td', commands.allCommands[cmd.name].getKeysDom()),
+                    dom('td', commands.allCommands[cmd.name]!.getKeysDom()),
                     dom('td', cmd.desc)
                   )
                 )
@@ -169,10 +173,9 @@ export class App extends DisposableWithEvents {
     G.window.addEventListener('beforeunload', (ev: BeforeUnloadEvent) => {
       if (unsavedChanges.haveUnsavedChanges()) {
         // Following https://developer.mozilla.org/en-US/docs/Web/API/Window/beforeunload_event
-        const msg = 'You have some unsaved changes';
-        ev.returnValue = msg;
+        ev.returnValue = true;
         ev.preventDefault();
-        return msg;
+        return true;
       }
       this.dispose();
     });
@@ -181,6 +184,7 @@ export class App extends DisposableWithEvents {
 
     // Add the cssRootVars class to enable the variables in cssVars.
     attachCssRootVars(this.topAppModel.productFlavor);
+    attachTheme();
     addViewportTag();
     this.autoDispose(createAppUI(this.topAppModel, this));
   }
@@ -215,6 +219,20 @@ export class App extends DisposableWithEvents {
     this._mostRecentDocPageModel = pageModel;
   }
 
+  /**
+   * This method is not called anywhere, it is here just to introduce
+   * a special translation key. The purpose of this key is to let translators
+   * control whether a translation is ready to be offered to the user.
+   *
+   * If the key has not been translated for a language, and the language
+   * is not the default language, then the language should not be offered
+   * or used (unless some flag is set). TODO: implement this once key
+   * is available in weblate and good translations have been updated.
+   */
+  public checkSpecialTranslationKey() {
+    return t('Translators: please translate this only when your language is ready to be offered to users');
+  }
+
   // Get the user profile for testing purposes
   public async testGetProfile(): Promise<any> {
     const resp = await fetchFromHome('/api/profile/user', {credentials: 'include'});
@@ -231,7 +249,7 @@ export class App extends DisposableWithEvents {
     if (message.match(/MemoryError|unmarshallable object/)) {
       if (err.message.length > 30) {
         // TLDR
-        err.message = 'Memory Error';
+        err.message = t("Memory Error");
       }
       this._mostRecentDocPageModel?.offerRecovery(err);
     }

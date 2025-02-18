@@ -1,4 +1,6 @@
+# pylint:disable=too-many-lines
 import json
+import logging
 import re
 from collections import defaultdict
 
@@ -10,10 +12,9 @@ import identifiers
 import schema
 import summary
 import table_data_set
-import logger
 from column import is_visible_column
 
-log = logger.Logger(__name__, logger.INFO)
+log = logging.getLogger(__name__)
 
 # PHILOSOPHY OF MIGRATIONS.
 #
@@ -28,6 +29,11 @@ log = logger.Logger(__name__, logger.INFO)
 # This should make it at least barely possible to share documents by people who are not all on the
 # same Grist version (even so, it will require more work). It should also make it somewhat safe to
 # upgrade and then open the document with a previous version.
+#
+# After each migration you probably should run these commands:
+# ./test/upgradeDocument public_samples/*.grist
+# UPDATE_REGRESSION_DATA=1 GREP_TESTS=DocRegressionTests ./test/testrun.sh server
+# ./test/upgradeDocument core/test/fixtures/docs/Hello.grist
 
 all_migrations = {}
 
@@ -383,8 +389,8 @@ def migration7(tdset):
     new_name = summary.encode_summary_table_name(source_table_name, groupby_col_ids)
     new_name = identifiers.pick_table_ident(new_name, avoid=table_name_set)
     table_name_set.add(new_name)
-    log.warn("Upgrading summary table %s for %s(%s) to %s" % (
-      t.tableId, source_table_name, groupby_colrefs, new_name))
+    log.warning("Upgrading summary table %s for %s(%s) to %s",
+      t.tableId, source_table_name, groupby_colrefs, new_name)
 
     # Remove the "lookupOrAddDerived" column from the source table (which is named using the
     # summary table name for its colId).
@@ -413,7 +419,7 @@ def migration7(tdset):
         groupby_cols.add(sum_col)
         source_cols.append((sum_col, src_col.id))
       else:
-        log.warn("Upgrading summary table %s: couldn't find column %s" % (t.tableId, col_ref))
+        log.warning("Upgrading summary table %s: couldn't find column %s", t.tableId, col_ref)
 
     # Finally, we have to remove all non-formula columns that are not groupby-columns (e.g.
     # 'manualSort'), because the new approach assumes ALL non-formula columns are for groupby.
@@ -1045,8 +1051,8 @@ def migration31(tdset):
       continue
     new_name = identifiers.pick_table_ident(new_name, avoid=table_name_set)
     table_name_set.add(new_name)
-    log.warn("Upgrading summary table %s for %s(%s) to %s" % (
-      t.tableId, source_table.tableId, groupby_col_ids, new_name))
+    log.warning("Upgrading summary table %s for %s(%s) to %s",
+      t.tableId, source_table.tableId, groupby_col_ids, new_name)
 
     # Schedule a rename of the summary table.
     table_renames.append((t, new_name))
@@ -1081,3 +1087,241 @@ def migration31(tdset):
         actions.UpdateRecord('_grist_ACLResources', resource.id, {'tableId': new_name})
       )
   return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=32)
+def migration32(tdset):
+  return tdset.apply_doc_actions([
+    add_column('_grist_Views_section', 'rules', 'RefList:_grist_Tables_column'),
+  ])
+
+@migration(schema_version=33)
+def migration33(tdset):
+  """
+  Add _grist_Cells table
+  """
+  doc_actions = [
+    actions.AddTable('_grist_Cells', [
+      schema.make_column("tableRef",       "Ref:_grist_Tables"),
+      schema.make_column("colRef",         "Ref:_grist_Tables_column"),
+      schema.make_column("rowId",          "Int"),
+      schema.make_column("root",           "Bool"),
+      schema.make_column("parentId",       "Ref:_grist_Cells"),
+      schema.make_column("type",           "Int"),
+      schema.make_column("content",        "Text"),
+      schema.make_column("userRef",        "Text"),
+    ]),
+  ]
+
+  return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=34)
+def migration34(tdset):
+  """
+  Add pinned column to _grist_Filters and populate based on existing sections.
+
+  When populating, pinned will be set to true for filters that either belong to
+  a section where the filter bar is toggled or a raw view section.
+
+  From this version on, _grist_Views_section.options.filterBar is deprecated.
+  """
+  doc_actions = [add_column('_grist_Filters', 'pinned', 'Bool')]
+
+  tables = list(actions.transpose_bulk_action(tdset.all_tables['_grist_Tables']))
+  sections = list(actions.transpose_bulk_action(tdset.all_tables['_grist_Views_section']))
+  filters = list(actions.transpose_bulk_action(tdset.all_tables['_grist_Filters']))
+  raw_section_ids = set(t.rawViewSectionRef for t in tables)
+  filter_bar_by_section_id = {
+    # Pre-migration, raw sections always showed the filter bar in the UI. Since we want
+    # existing raw section filters to continue appearing in the filter bar, we'll pretend
+    # here that raw sections have a filterBar value of True. Note that after this migration
+    # it will be possible for raw sections to have unpinned filters.
+    s.id: bool(s.id in raw_section_ids or safe_parse(s.options).get('filterBar', False))
+    for s in sections
+  }
+
+  # List of (filter_rec, pinned) pairs.
+  filter_updates = []
+  for filter_rec in filters:
+    filter_updates.append((
+      filter_rec,
+      filter_bar_by_section_id.get(filter_rec.viewSectionRef, False)
+    ))
+
+  if filter_updates:
+    doc_actions.append(actions.BulkUpdateRecord(
+      '_grist_Filters',
+      [filter_rec.id for filter_rec, _ in filter_updates],
+      {'pinned': [pinned for _, pinned in filter_updates]},
+    ))
+
+  return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=35)
+def migration35(tdset):
+  """
+  Add memo column to _grist_ACLRules and populate with comments stored in
+  _grist_ACLRules.aclFormula.
+
+  From this version on, comments in _grist_ACLRules.aclFormula will no longer
+  be used as memos.
+  """
+  doc_actions = [add_column('_grist_ACLRules', 'memo', 'Text')]
+
+  acl_rules = list(actions.transpose_bulk_action(tdset.all_tables['_grist_ACLRules']))
+
+  # List of (acl_rule_rec, memo) pairs.
+  acl_rule_updates = []
+  for acl_rule_rec in acl_rules:
+    acl_formula = safe_parse(acl_rule_rec.aclFormulaParsed)
+    if not acl_formula or acl_formula[0] != 'Comment':
+      continue
+
+    acl_rule_updates.append((
+      acl_rule_rec,
+      acl_formula[2]
+    ))
+
+  if acl_rule_updates:
+    doc_actions.append(actions.BulkUpdateRecord(
+      '_grist_ACLRules',
+      [acl_rule_rec.id for acl_rule_rec, _ in acl_rule_updates],
+      {'memo': [memo for _, memo in acl_rule_updates]},
+    ))
+
+  return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=36)
+def migration36(tdset):
+  """
+  Add description to column
+  """
+  return tdset.apply_doc_actions([add_column('_grist_Tables_column', 'description', 'Text')])
+
+@migration(schema_version=37)
+def migration37(tdset):
+  """
+  Add fileExt column to _grist_Attachments.
+  """
+  return tdset.apply_doc_actions([add_column('_grist_Attachments', 'fileExt', 'Text')])
+
+@migration(schema_version=38)
+def migration38(tdset):
+  """
+  Through a mishap, this migration ended up conflicted across two version of Grist.
+  In one version, it added webhook related columns. In another it added a description
+  to widgets. Sorry if this impacted you. Migration 39 does the best we can to
+  smooth over the divergence, and this migration now does nothing (though in the
+  past it did one of two possible things).
+  """
+  return tdset.apply_doc_actions([])
+
+@migration(schema_version=39)
+def migration39(tdset):
+  """
+  Adds memo, label, and enabled flag to triggers (for webhooks).
+  Adds a description to widgets.
+  """
+  doc_actions = []
+  if 'memo' not in tdset.all_tables['_grist_Triggers'].columns:
+    doc_actions += [add_column('_grist_Triggers', 'memo', 'Text'),
+                    add_column('_grist_Triggers', 'label', 'Text'),
+                    add_column('_grist_Triggers', 'enabled', 'Bool')]
+    triggers = list(actions.transpose_bulk_action(tdset.all_tables['_grist_Triggers']))
+    doc_actions.append(actions.BulkUpdateRecord(
+      '_grist_Triggers',
+      [t.id for t in triggers],
+      {'enabled': [True for t in triggers]}
+    ))
+  if 'description' not in tdset.all_tables['_grist_Views_section'].columns:
+    doc_actions.append(add_column('_grist_Views_section', 'description', 'Text'))
+  return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=40)
+def migration40(tdset):
+  """
+  Adds a recordCardViewSectionRef column to _grist_Tables, populating it
+  for each non-summary table in _grist_Tables that has a rawViewSectionRef.
+  """
+  doc_actions = [
+    add_column(
+      '_grist_Tables',
+      'recordCardViewSectionRef',
+      'Ref:_grist_Views_section'
+    ),
+  ]
+
+  tables = list(actions.transpose_bulk_action(tdset.all_tables["_grist_Tables"]))
+  columns = list(actions.transpose_bulk_action(tdset.all_tables["_grist_Tables_column"]))
+
+  new_view_section_id = next_id(tdset, "_grist_Views_section")
+
+  for table in sorted(tables, key=lambda t: t.tableId):
+    if not table.rawViewSectionRef or table.summarySourceTable:
+      continue
+
+    table_columns = [
+      col for col in columns
+      if table.id == col.parentId and is_visible_column(col.colId)
+    ]
+    table_columns.sort(key=lambda c: c.parentPos)
+    fields = {
+      "parentId": [new_view_section_id] * len(table_columns),
+      "colRef": [col.id for col in table_columns],
+      "parentPos": [col.parentPos for col in table_columns],
+    }
+    field_ids = [None] * len(table_columns)
+
+    doc_actions += [
+      actions.AddRecord("_grist_Views_section", new_view_section_id, {
+        "tableRef": table.id,
+        "parentId": 0,
+        "parentKey": "single",
+        "title": "",
+        "defaultWidth": 100,
+        "borderWidth": 1,
+      }),
+      actions.UpdateRecord("_grist_Tables", table.id, {
+        "recordCardViewSectionRef": new_view_section_id,
+      }),
+      actions.BulkAddRecord("_grist_Views_section_field", field_ids, fields),
+    ]
+
+    new_view_section_id += 1
+
+  return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=41)
+def migration41(tdset):
+  """
+  Add a table for tracking special shares.
+  """
+  doc_actions = [
+    actions.AddTable("_grist_Shares", [
+      schema.make_column("linkId", "Text"),
+      schema.make_column("options", "Text"),
+      schema.make_column("label", "Text"),
+      schema.make_column("description", "Text"),
+    ]),
+    add_column('_grist_Pages', 'shareRef', 'Ref:_grist_Shares'),
+    add_column('_grist_Views_section', 'shareOptions', 'Text'),
+  ]
+
+  return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=42)
+def migration42(tdset):
+  """
+  Adds column to register which table columns are triggered in webhooks.
+  """
+  return tdset.apply_doc_actions([
+    add_column('_grist_Triggers', 'watchedColRefList', 'RefList:_grist_Tables_column'),
+    add_column('_grist_Triggers', 'options', 'Text'),
+  ])
+
+@migration(schema_version=43)
+def migration43(tdset):
+  """
+  Adds reverseCol for two-way references.
+  """
+  return tdset.apply_doc_actions([
+    add_column('_grist_Tables_column', 'reverseCol', 'Ref:_grist_Tables_column')])

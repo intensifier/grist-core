@@ -7,7 +7,7 @@
 import {DocComm} from 'app/client/components/DocComm';
 import {MetaTableData, TableData} from 'app/client/models/TableData';
 import {ApplyUAOptions, ApplyUAResult} from 'app/common/ActiveDocAPI';
-import {CellValue, TableDataAction, UserAction} from 'app/common/DocActions';
+import {CellValue, getTableId, isDataAction, TableDataAction, UserAction} from 'app/common/DocActions';
 import {DocData as BaseDocData} from 'app/common/DocData';
 import {SchemaTypes} from 'app/common/schema';
 import {ColTypeMap} from 'app/common/TableData';
@@ -32,6 +32,8 @@ export class DocData extends BaseDocData {
   private _lastActionNum: number|null = null;   // ActionNum of the last action in the current bundle, or null.
   private _bundleSender: BundleSender;
 
+  private _virtualTablesFunc: Map<string, Constructor<TableData>>;
+
   /**
    * Constructor for DocData.
    * @param {Object} docComm: A map of server methods available on this document.
@@ -41,10 +43,12 @@ export class DocData extends BaseDocData {
   constructor(public readonly docComm: DocComm, metaTableData: {[tableId: string]: TableDataAction}) {
     super((tableId) => docComm.fetchTable(tableId), metaTableData);
     this._bundleSender = new BundleSender(this.docComm);
+    this._virtualTablesFunc = new Map();
   }
 
   public createTableData(tableId: string, tableData: TableDataAction|null, colTypes: ColTypeMap): TableData {
-    return new TableData(this, tableId, tableData, colTypes);
+    const Cons = this._virtualTablesFunc?.get(tableId) || TableData;
+    return new Cons(this, tableId, tableData, colTypes);
   }
 
   // Version of inherited getTable() which returns the enhance TableData type.
@@ -182,8 +186,33 @@ export class DocData extends BaseDocData {
     return this.sendActions([action], optDesc).then((retValues) => retValues[0]);
   }
 
+  public registerVirtualTableFactory(tableId: string, Cons: typeof TableData) {
+    this._virtualTablesFunc.set(tableId, Cons);
+  }
+
+  public unregisterVirtualTableFactory(tableId: string) {
+    this._virtualTablesFunc.delete(tableId);
+  }
+
   // See documentation of sendActions().
   private async _sendActionsImpl(actions: UserAction[], optDesc?: string): Promise<any[]> {
+    const tableName = String(actions[0]?.[1]);
+    if (this._virtualTablesFunc?.has(tableName)) {
+      // Actions applying to virtual tables are handled directly by their TableData instance.
+      for (const action of actions) {
+        if (!isDataAction(action)) {
+          throw new Error('virtual table received an action it cannot handle');
+        }
+        if (getTableId(action) !== tableName) {
+          throw new Error('virtual table actions mixed with other actions');
+        }
+      }
+      const tableActions = actions.map(a => [a[0], ...a.slice(2)]);
+      // The type on sendTableActions seems kind of misleading, and
+      // only working because UserAction is defined weakly. The first
+      // thing the method does is splice back in the table names...
+      return this.getTable(tableName)!.sendTableActions(tableActions, optDesc);
+    }
     const eventData = {actions};
     this.sendActionsEmitter.emit(eventData);
     const options = { desc: optDesc };
@@ -225,6 +254,7 @@ class BundleSender {
     return this._getSendPromise()
     .then(result => ({
       actionNum: result.actionNum,
+      actionHash: result.actionHash,
       retValues: result.retValues.slice(start, end),
       isModification: result.isModification
     }));
@@ -282,3 +312,5 @@ export interface BundlingInfo<T = unknown> {
   // Promise for when the bundle has been finalized.
   completionPromise: Promise<void>;
 }
+
+type Constructor<T> = new (...args: any[]) => T;

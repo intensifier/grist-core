@@ -2,8 +2,20 @@
 /_build/
 /static/*.bundle.js
 /static/*.bundle.js.map
+/static/grist-plugin-api*
 /static/bundle.css
 /static/browser-check.js
+/static/*.bundle.js.*.txt
+/grist-sessions.db
+/landing.db
+/docs/
+/sandbox_venv*
+/.vscode/
+
+# Files created by grist-desktop setup
+/cpython.tar.gz
+/python
+/static_ext
 
 # Build helper files.
 /.build*
@@ -47,6 +59,7 @@ build/Release
 # Dependency directories
 /node_modules/
 jspm_packages/
+/docs
 
 # Optional npm cache directory
 .npm
@@ -65,3 +78,22 @@ jspm_packages/
 
 # dotenv environment variables file
 .env
+
+# Test
+timings.txt
+xunit.xml
+.clipboard.lock
+
+**/_build
+
+# ext directory can be overwritten
+/ext
+/ext/**
+
+# Docker compose examples - persistent values and secrets
+/docker-compose-examples/*/persist
+/docker-compose-examples/*/secrets
+/docker-compose-examples/grist-traefik-oidc-auth/.env
+
+# Sample grist documents
+/samples/

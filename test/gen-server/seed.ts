@@ -23,7 +23,7 @@
  */
 
 import {addPath} from 'app-module-path';
-import {IHookCallbackContext} from 'mocha';
+import {Context} from 'mocha';
 import * as path from 'path';
 import {Connection, getConnectionManager, Repository} from 'typeorm';
 
@@ -37,22 +37,48 @@ import {Document} from "app/gen-server/entity/Document";
 import {Group} from "app/gen-server/entity/Group";
 import {Login} from "app/gen-server/entity/Login";
 import {Organization} from "app/gen-server/entity/Organization";
-import {Product, PRODUCTS, synchronizeProducts, testDailyApiLimitFeatures} from "app/gen-server/entity/Product";
+import {Product, PRODUCTS, synchronizeProducts, teamFeatures, teamFreeFeatures} from "app/gen-server/entity/Product";
 import {User} from "app/gen-server/entity/User";
 import {Workspace} from "app/gen-server/entity/Workspace";
-import {EXAMPLE_WORKSPACE_NAME} from 'app/gen-server/lib/HomeDBManager';
+import {EXAMPLE_WORKSPACE_NAME} from 'app/gen-server/lib/homedb/HomeDBManager';
 import {Permissions} from 'app/gen-server/lib/Permissions';
-import {getOrCreateConnection, runMigrations, undoLastMigration, updateDb} from 'app/server/lib/dbUtils';
+import {
+  getOrCreateConnection, runMigrations, undoLastMigration, updateDb
+} from 'app/server/lib/dbUtils';
 import {FlexServer} from 'app/server/lib/FlexServer';
 import * as fse from 'fs-extra';
 
 const ACCESS_GROUPS = ['owners', 'editors', 'viewers', 'guests', 'members'];
 
+
+export const testDailyApiLimitFeatures = {
+  ...teamFreeFeatures,
+  baseMaxApiUnitsPerDocumentPerDay: 3,
+};
+
+export const testMaxNewUserInvitesFeatures = {
+  ...teamFeatures,
+  maxNewUserInvitesPerOrg: 3,
+  maxSharesPerDoc: 5,
+};
+
+export const testAuditLogsFeatures = {
+  ...teamFeatures,
+};
+
 const testProducts = [
   ...PRODUCTS,
-    {
+  {
     name: 'testDailyApiLimit',
     features: testDailyApiLimitFeatures,
+  },
+  {
+    name: 'testMaxNewUserInvites',
+    features: testMaxNewUserInvitesFeatures,
+  },
+  {
+    name: 'testAuditLogs',
+    features: testAuditLogsFeatures,
   },
 ];
 
@@ -220,12 +246,38 @@ export const exampleOrgs = [
       }
     ]
   },
+  {
+    name: 'TestMaxNewUserInvites',
+    domain: 'textmaxnewuserinvites',
+    product: 'testMaxNewUserInvites',
+    workspaces: [
+      {
+        name: 'TestMaxNewUserInvitesWs',
+        docs: [
+          "TestMaxNewUserInvitesDoc1",
+          "TestMaxNewUserInvitesDoc2",
+        ],
+      }
+    ]
+  },
+  {
+    name: 'TestAuditLogs',
+    domain: 'testauditlogs',
+    product: 'testAuditLogs',
+    workspaces: [
+      {
+        name: 'TestAuditLogsWs',
+        docs: [],
+      }
+    ]
+  },
 ];
-
 
 const exampleUsers: {[user: string]: {[org: string]: string}} = {
   Chimpy: {
     TestDailyApiLimit: 'owners',
+    TestMaxNewUserInvites: 'owners',
+    TestAuditLogs: 'owners',
     FreeTeam: 'owners',
     Chimpyland: 'owners',
     NASA: 'owners',
@@ -428,7 +480,11 @@ class Seed {
       const ba = new BillingAccount();
       ba.individual = false;
       const productName = org.product || 'Free';
-      ba.product = (await Product.findOne({name: productName}))!;
+      const product = await Product.findOne({where: {name: productName}});
+      if (!product) {
+        throw new Error(`Product not found: ${productName}`);
+      }
+      ba.product = product;
       o.billingAccount = ba;
       if (org.domain) { o.domain = org.domain; }
       if (org.host) { o.host = org.host; }
@@ -449,7 +505,7 @@ class Seed {
           const d = new Document();
           d.name = doc;
           d.workspace = w;
-          d.id = `sample_${docId}`;
+          d.id = `sampledocid_${docId}`;
           docId++;
           await d.save();
           const dgrps = await this.createGroups(w);
@@ -461,7 +517,7 @@ class Seed {
   }
 
   public async run() {
-    if (await this.userRepository.findOne()) {
+    if (await this.userRepository.findOne({where: {}})) {
       // we already have a user - skip seeding database
       return;
     }
@@ -472,7 +528,7 @@ class Seed {
 
   // Creates benchmark data with 10 orgs, 50 workspaces per org and 20 docs per workspace.
   public async runBenchmark() {
-    if (await this.userRepository.findOne()) {
+    if (await this.userRepository.findOne({where: {}})) {
       // we already have a user - skip seeding database
       return;
     }
@@ -501,7 +557,7 @@ class Seed {
       login.displayEmail = login.email = name.toLowerCase() + "@getgrist.com";
       login.user = user;
       await login.save();
-      const personal = await Organization.findOne({name: name + "land"});
+      const personal = await Organization.findOne({where: {name: name + "land"}});
       if (personal) {
         personal.owner = user;
         await personal.save();
@@ -521,12 +577,12 @@ export async function removeConnection() {
       throw new Error("unexpected number of connections");
     }
     await getConnectionManager().connections[0].close();
-    // There is no official way to delete connections that I've found.
-    (getConnectionManager().connections as any) = [];
+    // There is still no official way to delete connections that I've found.
+    (getConnectionManager() as any).connectionMap = new Map();
   }
 }
 
-export async function createInitialDb(connection?: Connection, migrateAndSeedData: boolean = true) {
+export async function createInitialDb(connection?: Connection, migrateAndSeedData: boolean|'migrateOnly' = true) {
   // In jenkins tests, we may want to reset the database to a clean
   // state.  If so, TEST_CLEAN_DATABASE will have been set.  How to
   // clean the database depends on what kind of database it is.  With
@@ -566,7 +622,9 @@ export async function createInitialDb(connection?: Connection, migrateAndSeedDat
   // Finally - actually initialize the database.
   if (migrateAndSeedData) {
     await updateDb(connection);
-    await addSeedData(connection);
+    if (migrateAndSeedData !== 'migrateOnly') {
+      await addSeedData(connection);
+    }
   }
 }
 
@@ -593,9 +651,13 @@ export async function createServer(port: number, initDb = createInitialDb): Prom
   flexServer.addJsonSupport();
   await flexServer.start();
   await flexServer.initHomeDBManager();
+  flexServer.addDocWorkerMap();
+  await flexServer.addLoginMiddleware();
+  flexServer.addHosts();
   flexServer.addAccessMiddleware();
   flexServer.addApiMiddleware();
   flexServer.addHomeApi();
+  flexServer.addScimApi();
   flexServer.addApiErrorHandlers();
   await initDb(flexServer.getHomeDBManager().connection);
   flexServer.summary();
@@ -640,7 +702,7 @@ function _generateData(numOrgs: number, numWorkspaces: number, numDocs: number) 
  * To set up TYPEORM_* environment variables for testing, call this in a before() call of a test
  * suite, using setUpDB(this);
  */
-export function setUpDB(context?: IHookCallbackContext) {
+export function setUpDB(context?: Context) {
   if (!process.env.TYPEORM_DATABASE) {
     process.env.TYPEORM_DATABASE = ":memory:";
   } else {

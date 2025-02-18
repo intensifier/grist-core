@@ -1,20 +1,27 @@
-var _             = require('underscore');
-var ko            = require('knockout');
+const _             = require('underscore');
+const ko            = require('knockout');
 
-var dom           = require('app/client/lib/dom');
-var kd            = require('app/client/lib/koDom');
-var koDomScrolly  = require('app/client/lib/koDomScrolly');
+const dom           = require('app/client/lib/dom');
+const kd            = require('app/client/lib/koDom');
+const koDomScrolly  = require('app/client/lib/koDomScrolly');
 const {renderAllRows} = require('app/client/components/Printing');
+const {isNarrowScreen} = require('app/client/ui2018/cssVars');
+const {icon} = require('app/client/ui2018/icons');
 
 require('app/client/lib/koUtil'); // Needed for subscribeInit.
 
-var Base          = require('./Base');
-var BaseView      = require('./BaseView');
-var {CopySelection} = require('./CopySelection');
-var RecordLayout  = require('./RecordLayout');
-var commands      = require('./commands');
-const {RowContextMenu} = require('../ui/RowContextMenu');
+const Base          = require('./Base');
+const BaseView      = require('./BaseView');
+const selector      = require('./CellSelector');
+const {CopySelection} = require('./CopySelection');
+const RecordLayout  = require('./RecordLayout');
+const commands      = require('./commands');
+const tableUtil     = require('../lib/tableUtil');
+const {CardContextMenu} = require('../ui/CardContextMenu');
+const {FieldContextMenu} = require('../ui/FieldContextMenu');
 const {parsePasteForView} = require("./BaseView2");
+const {descriptionInfoTooltip} = require("../ui/tooltips");
+
 
 /**
  * DetailView component implements a list of record layouts.
@@ -22,15 +29,19 @@ const {parsePasteForView} = require("./BaseView2");
 function DetailView(gristDoc, viewSectionModel) {
   BaseView.call(this, gristDoc, viewSectionModel, { 'addNewRow': true });
 
+  this.cellSelector = selector.CellSelector.create(this, this);
+
   this.viewFields = gristDoc.docModel.viewFields;
   this._isSingle = (this.viewSection.parentKey.peek() === 'single');
+  this._isExternalSectionPopup = gristDoc.externalSectionId.get() === this.viewSection.id();
 
   //--------------------------------------------------
   // Create and attach the DOM for the view.
   this.recordLayout = this.autoDispose(RecordLayout.create({
     viewSection: this.viewSection,
     buildFieldDom: this.buildFieldDom.bind(this),
-    buildContextMenu : this.buildContextMenu.bind(this),
+    buildCardContextMenu : this.buildCardContextMenu.bind(this),
+    buildFieldContextMenu : this.buildFieldContextMenu.bind(this),
     resizeCallback: () => {
       if (!this._isSingle) {
         this.scrolly().updateSize();
@@ -74,6 +85,7 @@ function DetailView(gristDoc, viewSectionModel) {
 
   //--------------------------------------------------
   // Set up DOM event handling.
+  this._twoLastFieldIdsSelected = [null, null];
 
   // Clicking on a detail field selects that field.
   this.onEvent(this.viewPane, 'mousedown', '.g_record_detail_el', function(elem, event) {
@@ -81,6 +93,8 @@ function DetailView(gristDoc, viewSectionModel) {
     var rowModel = this.recordLayout.getContainingRow(elem, this.viewPane);
     var field = this.recordLayout.getContainingField(elem, this.viewPane);
     commands.allCommands.setCursor.run(rowModel, field);
+    this._twoLastFieldIdsSelected.unshift(field.id());
+    this._twoLastFieldIdsSelected.pop();
   });
 
   // Double-clicking on a field also starts editing the field.
@@ -88,11 +102,28 @@ function DetailView(gristDoc, viewSectionModel) {
     this.activateEditorAtCursor();
   });
 
+  // We authorize single click only on the value to avoid conflict with tooltip
+  this.onEvent(this.viewPane, 'click', '.g_record_detail_value', function(elem, event) {
+    // If the click was place in a link, we don't want to trigger the single click
+    if (event.target?.closest("a")) { return; }
+
+    const field = this.recordLayout.getContainingField(elem, this.viewPane);
+    if (
+      this._twoLastFieldIdsSelected[0] === this._twoLastFieldIdsSelected[1]
+      && !isNarrowScreen()
+      && this._canSingleClick(field)
+    ) {
+      this.activateEditorAtCursor();
+    }
+  });
+
   //--------------------------------------------------
   // Instantiate CommandGroups for the different modes.
   this.autoDispose(commands.createGroup(DetailView.generalCommands, this, this.viewSection.hasFocus));
-  this.newFieldCommandGroup = this.autoDispose(
-    commands.createGroup(DetailView.newFieldCommands, this, this.isNewFieldActive));
+  this.autoDispose(commands.createGroup(DetailView.fieldCommands, this, this.viewSection.hasFocus));
+  const hasSelection = this.autoDispose(ko.pureComputed(() =>
+    !this.cellSelector.isCurrentSelectType('') || this.copySelection()));
+  this.autoDispose(commands.createGroup(DetailView.selectionCommands, this, hasSelection));
 }
 Base.setBaseFor(DetailView);
 _.extend(DetailView.prototype, BaseView.prototype);
@@ -122,14 +153,6 @@ DetailView.generalCommands = {
   cursorDown: function() { this.cursor.fieldIndex(this.cursor.fieldIndex() + 1); },
   pageUp: function() { this.cursor.rowIndex(this.cursor.rowIndex() - 1); },
   pageDown: function() { this.cursor.rowIndex(this.cursor.rowIndex() + 1); },
-
-  deleteRecords: function() {
-    // Do not allow deleting the add record row.
-    if (!this._isAddRow()) {
-      this.deleteRow(this.cursor.rowIndex());
-    }
-  },
-
   copy: function() { return this.copy(this.getSelection()); },
   cut: function() { return this.cut(this.getSelection()); },
   paste: function(pasteObj, cutCallback) {
@@ -141,23 +164,38 @@ DetailView.generalCommands = {
       this.scrolly().scrollRowIntoView(this.cursor.rowIndex());
     }
     this.recordLayout.editLayout(this.cursor.rowIndex());
-  }
+  },
+};
+
+DetailView.fieldCommands = {
+  clearValues: function() { this._clearCardFields(); },
+  hideCardFields: function() { this._hideCardFields(); },
+};
+
+DetailView.selectionCommands = {
+  clearCopySelection: function() { this._clearCopySelection(); },
+  cancel: function() { this._clearSelection(); }
 };
 
 //----------------------------------------------------------------------
 
-// TODO: Factor code duplicated with GridView for deleteRow, deleteColumn,
-// insertDetailField out of the view modules
 
-DetailView.prototype.deleteRow = function(index) {
-  if (this.viewSection.disableAddRemoveRows()) {
-    return;
+DetailView.prototype.selectedRows = function() {
+  if (!this._isAddRow()) {
+    return [this.viewData.getRowId(this.cursor.rowIndex())];
   }
-  var action = ['RemoveRecord', this.viewData.getRowId(index)];
-  return this.tableModel.sendTableAction(action)
-  .bind(this).then(function() {
-    this.cursor.rowIndex(index);
-  });
+  return [];
+};
+
+DetailView.prototype.deleteRows = async function(rowIds) {
+ const index = this.cursor.rowIndex();
+  try {
+    await BaseView.prototype.deleteRows.call(this, rowIds);
+  } finally {
+    if (!this.isDisposed()) {
+      this.cursor.rowIndex(index);
+    }
+  }
 };
 
 /**
@@ -192,7 +230,7 @@ DetailView.prototype.paste = async function(data, cutCallback) {
       const addRowId = (action[0] === 'BulkAddRecord' ? results[0][0] : null);
       // Restore the cursor to the right rowId, even if it jumped.
       this.cursor.setCursorPos({rowId: cursorPos.rowId === 'new' ? addRowId : cursorPos.rowId});
-      this.copySelection(null);
+      commands.allCommands.clearCopySelection.run();
     });
 };
 
@@ -211,14 +249,14 @@ DetailView.prototype.getSelection = function() {
   );
 };
 
-DetailView.prototype.buildContextMenu = function(row, options) {
-  const defaults = {
-    disableInsert: Boolean(this.gristDoc.isReadonly.get() || this.viewSection.disableAddRemoveRows() || this.tableModel.tableMetaRow.onDemand()),
-    disableDelete: Boolean(this.gristDoc.isReadonly.get() || this.viewSection.disableAddRemoveRows() || row._isAddRow()),
-    isViewSorted: this.viewSection.activeSortSpec.peek().length > 0,
-    numRows: this.getSelection().rowIds.length,
-  };
-  return RowContextMenu(options ? Object.assign(defaults, options) : defaults);
+DetailView.prototype.buildCardContextMenu = function(row) {
+  const cardOptions = this._getCardContextMenuOptions(row);
+  return CardContextMenu(cardOptions);
+}
+
+DetailView.prototype.buildFieldContextMenu = function() {
+  const fieldOptions = this._getFieldContextMenuOptions();
+  return FieldContextMenu(fieldOptions);
 }
 
 /**
@@ -232,8 +270,11 @@ DetailView.prototype.buildFieldDom = function(field, row) {
   if (field.isNewField) {
     return dom('div.g_record_detail_el.flexitem',
       kd.cssClass(function() { return 'detail_theme_field_' + self.viewSection.themeDef(); }),
-      dom('div.g_record_detail_label', field.label),
-      dom('div.g_record_detail_value', field.value)
+      dom('div.g_record_detail_label_container',
+        dom('div.g_record_detail_label', kd.text(field.label)),
+        kd.scope(field.description, desc => desc ? descriptionInfoTooltip(desc, "colmun") : null)
+      ),
+      dom('div.g_record_detail_value'),
     );
   }
 
@@ -262,11 +303,16 @@ DetailView.prototype.buildFieldDom = function(field, row) {
     dom.autoDispose(isCellSelected),
     dom.autoDispose(isCellActive),
     kd.cssClass(function() { return 'detail_theme_field_' + self.viewSection.themeDef(); }),
-    dom('div.g_record_detail_label', kd.text(field.displayLabel)),
+    dom('div.g_record_detail_label_container',
+      dom('div.g_record_detail_label', kd.text(field.displayLabel)),
+      kd.scope(field.description, desc => desc ? descriptionInfoTooltip(desc, "column") : null)
+    ),
     dom('div.g_record_detail_value',
       kd.toggleClass('scissors', isCopyActive),
       kd.toggleClass('record-add', row._isAddRow),
       dom.autoDispose(isCopyActive),
+      // Optional icon. Currently only use to show formula icon.
+      dom('div.field-icon'),
       fieldBuilder.buildDomWithCursor(row, isCellActive, isCellSelected)
     )
   );
@@ -324,7 +370,13 @@ DetailView.prototype.buildTitleControls = function() {
   // the controls can be confusing in this case.
   // Note that the controls should still be visible with a filter link.
   const showControls = ko.computed(() => {
-    if (!this._isSingle || this.recordLayout.layoutEditor()) { return false; }
+    if (
+      !this._isSingle||
+      this.recordLayout.layoutEditor() ||
+      this._isExternalSectionPopup
+    ) {
+      return false;
+    }
     const linkingState = this.viewSection.linkingState();
     return !(linkingState && Boolean(linkingState.cursorPos));
   });
@@ -340,28 +392,29 @@ DetailView.prototype.buildTitleControls = function() {
         kd.text(() => this._isAddRow() ? 'Add record' :
           `${this.cursor.rowIndex() + 1} of ${this.getLastDataRowIndex() + 1}`)
       ),
-      dom('div.btn-group.btn-group-xs',
-        dom('div.btn.btn-default.detail-left',
-          dom('span.glyphicon.glyphicon-chevron-left'),
+      dom('div.detail-buttons',
+        dom('div.detail-button.detail-left',
+          icon('ArrowLeft'),
           dom.on('click', () => { this.cursor.rowIndex(this.cursor.rowIndex() - 1); }),
-          kd.toggleClass('disabled', () => this.cursor.rowIndex() === 0)
+          kd.toggleClass('disabled', () => this.cursor.rowIndex() === 0),
+          dom.testId('detailView_detail_left'),
         ),
-        dom('div.btn.btn-default.detail-right',
-          dom('span.glyphicon.glyphicon-chevron-right'),
+        dom('div.detail-button.detail-right',
+          icon('ArrowRight'),
           dom.on('click', () => { this.cursor.rowIndex(this.cursor.rowIndex() + 1); }),
-          kd.toggleClass('disabled', () => this.cursor.rowIndex() >= this.viewData.all().length - 1)
-        )
-      ),
-      dom('div.btn-group.btn-group-xs.detail-add-grp',
-        dom('div.btn.btn-default.detail-add-btn',
-          dom('span.glyphicon.glyphicon-plus'),
+          kd.toggleClass('disabled', () => this.cursor.rowIndex() >= this.viewData.all().length - 1),
+          dom.testId('detailView_detail_right'),
+        ),
+        dom('div.detail-button.detail-add-btn',
+          icon('Plus'),
           dom.on('click', () => {
             let addRowIndex = this.viewData.getRowIndex('new');
             this.cursor.rowIndex(addRowIndex);
           }),
-          kd.toggleClass('disabled', () => this.viewData.getRowId(this.cursor.rowIndex()) === 'new')
-        )
-      )
+          kd.toggleClass('disabled', () => this.viewData.getRowId(this.cursor.rowIndex()) === 'new'),
+          dom.testId('detailView_detail_add'),
+        ),
+      ),
     ))
   );
 };
@@ -392,6 +445,7 @@ DetailView.prototype.makeRecord = function(record) {
       return rowType && `diff-${rowType}` || '';
     }) : null,
     kd.toggleClass('active', () => (this.cursor.rowIndex() === record._index() && this.viewSection.hasFocus())),
+    kd.toggleClass('selected', () => (this.cursor.rowIndex() === record._index()  && !this.viewSection.hasFocus())),
     // 'detailview_record_single' or 'detailview_record_detail' doesn't need to be an observable,
     // since a change to parentKey would cause a separate call to makeRecord.
     kd.cssClass('detailview_record_' + this.viewSection.parentKey.peek())
@@ -426,6 +480,80 @@ DetailView.prototype.scrollToCursor = function(sync = true) {
 DetailView.prototype._duplicateRows = async function() {
   const addRowIds = await BaseView.prototype._duplicateRows.call(this);
   this.setCursorPos({rowId: addRowIds[0]})
+}
+
+DetailView.prototype._canSingleClick = function(field) {
+  // we can't single click if :
+  // - the field is a formula
+  // - the field is toggle (switch or checkbox)
+  if (
+    field.column().isRealFormula() ||
+    field.column().hasTriggerFormula() ||
+    (
+      field.column().pureType() === "Bool" &&
+      ["Switch", "CheckBox"].includes(field.visibleColFormatter().widgetOpts.widget)
+    )
+  ) {
+    return false;
+  }
+  return true;
+};
+
+DetailView.prototype._clearCardFields = function() {
+  const selection = this.getSelection();
+  const isFormula = Boolean(selection.fields[0]?.column.peek().isRealFormula.peek());
+  if (isFormula) {
+    this.activateEditorAtCursor({init: ''});
+  } else {
+    const clearAction = tableUtil.makeDeleteAction(this.getSelection());
+    if (clearAction) {
+      this.gristDoc.docData.sendAction(clearAction);
+    }
+  }
+};
+
+DetailView.prototype._hideCardFields = function() {
+  const selection = this.getSelection();
+  const actions = selection.fields.map(field => ['RemoveRecord', field.id()]);
+  return this.gristDoc.docModel.viewFields.sendTableActions(
+    actions,
+    `Hide fields ${actions.map(a => a[1]).join(', ')} ` +
+      `from ${this.tableModel.tableData.tableId}.`
+  );
+}
+
+DetailView.prototype._clearSelection = function() {
+  this.copySelection(null);
+  this.cellSelector.setToCursor();
+};
+
+DetailView.prototype._clearCopySelection = function() {
+  this.copySelection(null);
+};
+
+DetailView.prototype._getCardContextMenuOptions = function(row) {
+  return {
+    disableInsert: Boolean(
+      this.gristDoc.isReadonly.get() ||
+      this.viewSection.disableAddRemoveRows() ||
+      this.tableModel.tableMetaRow.onDemand()
+    ),
+    disableDelete: Boolean(
+      this.gristDoc.isReadonly.get() ||
+      this.viewSection.disableAddRemoveRows() ||
+      row._isAddRow()
+    ),
+    isViewSorted: this.viewSection.activeSortSpec.peek().length > 0,
+    numRows: this.getSelection().rowIds.length,
+  };
+}
+
+DetailView.prototype._getFieldContextMenuOptions = function() {
+  const selection = this.getSelection();
+  return {
+    disableModify: Boolean(selection.fields[0]?.disableModify.peek()),
+    isReadonly: this.gristDoc.isReadonly.get() || this.isPreview,
+  };
 }
 
 module.exports = DetailView;

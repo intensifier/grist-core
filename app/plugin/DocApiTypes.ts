@@ -1,4 +1,4 @@
-import { CellValue } from "app/plugin/GristData";
+import { CellValue } from "./GristData";
 
 /**
  * JSON schema for api /record endpoint. Used in POST method for adding new records.
@@ -11,11 +11,25 @@ export interface NewRecord {
   fields?: { [coldId: string]: CellValue };
 }
 
+export interface NewRecordWithStringId {
+  id?: string;  // tableId or colId
+  /**
+   * Initial values of cells in record. Optional, if not set cells are left
+   * blank.
+   */
+  fields?: { [coldId: string]: CellValue };
+}
+
 /**
  * JSON schema for api /record endpoint. Used in PATCH method for updating existing records.
  */
 export interface Record {
   id: number;
+  fields: { [coldId: string]: CellValue };
+}
+
+export interface RecordWithStringId {
+  id: string;  // tableId or colId
   fields: { [coldId: string]: CellValue };
 }
 
@@ -64,4 +78,56 @@ export type RecordId = number;
  */
 export interface MinimalRecord {
   id: number
+}
+
+export interface ColumnsPost {
+  columns: [NewRecordWithStringId, ...NewRecordWithStringId[]]; // at least one column is required
+}
+
+export interface ColumnsPatch {
+  columns: [RecordWithStringId, ...RecordWithStringId[]]; // at least one column is required
+}
+
+export interface ColumnsPut {
+  columns: [RecordWithStringId, ...RecordWithStringId[]]; // at least one column is required
+}
+
+/**
+ * Creating tables requires a list of columns.
+ * `fields` is not accepted because it's not generally sensible to set the metadata fields on new tables.
+ */
+export interface TablePost extends ColumnsPost {
+  id?: string;
+}
+
+export interface TablesPost {
+  tables: [TablePost, ...TablePost[]]; // at least one table is required
+}
+
+export interface TablesPatch {
+  tables: [RecordWithStringId, ...RecordWithStringId[]]; // at least one table is required
+}
+
+/**
+ * JSON schema for the body of api /sql POST endpoint
+ */
+export interface SqlPost {
+  sql: string;
+  args?: any[];      // (It would be nice to support named parameters, but
+                     // that feels tricky currently with node-sqlite3)
+  timeout?: number;  // In msecs. Can only be reduced from server default,
+                     // not increased. Note timeout of a query could affect
+                     // other queued queries on same document, because of
+                     // limitations of API node-sqlite3 exposes.
+}
+
+
+export interface SetAttachmentStorePost {
+  type: AttachmentStore
+}
+
+export type AttachmentStore = 'internal' | 'external';
+
+export interface AttachmentStoreDesc {
+  label: string;
 }

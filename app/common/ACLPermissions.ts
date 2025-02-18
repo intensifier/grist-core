@@ -41,7 +41,10 @@ export type PartialPermissionSet = PermissionSet<PartialPermissionValue>;
 export type MixedPermissionSet = PermissionSet<MixedPermissionValue>;
 export type TablePermissionSet = PermissionSet<TablePermissionValue>;
 
-const PERMISSION_BITS: {[letter: string]: keyof PermissionSet} = {
+// One of the strings 'read', 'update', etc.
+export type PermissionKey = keyof PermissionSet;
+
+const PERMISSION_BITS: {[letter: string]: PermissionKey} = {
   R: 'read',
   C: 'create',
   U: 'update',
@@ -59,6 +62,9 @@ const ALIASES: {[key: string]: string} = {
   none: '-CRUDS',
 };
 const REVERSE_ALIASES = fromPairs(Object.entries(ALIASES).map(([alias, value]) => [value, alias]));
+
+export const AVAILABLE_BITS_TABLES: PermissionKey[] = ['read', 'update', 'create', 'delete'];
+export const AVAILABLE_BITS_COLUMNS: PermissionKey[] = ['read', 'update'];
 
 // Comes in useful for initializing unset PermissionSets.
 export function emptyPermissionSet(): PartialPermissionSet {
@@ -142,6 +148,20 @@ export function mergePartialPermissions(a: PartialPermissionSet, b: PartialPermi
 }
 
 /**
+ * Returns permissions trimmed to include only the available bits, and empty for any other bits.
+ */
+export function trimPermissions(
+  permissions: PartialPermissionSet, availableBits: PermissionKey[]
+): PartialPermissionSet {
+  const trimmed = emptyPermissionSet();
+  for (const bit of availableBits) {
+    trimmed[bit] = permissions[bit];
+  }
+  return trimmed;
+}
+
+
+/**
  * Merge a list of PermissionSets by combining individual bits.
  */
 export function mergePermissions<T, U>(psets: Array<PermissionSet<T>>, combine: (bits: T[]) => U
@@ -189,4 +209,26 @@ export function summarizePermissions(perms: MixedPermissionValue[]): MixedPermis
   if (perms.length === 0) { return 'mixed'; }
   const perm = perms[0];
   return perms.some(p => p !== perm) ? 'mixed' : perm;
+}
+
+
+function isEmpty(permissions: PartialPermissionSet): boolean {
+  return Object.values(permissions).every(v => v === "");
+}
+
+
+/**
+ * Divide up a PartialPermissionSet into two: one containing only the 'schemaEdit' permission bit,
+ * and the other containing everything else. Empty parts will be returned as undefined, except
+ * when both are empty, in which case nonSchemaEdit will be returned as an empty permission set.
+ */
+export function splitSchemaEditPermissionSet(permissions: PartialPermissionSet):
+    {schemaEdit?: PartialPermissionSet, nonSchemaEdit?: PartialPermissionSet} {
+
+  const schemaEdit = {...emptyPermissionSet(), schemaEdit: permissions.schemaEdit};
+  const nonSchemaEdit: PartialPermissionSet = {...permissions, schemaEdit: ""};
+  return {
+    schemaEdit: !isEmpty(schemaEdit) ? schemaEdit : undefined,
+    nonSchemaEdit: !isEmpty(nonSchemaEdit) || isEmpty(schemaEdit) ? nonSchemaEdit : undefined,
+  };
 }

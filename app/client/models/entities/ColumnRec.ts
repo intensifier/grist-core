@@ -1,6 +1,10 @@
 import {KoArray} from 'app/client/lib/koArray';
-import {DocModel, IRowModel, recordSet, refRecord, TableRec, ViewFieldRec} from 'app/client/models/DocModel';
+import {localStorageJsonObs} from 'app/client/lib/localStorageObs';
+import {CellRec, DocModel, IRowModel, recordSet,
+        refRecord, TableRec, ViewFieldRec} from 'app/client/models/DocModel';
+import {urlState} from 'app/client/models/gristUrlState';
 import {jsonObservable, ObjObservable} from 'app/client/models/modelUtil';
+import {AssistanceState} from 'app/common/AssistancePrompts';
 import * as gristTypes from 'app/common/gristTypes';
 import {getReferencedTableId} from 'app/common/gristTypes';
 import {
@@ -9,12 +13,20 @@ import {
   createVisibleColFormatterRaw,
   FullFormatterArgs
 } from 'app/common/ValueFormatter';
+import {createParser} from 'app/common/ValueParser';
+import {Observable} from 'grainjs';
 import * as ko from 'knockout';
+import {v4 as uuidv4} from 'uuid';
+
+// Column behavior type, used primarily in the UI.
+export type BEHAVIOR = "empty"|"formula"|"data";
 
 // Represents a column in a user-defined table.
 export interface ColumnRec extends IRowModel<"_grist_Tables_column"> {
   table: ko.Computed<TableRec>;
   widgetOptionsJson: ObjObservable<any>;
+  /** Widget options that are save to copy over (for now, without rules) */
+  cleanWidgetOptionsJson: ko.Computed<string>;
   viewFields: ko.Computed<KoArray<ViewFieldRec>>;
   summarySource: ko.Computed<ColumnRec>;
 
@@ -38,6 +50,9 @@ export interface ColumnRec extends IRowModel<"_grist_Tables_column"> {
   // Convenience observable to obtain and set the type with no suffix
   pureType: ko.Computed<string>;
 
+  // Column behavior as seen by the user.
+  behavior: ko.Computed<BEHAVIOR>;
+
   // The column's display column
   _displayColModel: ko.Computed<ColumnRec>;
 
@@ -48,11 +63,17 @@ export interface ColumnRec extends IRowModel<"_grist_Tables_column"> {
   displayColModel: ko.Computed<ColumnRec>;
   visibleColModel: ko.Computed<ColumnRec>;
 
+  // Reverse Ref/RefList column for this column. Only for Ref/RefList columns in two-way relations.
+  reverseColModel: ko.Computed<ColumnRec>;
+  // If this column has a relation.
+  hasReverse: ko.Computed<boolean>;
+
   disableModifyBase: ko.Computed<boolean>;    // True if column config can't be modified (name, type, etc.)
-  disableModify: ko.Computed<boolean>;        // True if column can't be modified or is being transformed.
+  disableModify: ko.Computed<boolean>;        // True if column can't be modified (is summary) or is being transformed.
   disableEditData: ko.Computed<boolean>;      // True to disable editing of the data in this column.
 
   isHiddenCol: ko.Computed<boolean>;
+  isFormCol: ko.Computed<boolean>;
 
   // Returns the rowModel for the referenced table, or null, if is not a reference column.
   refTable: ko.Computed<TableRec|null>;
@@ -67,9 +88,23 @@ export interface ColumnRec extends IRowModel<"_grist_Tables_column"> {
   // (i.e. they aren't actually referenced but they exist in the visible column and are relevant to e.g. autocomplete)
   // `formatter` formats actual cell values, e.g. a whole list from the display column.
   formatter: ko.Computed<BaseFormatter>;
+  cells: ko.Computed<KoArray<CellRec>>;
+
+  /**
+   * Current history of chat. This is a temporary array used only in the ui.
+   */
+  chatHistory: ko.PureComputed<Observable<ChatHistory>>;
 
   // Helper which adds/removes/updates column's displayCol to match the formula.
   saveDisplayFormula(formula: string): Promise<void>|undefined;
+
+  createValueParser(): (value: string) => any;
+
+  /** Helper method to add a reverse column (only for Ref/RefList) */
+  addReverseColumn(): Promise<void>;
+
+  /** Helper method to remove a reverse column (only for Ref/RefList) */
+  removeReverseColumn(): Promise<void>;
 }
 
 export function createColumnRec(this: ColumnRec, docModel: DocModel): void {
@@ -77,6 +112,7 @@ export function createColumnRec(this: ColumnRec, docModel: DocModel): void {
   this.widgetOptionsJson = jsonObservable(this.widgetOptions);
   this.viewFields = recordSet(this, docModel.viewFields, 'colRef');
   this.summarySource = refRecord(docModel.columns, this.summarySourceCol);
+  this.cells = recordSet(this, docModel.cells, 'colRef');
 
   // Is this an empty column (undecided if formula or data); denoted by an empty formula.
   this.isEmpty = ko.pureComputed(() => this.isFormula() && this.formula() === '');
@@ -113,6 +149,8 @@ export function createColumnRec(this: ColumnRec, docModel: DocModel): void {
 
   // The display column to use for the column, or the column itself when no displayCol is set.
   this.displayColModel = refRecord(docModel.columns, this.displayColRef);
+  this.reverseColModel = refRecord(docModel.columns, this.reverseCol);
+  this.hasReverse = this.autoDispose(ko.pureComputed(() => Boolean(this.reverseColModel().id())));
   this.visibleColModel = refRecord(docModel.columns, this.visibleCol);
 
   this.disableModifyBase = ko.pureComputed(() => Boolean(this.summarySourceCol()));
@@ -120,6 +158,11 @@ export function createColumnRec(this: ColumnRec, docModel: DocModel): void {
   this.disableEditData = ko.pureComputed(() => Boolean(this.summarySourceCol()));
 
   this.isHiddenCol = ko.pureComputed(() => gristTypes.isHiddenCol(this.colId()));
+  this.isFormCol = ko.pureComputed(() => (
+    !this.isHiddenCol() &&
+    this.pureType() !== 'Attachments' &&
+    !this.isRealFormula()
+  ));
 
   // Returns the rowModel for the referenced table, or null, if this is not a reference column.
   this.refTable = ko.pureComputed(() => {
@@ -132,6 +175,43 @@ export function createColumnRec(this: ColumnRec, docModel: DocModel): void {
   this.visibleColFormatter = ko.pureComputed(() => formatterForRec(this, this, docModel, 'vcol'));
 
   this.formatter = ko.pureComputed(() => formatterForRec(this, this, docModel, 'full'));
+
+  this.createValueParser = function() {
+    const parser = createParser(docModel.docData, this.id.peek());
+    return parser.cleanParse.bind(parser);
+  };
+
+  this.behavior = ko.pureComputed(() => this.isEmpty() ? 'empty' : this.isFormula() ? 'formula' : 'data');
+
+  this.chatHistory = this.autoDispose(ko.computed(() => {
+    const docId = urlState().state.get().doc ?? '';
+    // Changed key name from history to history-v2 when ChatHistory changed in incompatible way.
+    const key = `formula-assistant-history-v2-${docId}-${this.table().tableId()}-${this.colId()}`;
+    return localStorageJsonObs(key, {messages: [], conversationId: uuidv4()} as ChatHistory);
+  }));
+
+  this.cleanWidgetOptionsJson = ko.pureComputed(() => {
+    const options = this.widgetOptionsJson();
+    if (options && options.rules) {
+      delete options.rules;
+    }
+    return JSON.stringify(options);
+  });
+
+  this.addReverseColumn = () => {
+    return docModel.docData.sendAction(['AddReverseColumn', this.table.peek().tableId.peek(), this.colId.peek()]);
+  };
+
+  this.removeReverseColumn = async () => {
+    if (!this.hasReverse.peek()) {
+      throw new Error("Column does not have a reverse column");
+    }
+    // Remove the other column. Data engine will take care of removing the relation.
+    const column = this.reverseColModel.peek();
+    const tableId = column.table.peek().tableId.peek();
+    const colId = column.colId.peek();
+    return await docModel.docData.sendAction(['RemoveColumn', tableId, colId]);
+  };
 }
 
 export function formatterForRec(
@@ -148,4 +228,40 @@ export function formatterForRec(
     docSettings: docModel.docInfoRow.documentSettingsJson(),
   };
   return func(args);
+}
+
+/**
+ * A chat message. Either send by the user or by the AI.
+ */
+export interface ChatMessage {
+  /**
+   * The message to display. It is a prompt typed by the user or a formula returned from the AI.
+   */
+  message: string;
+  /**
+   * The sender of the message. Either the user or the AI.
+   */
+  sender: 'user' | 'ai';
+  /**
+   * The formula returned from the AI. It is only set when the sender is the AI.
+   */
+  formula?: string|null;
+  /**
+   * Suggested actions returned from the AI.
+   */
+  action?: any;
+}
+
+/**
+ * The state of assistance for a particular column.
+ * ChatMessages are what are shown in the UI, whereas state is
+ * how the back-end represents the conversation. The two are
+ * similar but not the same because of post-processing.
+ * It may be possible to reconcile them when things settle down
+ * a bit?
+ */
+export interface ChatHistory {
+  messages: ChatMessage[];
+  conversationId?: string;
+  state?: AssistanceState;
 }

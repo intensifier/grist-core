@@ -6,7 +6,7 @@ Object.assign(window.exposedModules, {
   grainjs: require('grainjs'),
   ko: require('knockout'),
   moment: require('moment-timezone'),
-  Comm: require('./components/Comm'),
-  _loadScript: require('./lib/loadScript'),
+  Comm: require('app/client/components/Comm'),
+  loadScript: require('./lib/loadScript'),
   ConnectState: require('./models/ConnectState'),
 });

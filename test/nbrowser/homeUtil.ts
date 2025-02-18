@@ -4,19 +4,20 @@
 import FormData from 'form-data';
 import * as fse from 'fs-extra';
 import defaults = require('lodash/defaults');
-import {WebElement} from 'mocha-webdriver';
+import {Key, WebDriver, WebElement} from 'mocha-webdriver';
 import fetch from 'node-fetch';
 import {authenticator} from 'otplib';
 import * as path from 'path';
-import {WebDriver} from 'selenium-webdriver';
 
+import {normalizeEmail} from 'app/common/emails';
 import {UserProfile} from 'app/common/LoginSessionAPI';
+import {BehavioralPrompt, UserPrefs, WelcomePopup} from 'app/common/Prefs';
 import {DocWorkerAPI, UserAPI, UserAPIImpl} from 'app/common/UserAPI';
-import {HomeDBManager} from 'app/gen-server/lib/HomeDBManager';
-import log from 'app/server/lib/log';
+import {HomeDBManager} from 'app/gen-server/lib/homedb/HomeDBManager';
 import {TestingHooksClient} from 'app/server/lib/TestingHooks';
+import EventEmitter = require('events');
 
-export interface Server {
+export interface Server extends EventEmitter {
   driver: WebDriver;
   getTestingHooks(): Promise<TestingHooksClient>;
   getHost(): string;
@@ -25,12 +26,39 @@ export interface Server {
   isExternalServer(): boolean;
 }
 
+const ALL_TIPS_ENABLED = {
+  behavioralPrompts: {
+    dontShowTips: false,
+    dismissedTips: [],
+  },
+  dismissedWelcomePopups: [],
+};
+
+const ALL_TIPS_DISABLED = {
+  behavioralPrompts: {
+    dontShowTips: true,
+    dismissedTips: BehavioralPrompt.values,
+  },
+  dismissedWelcomePopups: WelcomePopup.values.map(id => {
+    return {
+      id,
+      lastDismissedAt: 0,
+      nextAppearanceAt: null,
+      timesDismissed: 1,
+    };
+  }),
+};
+
 export class HomeUtil {
   // Cache api keys of test users.  It is often convenient to have various instances
   // of the home api available while making browser tests.
   private _apiKey = new Map<string, string>();
 
-  constructor(public fixturesRoot: string, public server: Server) {}
+  constructor(public fixturesRoot: string, public server: Server) {
+    server.on('stop', () => {
+      this._apiKey.clear();
+    });
+  }
 
   public get driver(): WebDriver { return this.server.driver; }
 
@@ -54,9 +82,13 @@ export class HomeUtil {
     freshAccount?: boolean,
     isFirstLogin?: boolean,
     showGristTour?: boolean,
+    showTips?: boolean,
     cacheCredentials?: boolean,
   } = {}) {
-    const {loginMethod, isFirstLogin} = defaults(options, {loginMethod: 'Email + Password'});
+    const {loginMethod, isFirstLogin, showTips} = defaults(options, {
+      loginMethod: 'Email + Password',
+      showTips: false,
+    });
     const showGristTour = options.showGristTour ?? (options.freshAccount ?? isFirstLogin);
 
     // For regular tests, we can log in through a testing hook.
@@ -64,24 +96,33 @@ export class HomeUtil {
       if (options.freshAccount) { await this._deleteUserByEmail(email); }
       if (isFirstLogin !== undefined) { await this._setFirstLogin(email, isFirstLogin); }
       if (showGristTour !== undefined) { await this._initShowGristTour(email, showGristTour); }
+      if (showTips) {
+        await this.enableTips(email);
+      } else {
+        await this.disableTips(email);
+      }
       // TestingHooks communicates via JSON, so it's impossible to send an `undefined` value for org
       // through it. Using the empty string happens to work though.
       const testingHooks = await this.server.getTestingHooks();
       const sid = await this.getGristSid();
       if (!sid) { throw new Error('no session available'); }
-      await testingHooks.setLoginSessionProfile(sid, {name, email, loginMethod}, org);
+      await testingHooks.setLoginSessionProfile(
+        sid,
+        {name, email, loginEmail: normalizeEmail(email), loginMethod},
+        org
+      );
     } else {
       if (loginMethod && loginMethod !== 'Email + Password') {
         throw new Error('only Email + Password logins supported for external server tests');
       }
       // Make sure we revisit page in case login is changing.
       await this.driver.get('about:blank');
+      await this._acceptAlertIfPresent();
       // When running against an external server, we log in through the Grist login page.
       await this.driver.get(this.server.getUrl(org, ""));
       if (!await this.isOnLoginPage()) {
-        // Explicitly click sign-in link if necessary.
-        await this.driver.findWait('.test-user-signin', 4000).click();
-        await this.driver.findContentWait('.grist-floating-menu a', 'Sign in', 500).click();
+        // Explicitly click Sign In button if necessary.
+        await this.driver.findWait('.test-user-sign-in', 4000).click();
       }
 
       // Fill the login form (either test or Grist).
@@ -102,7 +143,8 @@ export class HomeUtil {
       // Take this opportunity to cache access info.
       if (!this._apiKey.has(email)) {
         await this.driver.get(this.server.getUrl(org || 'docs', ''));
-        this._apiKey.set(email, await this._getApiKey());
+        const apiKey = await this._getApiKey();
+        this._apiKey.set(email, apiKey);
       }
     }
   }
@@ -113,13 +155,24 @@ export class HomeUtil {
    * to be more nuanced.
    */
   public async removeLogin(org: string = "") {
+    // If cursor is on field editor, escape before remove login
+    await this.driver.sendKeys(Key.ESCAPE);
     if (!this.server.isExternalServer()) {
       const testingHooks = await this.server.getTestingHooks();
       const sid = await this.getGristSid();
       if (sid) { await testingHooks.setLoginSessionProfile(sid, null, org); }
     } else {
       await this.driver.get(`${this.server.getHost()}/logout`);
+      await this._acceptAlertIfPresent();
     }
+  }
+
+  public async enableTips(email: string) {
+    await this._toggleTips(true, email);
+  }
+
+  public async disableTips(email: string) {
+    await this._toggleTips(false, email);
   }
 
   // Check if the url looks like a welcome page.  The check is weak, but good enough
@@ -205,6 +258,7 @@ export class HomeUtil {
   public async getGristSid(): Promise<string|null> {
     // Load a cheap page on our server to get the session-id cookie from browser.
     await this.driver.get(`${this.server.getHost()}/test/session`);
+    await this._acceptAlertIfPresent();
     const cookie = await this.driver.manage().getCookie(process.env.GRIST_SESSION_COOKIE || 'grist_sid');
     if (!cookie) { return null; }
     return decodeURIComponent(cookie.value);
@@ -269,9 +323,14 @@ export class HomeUtil {
   // A helper to create a UserAPI instance for a given useranme and org, that targets the home server
   // Username can be null for anonymous access.
   public createHomeApi(username: string|null, org: string, email?: string): UserAPIImpl {
+    const apiKey = this.getApiKey(username, email);
+    return this._createHomeApiUsingApiKey(apiKey, org);
+  }
+
+  public getApiKey(username: string|null, email?: string): string | null {
     const name = (username || '').toLowerCase();
     const apiKey = username && ((email && this._apiKey.get(email)) || `api_key_for_${name}`);
-    return this._createHomeApiUsingApiKey(apiKey, org);
+    return apiKey;
   }
 
   /**
@@ -322,7 +381,7 @@ export class HomeUtil {
   /**
    * Waits for browser to navigate to a Grist login page.
    */
-   public async checkGristLoginPage(waitMs: number = 2000) {
+  public async checkGristLoginPage(waitMs: number = 2000) {
     await this.driver.wait(this.isOnGristLoginPage.bind(this), waitMs);
   }
 
@@ -334,8 +393,7 @@ export class HomeUtil {
     await this.deleteCurrentUser();
     await this.removeLogin(org);
     await this.driver.get(this.server.getUrl(org, ""));
-    await this.driver.findWait('.test-user-signin', 4000).click();
-    await this.driver.findContentWait('.grist-floating-menu a', 'Sign in', 500).click();
+    await this.driver.findWait('.test-user-sign-in', 4000).click();
     await this.checkLoginPage();
     // Fill the login form (either test or Grist).
     if (await this.isOnTestLoginPage()) {
@@ -362,7 +420,7 @@ export class HomeUtil {
     if (this.server.isExternalServer()) { throw new Error('not supported'); }
     const dbManager = await this.server.getDatabase();
     const user = await dbManager.getUserByLogin(email);
-    if (user) { await dbManager.deleteUser({userId: user.id}, user.id, user.name); }
+    await dbManager.deleteUser({userId: user.id}, user.id, user.name);
   }
 
   // Set whether this is the user's first time logging in.  Requires access to the database.
@@ -370,10 +428,8 @@ export class HomeUtil {
     if (this.server.isExternalServer()) { throw new Error('not supported'); }
     const dbManager = await this.server.getDatabase();
     const user = await dbManager.getUserByLogin(email);
-    if (user) {
-      user.isFirstTimeUser = isFirstLogin;
-      await user.save();
-    }
+    user.isFirstTimeUser = isFirstLogin;
+    await user.save();
   }
 
   private async _initShowGristTour(email: string, showGristTour: boolean) {
@@ -394,6 +450,42 @@ export class HomeUtil {
       headers,
       fetch: fetch as any,
       newFormData: () => new FormData() as any,  // form-data isn't quite type compatible
-      logger: log});
+    });
+  }
+
+  private async _toggleTips(enabled: boolean, email: string) {
+    if (this.server.isExternalServer()) {
+      // Unsupported due to lack of access to the database.
+      return;
+    }
+
+    const dbManager = await this.server.getDatabase();
+    const user = await dbManager.getUserByLogin(email);
+
+    if (user.personalOrg) {
+      const org = await dbManager.getOrg({userId: user.id}, user.personalOrg.id);
+      const userPrefs = (org.data as any)?.userPrefs ?? {};
+      const newUserPrefs: UserPrefs = {
+        ...userPrefs,
+        ...(enabled ? ALL_TIPS_ENABLED : ALL_TIPS_DISABLED),
+      };
+      await dbManager.updateOrg({userId: user.id}, user.personalOrg.id, {userPrefs: newUserPrefs});
+    } else {
+      await this.driver.executeScript(`
+        const userPrefs = JSON.parse(localStorage.getItem('userPrefs:u=${user.id}') || '{}');
+        localStorage.setItem('userPrefs:u=${user.id}', JSON.stringify({
+          ...userPrefs,
+          ...${JSON.stringify(enabled ? ALL_TIPS_ENABLED : ALL_TIPS_DISABLED)},
+        }));
+      `);
+    }
+  }
+
+  private async _acceptAlertIfPresent() {
+    try {
+      await (await this.driver.switchTo().alert()).accept();
+    } catch {
+      /* There was no alert to accept. */
+    }
   }
 }

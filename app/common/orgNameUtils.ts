@@ -16,7 +16,7 @@ const BLACKLISTED_SUBDOMAINS = new Set([
   'docs', 'api', 'static',
   'ftp', 'imap', 'pop', 'smtp', 'mail', 'git', 'blog', 'wiki', 'support', 'kb', 'help',
   'admin', 'store', 'dev', 'beta',
-  'community', 'try', 'wpx',
+  'community', 'try', 'wpx', 'telemetry',
 
   // a few random tech brands
   'google', 'apple', 'microsoft', 'ms', 'facebook', 'fb', 'twitter', 'youtube', 'yt',
@@ -31,7 +31,7 @@ const BLACKLISTED_SUBDOMAINS = new Set([
 /**
  *
  * Checks whether the subdomain is on the list of forbidden subdomains.
- * See https://phab.getgrist.com/w/hosting/v1/urls/#organization-subdomains
+ * See /documentation/urls.md#organization-subdomains
  *
  * Also enforces various sanity checks.
  *
@@ -41,7 +41,7 @@ const BLACKLISTED_SUBDOMAINS = new Set([
 export function checkSubdomainValidity(subdomain: string): void {
   // stick with limited alphanumeric subdomains.
   if (!(/^[a-z0-9][-a-z0-9]*$/.test(subdomain))) {
-    throw new Error('Domain must include letters, numbers, and dashes only.');
+    throw new Error('Domain must include lower-case letters, numbers, and dashes only.');
   }
   // 'docs-*' is reserved for personal orgs.
   if (subdomain.startsWith('docs-')) { throw new Error('Domain cannot use reserved prefix "docs-".'); }

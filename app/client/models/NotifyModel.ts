@@ -1,14 +1,25 @@
 import * as log from 'app/client/lib/log';
 import {ConnectState, ConnectStateManager} from 'app/client/models/ConnectState';
+import {isNarrowScreenObs, testId} from 'app/client/ui2018/cssVars';
 import {delay} from 'app/common/delay';
 import {isLongerThan} from 'app/common/gutil';
 import {InactivityTimer} from 'app/common/InactivityTimer';
 import {timeFormat} from 'app/common/timeFormat';
-import {bundleChanges, Disposable, Holder, IDisposable, IDisposableOwner } from 'grainjs';
-import {Computed, dom, DomElementArg, MutableObsArray, obsArray, Observable} from 'grainjs';
+import {
+  bundleChanges,
+  Computed,
+  Disposable,
+  dom,
+  DomElementArg,
+  Holder,
+  IDisposable,
+  IDisposableOwner,
+  MutableObsArray,
+  obsArray,
+  Observable
+} from 'grainjs';
 import clamp = require('lodash/clamp');
 import defaults = require('lodash/defaults');
-import {isNarrowScreenObs, testId} from 'app/client/ui2018/cssVars';
 
 // When rendering app errors, we'll only show the last few.
 const maxAppErrors = 5;
@@ -26,7 +37,7 @@ interface INotifier {
   getFullAppErrors(): IAppError[];
 }
 
-interface INotification extends Expirable {
+export interface INotification extends Expirable {
   expire(): Promise<void>;
 }
 
@@ -34,11 +45,19 @@ export interface IProgress extends Expirable {
   setProgress(percent: number): void;
 }
 
+/**
+ * Custom action to be shown as a notification with a handler.
+ */
+export interface CustomAction { label: string, action: () => void }
+/**
+ * A string, or a function that builds dom.
+ */
+export type MessageType = string | (() => DomElementArg);
 // Identifies supported actions. These are implemented in NotifyUI.
-export type NotifyAction = 'upgrade' | 'renew' | 'personal' | 'report-problem' | 'ask-for-help';
-
+export type NotifyAction = 'upgrade' | 'renew' | 'personal' | 'report-problem'
+                           | 'ask-for-help' | 'manage' | CustomAction;
 export interface INotifyOptions {
-  message: string | (() => DomElementArg);     // A string, or a function that builds dom.
+  message: MessageType;     // A string, or a function that builds dom.
   timestamp?: number;
   title?: string;
   canUserClose?: boolean;
@@ -71,9 +90,11 @@ export class Expirable extends Disposable {
   /**
    * Sets status to 'expiring', then calls dispose after a short delay.
    */
-  public async expire(): Promise<void> {
+  public async expire(withoutDelay: boolean = false): Promise<void> {
     this.status.set('expiring');
-    await delay(Expirable.fadeDelay);
+    if(!withoutDelay) {
+      await delay(Expirable.fadeDelay);
+    }
     if (!this.isDisposed()) {
       this.dispose();
     }
@@ -224,7 +245,7 @@ export class Notifier extends Disposable implements INotifier {
    * Additional option level, can be used to style the notification to like a success, warning,
    * info or error message.
    */
-  public createUserMessage(message: string, options: Partial<INotifyOptions> = {}): INotification {
+  public createUserMessage(message: MessageType, options: Partial<INotifyOptions> = {}): INotification {
     const timestamp = Date.now();
     if (options.actions && options.actions.includes('ask-for-help')) {
       // If user should be able to ask for help, add this error to the notifier dropdown too for a
@@ -331,7 +352,7 @@ export class Notifier extends Disposable implements INotifier {
     if (key) {
       const prev = this._keyedItems.get(key);
       if (prev) {
-        await prev.expire();
+        await prev.expire(true);
       }
       this._keyedItems.set(key, n);
       n.onDispose(() => this.isDisposed() || this._keyedItems.delete(key));
@@ -360,7 +381,7 @@ export class Notifier extends Disposable implements INotifier {
         return dom('div',
           dom.forEach(appErrors, (appErr: IAppError) =>
             (where === 'toast' && appErr.seen ? null :
-              dom('div', timeFormat('T', new Date(appErr.timestamp)), ' ',
+              dom('div', {tabIndex: "-1"}, timeFormat('T', new Date(appErr.timestamp)), ' ',
                   appErr.error.message, testId('notification-app-error'))
             )
           ),

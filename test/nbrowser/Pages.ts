@@ -7,8 +7,7 @@ import {server, setupTestSuite} from 'test/nbrowser/testUtils';
 import values = require('lodash/values');
 
 describe('Pages', function() {
-  this.timeout(20000);
-  setupTestSuite();
+  this.timeout(60000);
   let doc: DocCreationInfo;
   let api: UserAPI;
   let session: Session;
@@ -19,6 +18,113 @@ describe('Pages', function() {
     doc = await session.tempDoc(cleanup, 'Pages.grist');
     api = session.createHomeApi();
   });
+
+  it('should show censor pages', async () => {
+    // Make a 3 level hierarchy.
+    assert.deepEqual(await gu.getPageTree(), [
+      {
+        label: 'Interactions', children: [
+          { label: 'Documents' },
+        ]
+      },
+      {
+        label: 'People', children: [
+          { label: 'User & Leads' },
+          { label: 'Overview' },
+        ]
+      },
+    ]);
+    await insertPage(/Overview/, /User & Leads/);
+    assert.deepEqual(await gu.getPageTree(), [
+      {
+        label: 'Interactions', children: [
+          {label: 'Documents' },
+        ]
+      },
+      {
+        label: 'People', children: [
+          {label: 'User & Leads', children: [
+            {label: 'Overview'}] },
+        ]
+      },
+    ]);
+    const revertAcl = await gu.beginAclTran(api, doc.id);
+    // Update ACL, hide Overview table from all users.
+    await hideTable("Overview");
+    // We will be reloaded, but it's not easy to wait for it, so do the refresh manually.
+    await gu.reloadDoc();
+    assert.deepEqual(await gu.getPageTree(), [
+      {
+        label: 'Interactions', children: [
+          {label: 'Documents'},
+        ]
+      },
+      {
+        label: 'People', children: [
+          {label: 'User & Leads'},
+        ]
+      },
+    ]);
+
+
+    // Now hide User_Leads
+    await hideTable("User_Leads");
+    await gu.reloadDoc();
+    assert.deepEqual(await gu.getPageTree(), [
+      {
+        label: 'Interactions', children: [
+          { label: 'Documents'},
+        ]
+      },
+      {
+        label: 'People'
+      },
+    ]);
+
+    // Now hide People, and test that whole node is hidden.
+    await hideTable("People");
+    await gu.reloadDoc();
+    assert.deepEqual(await gu.getPageTree(), [
+      {
+        label: 'Interactions', children: [
+          { label: 'Documents'},
+        ]
+      }
+    ]);
+
+    // Now hide Documents, this is a leaf, so it should be hidden from the start
+    await hideTable("Documents");
+    await gu.reloadDoc();
+    assert.deepEqual(await gu.getPageTree(), [
+      {
+        label: 'Interactions'
+      }
+    ]);
+
+    // Now hide Interactions, we should have a blank treeview
+    await hideTable("Interactions");
+    // We can wait for doc to load, because it waits for section.
+    await driver.findWait(".test-treeview-container", 1000);
+    assert.deepEqual(await gu.getPageTree(), []);
+
+    // Rollback
+    await revertAcl();
+    await gu.reloadDoc();
+    assert.deepEqual(await gu.getPageTree(), [
+      {
+        label: 'Interactions', children: [
+          { label: 'Documents' },
+        ]
+      },
+      {
+        label: 'People', children: [
+          { label: 'User & Leads', children: [{ label: 'Overview' }] },
+        ]
+      },
+    ]);
+    await gu.undo();
+  });
+
 
   it('should list all pages in document', async () => {
 
@@ -35,7 +141,7 @@ describe('Pages', function() {
 
     // load page and check all pages are listed
     await driver.get(`${server.getHost()}/o/test-grist/doc/${doc.id}`);
-    await driver.findWait('.test-treeview-container', 1000);
+    await gu.waitForDocToLoad();
     assert.deepEqual(await gu.getPageNames(), ['Interactions', 'Documents', 'People', 'User & Leads', 'Overview']);
   });
 
@@ -51,7 +157,7 @@ describe('Pages', function() {
   it('should select first page if /p/<docPage> is omitted in the url', async () => {
 
     await driver.get(`${server.getHost()}/o/test-grist/doc/${doc.id}`);
-    await driver.findWait('.test-treeview-container', 1000);
+    await gu.waitForDocToLoad();
     assert.match(await driver.find('.test-treeview-itemHeader').getText(), /Interactions/);
     assert.match(await driver.find('.test-treeview-itemHeader.selected').getText(), /Interactions/);
     assert.match(await gu.getActiveSectionTitle(), /Interactions/i);
@@ -62,19 +168,16 @@ describe('Pages', function() {
 
   it('clicking page should set /p/<docPage> in the url', async () => {
     await driver.get(`${server.getHost()}/o/test-grist/doc/${doc.id}`);
-
-    // Wait for data to load.
-    assert.equal(await driver.findWait('.viewsection_title', 3000).isDisplayed(), true);
-    await gu.waitForServer();
+    await gu.waitForDocToLoad();
 
     // Click on a page; check the URL, selected item, and the title of the view section.
-    await clickPage(/Documents/)
+    await gu.openPage(/Documents/);
     assert.match(await driver.getCurrentUrl(), /\/p\/3/);
     assert.match(await driver.find('.test-treeview-itemHeader.selected').getText(), /Documents/);
     assert.match(await gu.getActiveSectionTitle(), /Documents/i);
 
     // Click on another page; check the URL, selected item, and the title of the view section.
-    await clickPage(/People/)
+    await gu.openPage(/People/);
     assert.match(await driver.getCurrentUrl(), /\/p\/2/);
     assert.match(await driver.find('.test-treeview-itemHeader.selected').getText(), /People/);
     assert.match(await gu.getActiveSectionTitle(), /People/i);
@@ -109,7 +212,7 @@ describe('Pages', function() {
 
   it('should allow renaming table when click on page selected label', async () => {
     // do rename
-    await clickPage(/People/)
+    await gu.openPage(/People/);
     await driver.findContent('.test-treeview-label', 'People').doClick();
     await driver.find('.test-docpage-editor').sendKeys('PeopleRenamed', Key.ENTER);
     await gu.waitForServer();
@@ -122,8 +225,7 @@ describe('Pages', function() {
     // revert changes
     await gu.undo(2);
     assert.deepEqual(await gu.getPageNames(), ['Interactions', 'Documents', 'People', 'User & Leads', 'Overview']);
-
-  })
+  });
 
   it('should not allow blank page name', async () => {
     // Begin renaming of People page
@@ -140,6 +242,66 @@ describe('Pages', function() {
 
     // Check name is still People
     assert.include(await gu.getPageNames(), 'People');
+  });
+
+  it('should pull out emoji from page names', async () => {
+    // A regular character is used as an initial AND kept in the name.
+    assert.deepEqual(await getInitialAndName(/People/), ['P', 'People']);
+
+    // It looks like our version of Chromedriver does not support sending emojis using sendKeys
+    // (issue mentioned here https://stackoverflow.com/a/59139690), so we'll use executeScript to
+    // rename pages.
+    async function renamePage(origName: string|RegExp, newName: string) {
+      await gu.openPageMenu(origName);
+      await driver.find('.test-docpage-rename').doClick();
+      const editor = await driver.find('.test-docpage-editor');
+      await driver.executeScript((el: HTMLInputElement, text: string) => { el.value = text; }, editor, newName);
+      await editor.sendKeys(Key.ENTER);
+      await gu.waitForServer();
+    }
+
+    async function getInitialAndName(pageName: string|RegExp): Promise<[string, string]> {
+      return await driver.findContent('.test-treeview-itemHeader', pageName)
+      .findAll('.test-docpage-initial, .test-docpage-label', el => el.getText()) as [string,
+        string];
+    }
+
+    // An emoji is pulled into the initial, and is removed from the name.
+    await renamePage('People', '👥 People');
+
+    assert.deepEqual(await getInitialAndName(/People/), ['👥', 'People']);
+
+    // Two complex emojis -- the first one is the pulled-out initial.
+    await renamePage('People', '👨‍👩‍👧‍👦👨‍👩‍👧Guest List');
+    assert.deepEqual(await getInitialAndName(/Guest List/),
+      ['👨‍👩‍👧‍👦', '👨‍👩‍👧Guest List']);
+
+    // Digits should not be considered emoji (even though they match /\p{Emoji}/...)
+    await renamePage(/Guest List/, '5Guest List');
+    assert.deepEqual(await getInitialAndName(/Guest List/), ['5', '5Guest List']);
+
+    await gu.undo(3);
+    assert.deepEqual(await getInitialAndName(/People/), ['P', 'People']);
+  });
+
+  it('should show tooltip for long page names on hover', async () => {
+    await gu.openPageMenu('People');
+    await driver.find('.test-docpage-rename').doClick();
+    await driver.find('.test-docpage-editor')
+      .sendKeys('People, Persons, Humans, Ladies & Gentlemen', Key.ENTER);
+    await gu.waitForServer();
+
+    await driver.findContent('.test-treeview-label', /People, Persons, Humans, Ladies & Gentlemen/).mouseMove();
+    await driver.wait(() => driver.findWait('.test-tooltip', 1000).isDisplayed(), 3000);
+    assert.equal(await driver.find('.test-tooltip').getText(),
+      'People, Persons, Humans, Ladies & Gentlemen');
+
+    await gu.undo();
+    assert.deepEqual(await gu.getPageNames(), ['Interactions', 'Documents', 'People', 'User & Leads', 'Overview']);
+
+    await driver.findContent('.test-treeview-label', /People/).mouseMove();
+    await driver.sleep(500);
+    assert.equal(await driver.find('.test-tooltip').isPresent(), false);
   });
 
   it('should not change page when clicking the input while renaming page', async () => {
@@ -214,7 +376,7 @@ describe('Pages', function() {
     }
 
     // goto page 'Interactions'
-    await clickPage(/Interactions/);
+    await gu.openPage(/Interactions/);
 
     // check selected page
     assert.match(await selectedPage(), /Interactions/);
@@ -249,7 +411,7 @@ describe('Pages', function() {
   it('undo/redo should update url', async () => {
 
     // goto page 'Interactions' and send keys
-    await clickPage(/Interactions/);
+    await gu.openPage(/Interactions/);
     assert.match(await driver.find('.test-treeview-itemHeader.selected').getText(), /Interactions/);
     await driver.findContentWait('.gridview_data_row_num', /1/, 2000);
     await driver.sendKeys(Key.ENTER, 'Foo', Key.ENTER);
@@ -257,7 +419,7 @@ describe('Pages', function() {
     assert.deepEqual(await gu.getVisibleGridCells(0, [1]), ['Foo']);
 
     // goto page 'People' and click undo
-    await clickPage(/People/);
+    await gu.openPage(/People/);
     await gu.waitForDocToLoad();
     await gu.waitForUrl(/\/p\/2\b/); // check that url match p/2
 
@@ -277,7 +439,7 @@ describe('Pages', function() {
 
   it('Add new page should update url', async () => {
     // goto page 'Interactions'  and check that url updated
-    await clickPage(/Interactions/);
+    await gu.openPage(/Interactions/);
     await gu.waitForUrl(/\/p\/1\b/);
 
     // Add new Page, check that url updated and page is selected
@@ -286,7 +448,7 @@ describe('Pages', function() {
     assert.match(await driver.find('.test-treeview-itemHeader.selected').getText(), /Table1/);
 
     // goto page 'Interactions' and check that url updated and page selectd
-    await clickPage(/Interactions/);
+    await gu.openPage(/Interactions/);
     await gu.waitForUrl(/\/p\/1\b/);
     assert.match(await driver.find('.test-treeview-itemHeader.selected').getText(), /Interactions/);
   });
@@ -296,6 +458,7 @@ describe('Pages', function() {
     // Create and open new document
     const docId = await session.tempNewDoc(cleanup, "test-page-removal");
     await driver.get(`${server.getHost()}/o/test-grist/doc/${docId}`);
+    await gu.waitForDocToLoad();
     await gu.waitForUrl('test-page-removal');
 
     // Add a new page using Table1
@@ -403,9 +566,9 @@ describe('Pages', function() {
 
   it('should not throw JS errors when removing the current page without a slug', async () => {
     // Create and open new document
-    const docId = await session.tempNewDoc(cleanup, "test-page-removal-js-error")
+    const docId = await session.tempNewDoc(cleanup, "test-page-removal-js-error");
     await driver.get(`${server.getHost()}/o/test-grist/doc/${docId}`);
-    await gu.waitForUrl('test-page-removal-js-error');
+    await gu.waitForDocToLoad();
 
     // Add two additional tables
     await gu.addNewTable();
@@ -414,6 +577,7 @@ describe('Pages', function() {
 
     // Open the default page (no p/<...> in the URL)
     await driver.get(`${server.getHost()}/o/test-grist/doc/${docId}`);
+    await gu.waitForDocToLoad();
 
     // Check that Table1 is now selected
     await driver.findContentWait('.test-treeview-itemHeader.selected', /Table1/, 2000);
@@ -442,9 +606,9 @@ describe('Pages', function() {
 
   it('should offer a way to delete last tables', async () => {
     // Create and open new document
-    const docId = await session.tempNewDoc(cleanup, "prompts")
+    const docId = await session.tempNewDoc(cleanup, "prompts");
     await driver.get(`${server.getHost()}/o/test-grist/doc/${docId}`);
-    await gu.waitForUrl('prompts');
+    await gu.waitForDocToLoad();
 
     // Add two additional tables, with custom names.
     await gu.addNewTable('Table B');
@@ -482,9 +646,18 @@ describe('Pages', function() {
     assert.deepEqual(await gu.getSectionTitles(), ['TABLE C', 'TABLE D', 'TABLE1' ]);
   });
 
+
+  async function hideTable(tableId: string) {
+    await api.applyUserActions(doc.id, [
+      ['AddRecord', '_grist_ACLResources', -1, {tableId, colIds: '*'}],
+      ['AddRecord', '_grist_ACLRules', null, {
+        resource: -1, aclFormula: '', permissionsText: '-R',
+      }],
+    ]);
+  }
 });
 
-async function movePage(page: RegExp, target: {before: RegExp}|{after: RegExp}) {
+async function movePage(page: RegExp, target: {before: RegExp}|{after: RegExp}|{into: RegExp}) {
   const targetReg = values(target)[0];
   await driver.withActions(actions => actions
     .move({origin: driver.findContent('.test-treeview-itemHeader', page)})
@@ -497,6 +670,18 @@ async function movePage(page: RegExp, target: {before: RegExp}|{after: RegExp}) 
     .release());
 }
 
-function clickPage(name: string|RegExp) {
-  return driver.findContent('.test-treeview-itemHeader', name).find(".test-docpage-initial").doClick();
+
+async function insertPage(page: RegExp, into: RegExp) {
+  await driver.withActions(actions => actions
+    .move({origin: driver.findContent('.test-treeview-itemHeader', page)})
+    .move({origin: driver.findContent('.test-treeview-itemHeaderWrapper', page)
+      .find('.test-treeview-handle')})
+    .press()
+    .move({origin: driver.findContent('.test-treeview-itemHeader', into),
+      y: 5
+    })
+    .pause(1500) // wait for a target to be highlighted
+    .release()
+  );
+  await gu.waitForServer();
 }

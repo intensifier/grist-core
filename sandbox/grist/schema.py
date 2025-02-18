@@ -4,7 +4,7 @@ create tables, add and remove columns, etc, Grist stores various document metada
 users' tables, views, etc.) also in tables.
 
 Before changing this file, please review:
-  https://phab.getgrist.com/w/migrations/
+  /documentation/migrations.md
 
 """
 
@@ -15,7 +15,7 @@ import six
 
 import actions
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 43
 
 def make_column(col_id, col_type, formula='', isFormula=False):
   return {
@@ -58,6 +58,7 @@ def schema_create_actions():
       make_column("onDemand",     "Bool"),
 
       make_column("rawViewSectionRef", "Ref:_grist_Views_section"),
+      make_column("recordCardViewSectionRef", "Ref:_grist_Views_section"),
     ]),
 
     # All columns in all user tables.
@@ -70,6 +71,7 @@ def schema_create_actions():
       make_column("isFormula",    "Bool"),
       make_column("formula",      "Text"),
       make_column("label",        "Text"),
+      make_column("description",  "Text"),
 
       # Normally a change to label changes colId as well, unless untieColIdFromLabel is True.
       # (We intentionally pick a variable whose default value is false.)
@@ -85,6 +87,10 @@ def schema_create_actions():
       make_column("visibleCol",       "Ref:_grist_Tables_column"),
       # Points to formula columns that hold conditional formatting rules.
       make_column("rules",       "RefList:_grist_Tables_column"),
+
+      # For Ref/RefList columns only, points to the corresponding reverse reference column.
+      # This column will get automatically set to reverse of the references in reverseCol.
+      make_column("reverseCol",       "Ref:_grist_Tables_column"),
 
       # Instructions when to recalculate the formula on a column with isFormula=False (previously
       # known as a "default formula"). Values are RecalcWhen constants defined below.
@@ -161,6 +167,7 @@ def schema_create_actions():
       make_column("viewRef", "Ref:_grist_Views"),
       make_column("indentation", "Int"),
       make_column("pagePos", "PositionNumber"),
+      make_column("shareRef", "Ref:_grist_Shares"),
     ]),
 
     # All user views.
@@ -180,6 +187,7 @@ def schema_create_actions():
       # TODO: rename this (e.g. to "sectionType").
       make_column("parentKey",          "Text"),
       make_column("title",              "Text"),
+      make_column("description",        "Text"),
       make_column("defaultWidth",       "Int", formula="100"),
       make_column("borderWidth",        "Int", formula="1"),
       make_column("theme",              "Text"),
@@ -194,6 +202,9 @@ def schema_create_actions():
       make_column("linkTargetColRef",   "Ref:_grist_Tables_column"),
       # embedId is deprecated as of version 12. Do not remove or reuse.
       make_column("embedId",            "Text"),
+      # Points to formula columns that hold conditional formatting rules for this view section.
+      make_column("rules",              "RefList:_grist_Tables_column"),
+      make_column("shareOptions",       "Text"),
     ]),
     # The fields of a view section.
     actions.AddTable("_grist_Views_section_field", [
@@ -233,6 +244,11 @@ def schema_create_actions():
       make_column("fileName",     "Text"), # User defined file name
       make_column("fileType",     "Text"), # A string indicating the MIME type of the data
       make_column("fileSize",     "Int"),  # The size in bytes
+      # The file extension, including the "." prefix.
+      # Prior to April 2023, this column did not exist, so attachments created before then have a
+      # blank fileExt. The extension may still be present in fileName, so a migration can backfill
+      # some older attachments if the need arises.
+      make_column("fileExt",      "Text"),
       make_column("imageHeight",  "Int"),  # height in pixels
       make_column("imageWidth",   "Int"),  # width in pixels
       make_column("timeDeleted",  "DateTime"),
@@ -246,6 +262,11 @@ def schema_create_actions():
       make_column("eventTypes", "ChoiceList"),
       make_column("isReadyColRef", "Ref:_grist_Tables_column"),
       make_column("actions", "Text"),  # JSON
+      make_column("label", "Text"),
+      make_column("memo", "Text"),
+      make_column("enabled", "Bool"),
+      make_column("watchedColRefList", "RefList:_grist_Tables_column"),
+      make_column("options", "Text"),
     ]),
 
     # All of the ACL rules.
@@ -278,6 +299,10 @@ def schema_create_actions():
       # becomes available to matchFunc. These rules are processed in order of rulePos,
       # which should list them before regular rules.
       make_column('userAttributes', 'Text'),
+
+      # Text of memo associated with this rule, if any. Prior to version 35, this was
+      # stored within aclFormula.
+      make_column('memo',           'Text'),
     ]),
 
     # Note that the special resource with tableId of '' and colIds of '' should be ignored. It is
@@ -313,7 +338,33 @@ def schema_create_actions():
       # `excluded` string to an array of column values:
       # Ex1: { included: ['foo', 'bar'] }
       # Ex2: { excluded: ['apple', 'orange'] }
-      make_column("filter",         "Text")
+      make_column("filter",         "Text"),
+      # Filters can be pinned to the filter bar, which causes a button to be displayed
+      # that opens the filter menu when clicked.
+      make_column("pinned",         "Bool"),
+    ]),
+
+    # Additional metadata for cells
+    actions.AddTable('_grist_Cells', [
+      make_column("tableRef",       "Ref:_grist_Tables"),
+      make_column("colRef",         "Ref:_grist_Tables_column"),
+      make_column("rowId",          "Int"),
+      # Cell metadata is stored as in hierarchical structure.
+      make_column("root",           "Bool"),
+      make_column("parentId",       "Ref:_grist_Cells"),
+      # Type of information, currently we have only one type Comments (with value 1).
+      make_column("type",           "Int"),
+      # JSON representation of the metadata.
+      make_column("content",        "Text"),
+      make_column("userRef",        "Text"),
+    ]),
+
+    actions.AddTable('_grist_Shares', [
+      make_column('linkId',         'Text'),   # Used to match records in home db without
+                                               # necessarily trusting the document much.
+      make_column('options',        'Text'),
+      make_column('label',          'Text'),
+      make_column('description',    'Text'),
     ]),
   ]
 
@@ -332,17 +383,25 @@ class RecalcWhen(object):
 # These are little structs to represent the document schema that's used in code generation.
 # Schema itself (as stored by Engine) is an OrderedDict(tableId -> SchemaTable), with
 # SchemaTable.columns being an OrderedDict(colId -> SchemaColumn).
+# Note: reverseColId produces types like grist.ReferenceList("Table", reverse_of="ColId")
+# used for two-way references.
 SchemaTable = namedtuple('SchemaTable', ('tableId', 'columns'))
-SchemaColumn = namedtuple('SchemaColumn', ('colId', 'type', 'isFormula', 'formula'))
+SchemaColumn = namedtuple('SchemaColumn', ('colId', 'type', 'isFormula', 'formula', 'reverseColId'))
 
 # Helpers to convert between schema structures and dicts used in schema actions.
 def dict_to_col(col, col_id=None):
   """Convert dict as used in AddColumn/AddTable actions to a SchemaColumn object."""
-  return SchemaColumn(col_id or col["id"], col["type"], bool(col["isFormula"]), col["formula"])
+  return SchemaColumn(col_id or col["id"], col["type"], bool(col["isFormula"]), col["formula"],
+      col.get("reverseColId"))
 
-def col_to_dict(col, include_id=True):
-  """Convert SchemaColumn to dict to use in AddColumn/AddTable actions."""
+def col_to_dict(col, include_id=True, include_default=False):
+  """
+  Convert SchemaColumn to dict to use in AddColumn/AddTable actions.
+  Set include_default=True to include default values explicitly, e.g. override previous values.
+  """
   ret = {"type": col.type, "isFormula": col.isFormula, "formula": col.formula}
+  if col.reverseColId or include_default:
+    ret["reverseColId"] = col.reverseColId
   if include_id:
     ret["id"] = col.colId
   return ret
@@ -358,6 +417,14 @@ def cols_to_dict_list(cols):
 def clone_schema(schema):
   return OrderedDict((t, SchemaTable(s.tableId, s.columns.copy()))
                      for (t, s) in six.iteritems(schema))
+
+def get_reverse_col_id_lookup_func(collist):
+  """
+  Given a list of _grist_Tables_column records, return a function that takes a record and
+  returns its reverseColId.
+  """
+  col_ref_to_col_id = {c.id: c.colId for c in collist}
+  return lambda c: col_ref_to_col_id.get(getattr(c, 'reverseCol', 0))
 
 def build_schema(meta_tables, meta_columns, include_builtin=True):
   """
@@ -378,8 +445,12 @@ def build_schema(meta_tables, meta_columns, include_builtin=True):
                    key=lambda c: (c.parentId, c.parentPos))
   coldict = {t: list(cols) for t, cols in itertools.groupby(collist, lambda r: r.parentId)}
 
+  # Translate reverseCol in metadata to reverseColId in schema structure.
+  reverse_col_id = get_reverse_col_id_lookup_func(collist)
+
   for t in actions.transpose_bulk_action(meta_tables):
-    columns = OrderedDict((c.colId, SchemaColumn(c.colId, c.type, bool(c.isFormula), c.formula))
-                          for c in coldict[t.id])
+    columns = OrderedDict(
+        (c.colId, SchemaColumn(c.colId, c.type, bool(c.isFormula), c.formula, reverse_col_id(c)))
+        for c in coldict[t.id])
     schema[t.tableId] = SchemaTable(t.tableId, columns)
   return schema

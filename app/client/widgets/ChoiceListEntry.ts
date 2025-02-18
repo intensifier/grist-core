@@ -1,12 +1,12 @@
 import {IToken, TokenField} from 'app/client/lib/TokenField';
-import {cssBlockedCursor} from 'app/client/ui/RightPanel';
+import {cssBlockedCursor} from 'app/client/ui/RightPanelStyles';
 import {basicButton, primaryButton} from 'app/client/ui2018/buttons';
 import {colorButton, ColorOption} from 'app/client/ui2018/ColorSelect';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {testId, theme} from 'app/client/ui2018/cssVars';
 import {editableLabel} from 'app/client/ui2018/editableLabel';
 import {icon} from 'app/client/ui2018/icons';
 import {ChoiceOptionsByName, IChoiceOptions} from 'app/client/widgets/ChoiceTextBox';
-import {Computed, Disposable, dom, DomContents, DomElementArg, Holder, Observable, styled} from 'grainjs';
+import {Computed, Disposable, dom, DomContents, DomElementArg, Holder, MultiHolder, Observable, styled} from 'grainjs';
 import {createCheckers, iface, ITypeSuite, opt, union} from 'ts-interface-checker';
 import isEqual = require('lodash/isEqual');
 import uniqBy = require('lodash/uniqBy');
@@ -91,11 +91,15 @@ export class ChoiceListEntry extends Disposable {
   private _isEditing: Observable<boolean> = Observable.create(this, false);
   private _tokenFieldHolder: Holder<TokenField<ChoiceItem>> = Holder.create(this);
 
+  private _editorContainer: HTMLElement | null = null;
+  private _editorSaveButtons: HTMLElement | null = null;
+
   constructor(
     private _values: Observable<string[]>,
     private _choiceOptionsByName: Observable<ChoiceOptionsByName>,
     private _onSave: (values: string[], choiceOptions: ChoiceOptionsByName, renames: Record<string, string>) => void,
-    private _disabled: Observable<boolean>
+    private _disabled: Observable<boolean>,
+    private _mixed: Observable<boolean>,
   ) {
     super();
 
@@ -104,16 +108,24 @@ export class ChoiceListEntry extends Disposable {
     this.autoDispose(this._values.addListener(() => {
       this._cancel();
     }));
+
+    this.onDispose(() => {
+      if (!this._isEditing.get()) { return; }
+
+      this._save();
+    });
   }
 
   // Arg maxRows indicates the number of rows to display when the editor is inactive.
   public buildDom(maxRows: number = 6): DomContents {
     return dom.domComputed(this._isEditing, (editMode) => {
       if (editMode) {
+        // If we have mixed values, we can't show any options on the editor.
+        const initialValue = this._mixed.get() ? [] : this._values.get().map(label => {
+          return new ChoiceItem(label, label, this._choiceOptionsByName.get().get(label));
+        });
         const tokenField = TokenField.ctor<ChoiceItem>().create(this._tokenFieldHolder, {
-          initialValue: this._values.get().map(label => {
-            return new ChoiceItem(label, label, this._choiceOptionsByName.get().get(label));
-          }),
+          initialValue,
           renderToken: token => this._renderToken(token),
           createToken: label => new ChoiceItem(label, null),
           clipboardToTokens: clipboardToChoices,
@@ -134,14 +146,42 @@ export class ChoiceListEntry extends Disposable {
         });
 
         return cssVerticalFlex(
-          cssListBox(
+          this._editorContainer = cssListBox(
+            {tabIndex: '-1'},
             elem => {
               tokenField.attach(elem);
               this._focusOnOpen(tokenField.getTextInput());
             },
+            dom.on('focusout', (ev) => {
+              const hasActiveElement = (
+                element: Element | null,
+                activeElement = document.activeElement
+              ) => {
+                return element?.contains(activeElement);
+              };
+
+              // Save and close the editor when it loses focus.
+              setTimeout(() => {
+                // The editor may have already been closed via keyboard shortcut.
+                if (!this._isEditing.get()) { return; }
+
+                if (
+                  // Don't close if focus hasn't left the editor.
+                  hasActiveElement(this._editorContainer) ||
+                  // Or if the token color picker has focus.
+                  hasActiveElement(document.querySelector('.token-color-picker')) ||
+                  // Or if Save or Cancel was clicked.
+                  hasActiveElement(this._editorSaveButtons, ev.relatedTarget as Element | null)
+                ) {
+                  return;
+                }
+
+                this._save();
+              }, 0);
+            }),
             testId('choice-list-entry')
           ),
-          cssButtonRow(
+          this._editorSaveButtons = cssButtonRow(
             primaryButton('Save',
               dom.on('click', () => this._save() ),
               testId('choice-list-entry-save')
@@ -151,61 +191,71 @@ export class ChoiceListEntry extends Disposable {
               testId('choice-list-entry-cancel')
             )
           ),
-          dom.onKeyDown({Escape$: () => this._cancel()}),
-          dom.onKeyDown({Enter$: () => this._save()}),
+          dom.onKeyDown({Escape: () => this._cancel()}),
+          dom.onKeyDown({Enter: () => this._save()}),
         );
       } else {
-        const someValues = Computed.create(null, this._values, (_use, values) =>
+        const holder = new MultiHolder();
+        const someValues = Computed.create(holder, this._values, (_use, values) =>
           values.length <= maxRows ? values : values.slice(0, maxRows - 1));
+        const noChoices = Computed.create(holder, someValues, (_use, values) => values.length === 0);
+
 
         return cssVerticalFlex(
-          cssListBoxInactive(
-            dom.cls(cssBlockedCursor.className, this._disabled),
-            dom.autoDispose(someValues),
-            dom.maybe(use => use(someValues).length === 0, () =>
-              row('No choices configured')
-            ),
-            dom.domComputed(this._choiceOptionsByName, (choiceOptions) =>
-              dom.forEach(someValues, val => {
-                return row(
-                  cssTokenColorInactive(
-                    dom.style('background-color', getFillColor(choiceOptions.get(val)) || '#FFFFFF'),
-                    dom.style('color', getTextColor(choiceOptions.get(val)) || '#000000'),
-                    dom.cls('font-bold', choiceOptions.get(val)?.fontBold ?? false),
-                    dom.cls('font-underline', choiceOptions.get(val)?.fontUnderline ?? false),
-                    dom.cls('font-italic', choiceOptions.get(val)?.fontItalic ?? false),
-                    dom.cls('font-strikethrough', choiceOptions.get(val)?.fontStrikethrough ?? false),
-                    'T',
-                    testId('choice-list-entry-color')
-                  ),
-                  cssTokenLabel(
-                    val,
-                    testId('choice-list-entry-label')
+          dom.autoDispose(holder),
+          dom.maybe(this._mixed, () => [
+            cssListBoxInactive(
+              dom.cls(cssBlockedCursor.className, this._disabled),
+              row('Mixed configuration')
+            )
+          ]),
+          dom.maybe(use => !use(this._mixed), () => [
+            cssListBoxInactive(
+              dom.cls(cssBlockedCursor.className, this._disabled),
+              dom.maybe(noChoices, () => row('No choices configured')),
+              dom.domComputed(this._choiceOptionsByName, (choiceOptions) =>
+                dom.forEach(someValues, val => {
+                  return row(
+                    cssTokenColorInactive(
+                      dom.style('background-color', getFillColor(choiceOptions.get(val)) || '#FFFFFF'),
+                      dom.style('color', getTextColor(choiceOptions.get(val)) || '#000000'),
+                      dom.cls('font-bold', choiceOptions.get(val)?.fontBold ?? false),
+                      dom.cls('font-underline', choiceOptions.get(val)?.fontUnderline ?? false),
+                      dom.cls('font-italic', choiceOptions.get(val)?.fontItalic ?? false),
+                      dom.cls('font-strikethrough', choiceOptions.get(val)?.fontStrikethrough ?? false),
+                      'T',
+                      testId('choice-list-entry-color')
+                    ),
+                    cssTokenLabel(
+                      val,
+                      testId('choice-list-entry-label')
+                    )
+                  );
+                }),
+              ),
+              // Show description row for any remaining rows
+              dom.maybe(use => use(this._values).length > maxRows, () =>
+                row(
+                  dom('span',
+                    testId('choice-list-entry-label'),
+                    dom.text((use) => `+${use(this._values).length - (maxRows - 1)} more`)
                   )
-                );
-              }),
-            ),
-            // Show description row for any remaining rows
-            dom.maybe(use => use(this._values).length > maxRows, () =>
-              row(
-                dom('span',
-                  testId('choice-list-entry-label'),
-                  dom.text((use) => `+${use(this._values).length - (maxRows - 1)} more`)
                 )
-              )
+              ),
+              dom.on('click', () => this._startEditing()),
+              cssListBoxInactive.cls("-disabled", this._disabled),
+              testId('choice-list-entry')
             ),
-            dom.on('click', () => this._startEditing()),
-            cssListBoxInactive.cls("-disabled", this._disabled),
-            testId('choice-list-entry')
-          ),
-          dom.maybe(use => !use(this._disabled), () =>
+          ]),
+          dom.maybe(use => !use(this._disabled), () => [
             cssButtonRow(
-              primaryButton('Edit',
+              primaryButton(
+                dom.text(use => use(this._mixed) ? 'Reset' : 'Edit'),
                 dom.on('click', () => this._startEditing()),
                 testId('choice-list-entry-edit')
-              )
-            )
-          )
+              ),
+            ),
+          ]),
         );
       }
     });
@@ -297,33 +347,41 @@ export class ChoiceListEntry extends Disposable {
       dom.autoDispose(fillColorObs),
       dom.autoDispose(textColorObs),
       dom.autoDispose(choiceText),
-      colorButton({
-          textColor: new ColorOption(textColorObs, false, '#000000'),
-          fillColor: new ColorOption(fillColorObs, true, '', 'none', '#FFFFFF'),
-          fontBold: fontBoldObs,
-          fontItalic: fontItalicObs,
-          fontUnderline: fontUnderlineObs,
-          fontStrikethrough: fontStrikethroughObs
-        },
-        async () => {
-          const tokenField = this._tokenFieldHolder.get();
-          if (!tokenField) { return; }
+      colorButton(
+        {
+          styleOptions: {
+            textColor: new ColorOption({color: textColorObs, defaultColor: '#000000'}),
+            fillColor: new ColorOption(
+              {color: fillColorObs, allowsNone: true, noneText: 'none', defaultColor: '#FFFFFF'}),
+            fontBold: fontBoldObs,
+            fontItalic: fontItalicObs,
+            fontUnderline: fontUnderlineObs,
+            fontStrikethrough: fontStrikethroughObs
+          },
+          onSave: async () => {
+            const tokenField = this._tokenFieldHolder.get();
+            if (!tokenField) { return; }
 
-          const fillColor = fillColorObs.get();
-          const textColor = textColorObs.get();
-          const fontBold = fontBoldObs.get();
-          const fontItalic = fontItalicObs.get();
-          const fontUnderline = fontUnderlineObs.get();
-          const fontStrikethrough = fontStrikethroughObs.get();
-          tokenField.replaceToken(token.label, ChoiceItem.from(token).changeStyle({
-            fillColor,
-            textColor,
-            fontBold,
-            fontItalic,
-            fontUnderline,
-            fontStrikethrough,
-          }));
-        }
+            const fillColor = fillColorObs.get();
+            const textColor = textColorObs.get();
+            const fontBold = fontBoldObs.get();
+            const fontItalic = fontItalicObs.get();
+            const fontUnderline = fontUnderlineObs.get();
+            const fontStrikethrough = fontStrikethroughObs.get();
+            tokenField.replaceToken(token.label, ChoiceItem.from(token).changeStyle({
+              fillColor,
+              textColor,
+              fontBold,
+              fontItalic,
+              fontUnderline,
+              fontStrikethrough,
+            }));
+          },
+          onClose: () => this._editorContainer?.focus(),
+          colorPickerDomArgs: [
+            dom.cls('token-color-picker'),
+          ],
+        },
       ),
       editableLabel(choiceText, {
         save: rename,
@@ -421,20 +479,20 @@ const cssListBox = styled('div', `
   line-height: 1.5;
   padding-left: 4px;
   padding-right: 4px;
-  border: 1px solid ${colors.hover};
+  border: 1px solid ${theme.choiceEntryBorderHover};
   border-radius: 4px;
-  background-color: white;
+  background-color: ${theme.choiceEntryBg};
 `);
 
 const cssListBoxInactive = styled(cssListBox, `
   cursor: pointer;
-  border: 1px solid ${colors.darkGrey};
+  border: 1px solid ${theme.choiceEntryBorder};
 
   &:hover:not(&-disabled) {
-    border: 1px solid ${colors.hover};
+    border: 1px solid ${theme.choiceEntryBorderHover};
   }
   &-disabled {
-    opacity: 0.6;
+    opacity: 0.4;
   }
 `);
 
@@ -443,8 +501,8 @@ const cssListRow = styled('div', `
   margin-top: 4px;
   margin-bottom: 4px;
   padding: 4px 8px;
-  color: ${colors.dark};
-  background-color: ${colors.mediumGrey};
+  color: ${theme.choiceTokenFg};
+  background-color: ${theme.choiceTokenBg};
   border-radius: 3px;
   text-overflow: ellipsis;
 `);
@@ -463,7 +521,7 @@ const cssToken = styled(cssListRow, `
   cursor: grab;
 
   &.selected {
-    background-color: ${colors.darkGrey};
+    background-color: ${theme.choiceTokenSelectedBg};
   }
   &.token-dragging {
     pointer-events: none;
@@ -509,6 +567,7 @@ const cssEditableLabel = styled('div', `
 `);
 
 const cssTokenInput = styled('input', `
+  background-color: ${theme.choiceEntryBg};
   padding-top: 4px;
   padding-bottom: 4px;
   overflow: hidden;
@@ -546,7 +605,6 @@ const cssButtonRow = styled('div', `
   gap: 8px;
   display: flex;
   margin-top: 8px;
-  margin-bottom: 16px;
 `);
 
 const cssDeleteButton = styled('div', `
@@ -560,8 +618,9 @@ const cssDeleteButton = styled('div', `
 `);
 
  const cssDeleteIcon = styled(icon, `
-   --icon-color: ${colors.slate};
+   --icon-color: ${theme.text};
+   opacity: 0.6;
    &:hover {
-     --icon-color: ${colors.dark};
+     opacity: 1.0;
    }
  `);

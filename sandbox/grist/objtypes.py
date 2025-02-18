@@ -15,9 +15,12 @@ import traceback
 from datetime import date, datetime
 from math import isnan
 
+import six
+
+import friendly_errors
 import moment
 import records
-import six
+import depend
 
 
 class UnmarshallableError(ValueError):
@@ -118,10 +121,8 @@ class CensoredValue(object):
 _censored_sentinel = CensoredValue()
 
 
-_max_js_int = 1<<31
-
 def is_int_short(value):
-  return -_max_js_int <= value < _max_js_int
+  return -(1<<31) <= value < (1<<31)
 
 def safe_shift(arg, default=None):
   value = arg.pop(0) if arg else None
@@ -166,15 +167,26 @@ def encode_object(value):
   Produces a Grist-encoded version of the value, e.g. turning a Date into ['d', timestamp].
   Returns ['U', repr(value)] if it fails to encode otherwise.
   """
+  # pylint: disable=unidiomatic-typecheck
   try:
-    if isinstance(value, (six.text_type, float, bool)) or value is None:
+    # A primitive type can be returned directly.
+    if type(value) in (six.text_type, float, bool) or value is None:
       return value
+    # Other instances of these types must be derived; cast these to the primitive type to ensure
+    # they are marshallable.
+    elif isinstance(value, six.text_type):
+      return six.text_type(value)
+    elif isinstance(value, float):
+      return float(value)
+    elif isinstance(value, bool):
+      return bool(value)
     elif isinstance(value, six.binary_type):
       return value.decode('utf8')
     elif isinstance(value, six.integer_types):
       if not is_int_short(value):
-        raise UnmarshallableError("Integer too large")
-      return value
+        return ['U', str(value)]
+      # Cast to a primitive type to ensure it's marshallable (e.g. enum.IntEnum would not be).
+      return int(value)
     elif isinstance(value, AltText):
       return six.text_type(value)
     elif isinstance(value, records.Record):
@@ -306,6 +318,10 @@ class RaisedException(object):
     if include_details:
       self.details = traceback.format_exc()
       self._message = str(error) + location
+      if not (isinstance(error, (SyntaxError, depend.CircularRefError)) or error != self.error):
+        # For SyntaxError, the friendly message was already added earlier.
+        # CircularRefError and CellError are Grist-specific and have no friendly message.
+        self._message += friendly_errors.friendly_message(error)
     elif isinstance(error, InvalidTypedValue):
       self._message = error.typename
       self.details = error.value
@@ -357,18 +373,32 @@ class CellError(Exception):
 
 class RecordList(list):
   """
+  A static method to recreate a RecordList from the output of __repr__.
+  It only restores the row_ids. The group_by and sort_by attributes are not restored.
+  """
+  @staticmethod
+  def from_repr(repr_str):
+    if not repr_str.startswith('RecordList(['):
+      raise ValueError("Invalid RecordList representation")
+    # This is a string representation of a RecordList, which we can parse.
+    # > RecordList([1,2,3], group_by=%r, sort_by=%r)
+    # Match only rows, as group_by and sort_by are not used and can be stale.
+    numbers = repr_str.split('[')[1].split(']')[0].split(',')
+    return RecordList([int(v) for v in numbers])
+
+  """
   Just like list but allows setting custom attributes, which we use for remembering _group_by and
   _sort_by attributes when storing RecordSet as usertypes.ReferenceList type.
   """
-  def __init__(self, row_ids, group_by=None, sort_by=None):
+  def __init__(self, row_ids, group_by=None, sort_by=None, sort_key=None):
     list.__init__(self, row_ids)
-    self._group_by = group_by
-    self._sort_by = sort_by
+    self._group_by = group_by       # None or a tuple of col_ids
+    self._sort_by = sort_by         # None or a tuple of col_ids, optionally prefixed with "-"
+    self._sort_key = sort_key       # Comparator function (see sort_key.py)
 
   def __repr__(self):
     return "RecordList(%s, group_by=%r, sort_by=%r)" % (
       list.__repr__(self), self._group_by, self._sort_by)
-
 
 
 # We don't currently have a good way to convert an incoming marshalled record to a proper Record

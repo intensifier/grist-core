@@ -4,13 +4,14 @@
 from __future__ import absolute_import
 import datetime
 import hashlib
-import json
+import json as json_module
 import math
 import numbers
 import re
 
 import chardet
 import six
+from six.moves import urllib_parse
 
 import column
 import docmodel
@@ -256,7 +257,8 @@ _email_regexp = re.compile(
   ([A-Za-z0-9]                    # Each part of hostname must start with alphanumeric
     ([A-Za-z0-9-]*[A-Za-z0-9])?\. # May have dashes inside, but end in alphanumeric
   )+
-  [A-Za-z]{2,6}$                  # Restrict top-level domain to length {2,6}. Google seems
+  [A-Za-z]{2,24}$                 # Restrict top-level domain to length {2,24} (theoretically,
+                                  # the max length is 63 bytes as per RFC 1034). Google seems
                                   # to use a whitelist for TLDs longer than 2 characters.
   """, re.UNICODE | re.VERBOSE)
 
@@ -288,7 +290,8 @@ def ISEMAIL(value):
   >>> ISEMAIL("john@aol...com")
   False
 
-  More tests:
+  More tests:                                             Google Sheets   Grist
+                                                          -------------   -----
   >>> ISEMAIL("Abc@example.com")                              # True,     True
   True
   >>> ISEMAIL("Abc.123@example.com")                          # True,     True
@@ -313,6 +316,10 @@ def ISEMAIL(value):
   True
   >>> ISEMAIL("Bob_O'Reilly+tag@example.com")                 # False,    True
   True
+  >>> ISEMAIL("marie@isola.corsica")                          # False,    True
+  True
+  >>> ISEMAIL("fabio@disapproved.solutions")                  # False,    True
+  True
   >>> ISEMAIL(u"фыва@mail.ru")                                # False,    True
   True
   >>> ISEMAIL("my@baddash.-.com")                             # True,     False
@@ -322,8 +329,6 @@ def ISEMAIL(value):
   >>> ISEMAIL("my@baddash.b-.com")                            # True,     False
   False
   >>> ISEMAIL("john@-.com")                                   # True,     False
-  False
-  >>> ISEMAIL("fabio@disapproved.solutions")                  # False,    False
   False
   >>> ISEMAIL("!def!xyz%abc@example.com")                     # False,    False
   False
@@ -390,7 +395,8 @@ _url_regexp = re.compile(
   ([A-Za-z0-9]                    # Each part of hostname must start with alphanumeric
     ([A-Za-z0-9-]*[A-Za-z0-9])?\. # May have dashes inside, but end in alphanumeric
   )+
-  [A-Za-z]{2,6}                   # Restrict top-level domain to length {2,6}. Google seems
+  [A-Za-z]{2,24}                  # Restrict top-level domain to length {2,24} (theoretically,
+                                  # the max length is 63 bytes as per RFC 1034). Google seems
                                   # to use a whitelist for TLDs longer than 2 characters.
   ([/?][-\w!#$%&'()*+,./:;=?@~]*)?$ # Notably, this excludes <, >, and ".
   """, re.VERBOSE)
@@ -435,6 +441,8 @@ def ISURL(value):
   >>> ISURL("http://user@www.google.com")
   True
   >>> ISURL("http://foo.com/!#$%25&'()*+,-./=?@_~")
+  True
+  >>> ISURL("http://collectivite.isla.corsica")
   True
   >>> ISURL("http://../")
   False
@@ -502,14 +510,6 @@ def N(value):
   if isinstance(value, datetime.date):
     return date.DATE_TO_XL(value)
   return 0
-
-
-def CURRENT_CONVERSION(rec):
-  """
-  Internal function used by Grist during column type conversions. Not available for use in
-  formulas.
-  """
-  return rec.gristHelper_Converted
 
 
 def NA():
@@ -661,16 +661,70 @@ def is_error(value):
       or (isinstance(value, float) and math.isnan(value)))
 
 
-@unimplemented  # exclude from autocomplete while in beta
-def REQUEST(url, params=None, headers=None):
-  # Makes a GET HTTP request with an API similar to `requests.get`.
+def _replicate_requests_body_args(data=None, json=None):
+  """
+  Replicate some of the behaviour of requests.post, specifically the data and 
+  json args.
+
+  Returns a tuple of (body, extra_headers)
+  """
+  if data is None and json is None:
+      return None, {}
+
+  elif data is not None and json is None:
+    if isinstance(data, str):
+      body = data
+      extra_headers = {}
+    else:
+      body = urllib_parse.urlencode(data)
+      extra_headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+      }
+    return body, extra_headers
+
+  elif json is not None and data is None:
+    if isinstance(json, str):
+      body = json
+    else:
+      body = json_module.dumps(json)
+    extra_headers = {
+      "Content-Type": "application/json",
+    }
+    return body, extra_headers
+
+  elif data is not None and json is not None:
+    # From testing manually with requests 2.28.2, data overrides json if both
+    # supplied. However, this is probably a mistake on behalf of the caller, so
+    # we choose to throw an error instead
+    raise ValueError("`data` and `json` cannot be supplied to REQUEST at the same time")
+
+
+@unimplemented
+# ^ This excludes this function from autocomplete while in beta
+# and marks it as unimplemented in the docs.
+# It also makes grist-help expect to see the string 'raise NotImplemented' in the function source,
+# which it does now, because of this comment. Removing this comment will currently break the docs.
+def REQUEST(url, params=None, headers=None, method="GET", data=None, json=None):
+  # Makes an HTTP request with an API similar to `requests.request`.
   # Actually jumps through hoops internally to make the request asynchronously (usually)
   # while feeling synchronous to the formula writer.
 
+  # When making a POST or PUT request, REQUEST supports `data` and `json` args, from `requests.request`:
+  #   - `args` as str: Used as the request body
+  #   - `args` as other types: Form encoded and used as the request body. The correct header is also set.
+  #   - `json` as str: Used as the request body. The correct header is also set.
+  #   - `json` as other types: JSON encoded and set as the request body. The correct header is also set.
+  body, _headers = _replicate_requests_body_args(data=data, json=json)
+
+  # Extra headers that make us consistent with requests.post must not override
+  # user-supplied headers.
+  _headers.update(headers or {})
+
   # Requests are identified by a string key in various places.
   # The same arguments should produce the same key so the request is only made once.
-  args = dict(url=url, params=params, headers=headers)
-  args_json = json.dumps(args, sort_keys=True)
+  args = dict(url=url, params=params, headers=_headers, method=method, body=body)
+
+  args_json = json_module.dumps(args, sort_keys=True)
   key = hashlib.sha256(args_json.encode()).hexdigest()
 
   # This may either return the raw response data or it may raise a special exception
@@ -693,19 +747,19 @@ class Response(object):
   """
   Similar to the Response class from the `requests` library.
   """
-  def __init__(self, content, status, statusText, headers, encoding):
+  def __init__(self, content, status, statusText, headers, encoding=None):
     self.content = content  # raw bytes
     self.status_code = status  # e.g. 404
     self.reason = statusText  # e.g. "Not Found"
     self.headers = CaseInsensitiveDict(headers)
-    self.encoding = encoding or self.apparent_encoding
+    self.encoding = encoding or self.apparent_encoding or "utf-8"
 
   @property
   def text(self):
     return self.content.decode(self.encoding)
 
   def json(self, **kwargs):
-    return json.loads(self.text, **kwargs)
+    return json_module.loads(self.text, **kwargs)
 
   @property
   def ok(self):

@@ -13,12 +13,14 @@ the following fields:
 
  - Access: string or None
  - UserID: integer or None
+ - UserRef: string or None
  - Email: string or None
  - Name: string or None
  - Origin: string or None
  - LinkKey: dictionary
  - SessionID: string or None
  - IsLoggedIn: boolean
+ - ShareRef: integer or None
 
 Additional keys may be included, which may have a value that is
 either None or of type tuple with the following shape:
@@ -43,7 +45,7 @@ class User(object):
   """
   def __init__(self, data, tables, is_sample=False):
     for attr in ('Access', 'UserID', 'Email', 'Name', 'Origin', 'SessionID',
-                 'IsLoggedIn'):
+                 'IsLoggedIn', 'UserRef', 'ShareRef'):
       setattr(self, attr, data[attr])
 
     self.LinkKey = LinkKey(data['LinkKey'])

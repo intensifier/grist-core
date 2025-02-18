@@ -3,16 +3,18 @@ Test of Summary tables. This has many test cases, so to keep files smaller, it's
 files: test_summary.py and test_summary2.py.
 """
 
+import logging
+import unittest
+
 import actions
-import logger
 import summary
-import testutil
 import test_engine
+import testutil
+import useractions
+from test_engine import Table, Column, View, Section, Field
 from useractions import allowed_summary_change
 
-from test_engine import Table, Column, View, Section, Field
-
-log = logger.Logger(__name__, logger.INFO)
+log = logging.getLogger(__name__)
 
 
 class TestSummary(test_engine.EngineTestCase):
@@ -73,6 +75,7 @@ class TestSummary(test_engine.EngineTestCase):
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_create_view_section(self):
     self.load_sample(self.sample)
 
@@ -245,6 +248,7 @@ class Address:
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_summary_table_reuse(self):
     # Test that we'll reuse a suitable summary table when already available.
 
@@ -316,6 +320,7 @@ class Address:
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_summary_no_invalid_reuse(self):
     # Verify that if we have some summary tables for one table, they don't mistakenly get used
     # when we need a summary for another table.
@@ -399,6 +404,7 @@ class Address:
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_summary_updates(self):
     # Verify that summary tables update automatically when we change a value used in a summary
     # formula; or a value in a group-by column; or add/remove a record; that records get
@@ -499,6 +505,28 @@ class Address:
       ]
     })
 
+    # Add a new source record which creates a new summary row,
+    # then delete the source row which implicitly deletes the summary row.
+    # Overall this is a no-op, but it tests a specific undo-related bugfix.
+    self.add_record(source_tbl_name, city="Nowhere", state="??", amount=666)
+    out_actions = self.remove_record(source_tbl_name, 34)
+    self.assertOutActions(out_actions, {
+      'calc': [],
+      'direct': [True, False],
+      'stored': [
+        ['RemoveRecord', source_tbl_name, 34],
+        ['RemoveRecord', summary_tbl_name, 12],
+      ],
+      'undo': [
+        ['UpdateRecord', summary_tbl_name, 12, {'group': ['L', 34]}],
+        ['UpdateRecord', summary_tbl_name, 12, {'count': 1}],
+        ['UpdateRecord', summary_tbl_name, 12, {'amount': 666.0}],
+        ['AddRecord', source_tbl_name, 34, {'amount': 666.0, 'city': 'Nowhere', 'state': '??'}],
+        ['AddRecord', summary_tbl_name, 12,
+         {'city': 'Nowhere', 'group': ['L'], 'state': '??'}],
+      ],
+    })
+
     # Verify the resulting data after all the updates.
     self.assertTableData(summary_tbl_name, cols="subset", data=[
       [ "id", "city",     "state", "count", "amount"  ],
@@ -516,6 +544,7 @@ class Address:
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_table_rename(self):
     # Verify that summary tables keep working and updating when source table is renamed.
 
@@ -529,6 +558,13 @@ class Address:
       [2, "Address_summary_city_state",   1],
     ])
 
+    # Add a column to the summary table with a name that doesn't exist in the source table,
+    # to test a specific bug fix.
+    self.add_column(
+      "Address_summary_city_state", "lookup",
+      formula="Address.lookupRecords(city=$city)", isFormula=True
+    )
+
     # Rename the table: this is what we are really testing in this test case.
     self.apply_user_action(["RenameTable", "Address", "Location"])
 
@@ -537,11 +573,20 @@ class Address:
       [2, "Location_summary_city_state",   1],
     ])
 
+    # Check that the summary table column's formula was updated correctly.
+    self.assertTableData("_grist_Tables_column", cols="subset", rows="subset", data=[
+      ["id", "colId", "formula"],
+      [19, "lookup", "Location.lookupRecords(city=$city)"],
+    ])
+    # This column isn't expected in _do_test_updates().
+    self.remove_column("Location_summary_city_state", "lookup")
+
     # Verify that the bigger summary table respects all updates to the renamed source table.
     self._do_test_updates("Location", "Location_summary_city_state")
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_table_rename_multiple(self):
     # Similar to the above, verify renames, but now with two summary tables.
 
@@ -581,6 +626,7 @@ class Address:
 
   #----------------------------------------------------------------------
 
+  @test_engine.test_undo
   def test_change_summary_formula(self):
     # Verify that changing a summary formula affects all group-by variants, and adding a new
     # summary table gets the changed formula.
@@ -691,6 +737,7 @@ class Address:
     ])
 
   #----------------------------------------------------------------------
+  @test_engine.test_undo
   def test_convert_source_column(self):
     # Verify that we can convert the type of a column when there is a summary table using that
     # column to group by. Since converting generates extra summary records, this may cause bugs.
@@ -826,6 +873,57 @@ class Address:
       [ 2,    2.0,  [3],      1,        6   ],
     ])
 
+  def test_remove_source_columns_with_display_column(self):
+    # Verify a fix for a specific bug: removing multiple groupby source columns
+    # when the summary table contains a display column.
+
+    self.apply_user_action(["AddEmptyTable", None])
+    # Group by A and B
+    self.apply_user_action(["CreateViewSection", 1, 0, "record", [2,3], None])
+    # Add a display column for the group column
+    self.apply_user_action(['SetDisplayFormula', 'Table1_summary_A_B', None, 7, '$group.C'])
+
+    # Verify metadata and initially.
+    self.assertTables([
+      Table(1, "Table1", summarySourceTable=0, primaryViewId=1, columns=[
+        Column(1, "manualSort", "ManualSortPos",  False,  "", 0),
+        Column(2, "A",          "Any",        True,  "", 0),
+        Column(3, "B",          "Any",        True,  "", 0),
+        Column(4, "C",          "Any",        True,  "", 0),
+      ]),
+      Table(2, "Table1_summary_A_B", summarySourceTable=1, primaryViewId=0, columns=[
+        Column(5, "A",          "Any",            False, "", 2),
+        Column(6, "B",          "Any",            False, "", 3),
+        Column(7, "group",      "RefList:Table1", True,  "table.getSummarySourceGroup(rec)", 0),
+        Column(8, "count",      "Int",            True,  "len($group)", 0),
+        Column(9, "gristHelper_Display", "Any",   True,  "$group.C", 0),
+      ])
+    ])
+
+    user_actions = [
+      useractions.from_repr(ua) for ua in
+      [
+        ['RemoveColumn', 'Table1', 'A'],
+        ['RemoveColumn', 'Table1', 'B'],
+      ]
+    ]
+    self.engine.apply_user_actions(user_actions)
+
+    # Verify that the final structure is as expected.
+    self.assertTables([
+      Table(1, "Table1", summarySourceTable=0, primaryViewId=1, columns=[
+        Column(1, "manualSort", "ManualSortPos",  False,  "", 0),
+        Column(4, "C",          "Any",        True,  "", 0),
+      ]),
+      # Table1_summary_A_B was removed and recreated as Table1_summary.
+      # This removed Table1_summary_A_B.group which automatically removed gristHelper_Display
+      # which led to an error in the past.
+      Table(4, "Table1_summary", summarySourceTable=1, primaryViewId=0, columns=[
+        Column(14, "group",      "RefList:Table1", True,  "table.getSummarySourceGroup(rec)", 0),
+        Column(15, "count",      "Int",            True,  "len($group)", 0),
+      ])
+    ])
+
   #----------------------------------------------------------------------
   # pylint: disable=R0915
   def test_allow_select_by_change(self):
@@ -863,49 +961,49 @@ class Address:
     old = '{"widget":"Spinner","alignment":"center"}'
     self.assertTrue(widgetOptions(new, old))
 
-    # Can update but must leave other options.
-    new = '{"widget":"TextBox","cant":"center"}'
-    old = '{"widget":"Spinner","cant":"center"}'
+    # Can update but must leave choices options.
+    new = '{"widget":"TextBox","choices":"center"}'
+    old = '{"widget":"Spinner","choices":"center"}'
     self.assertTrue(widgetOptions(new, old))
 
     # Can't add protected property when old was empty.
-    new = '{"widget":"TextBox","cant":"new"}'
+    new = '{"widget":"TextBox","choices":"new"}'
     old = None
     self.assertFalse(widgetOptions(new, old))
 
     # Can't remove when there was a protected property.
     new = None
-    old = '{"widget":"TextBox","cant":"old"}'
+    old = '{"widget":"TextBox","choices":"old"}'
     self.assertFalse(widgetOptions(new, old))
 
     # Can't update by omitting.
     new = '{"widget":"TextBox"}'
-    old = '{"widget":"TextBox","cant":"old"}'
+    old = '{"widget":"TextBox","choices":"old"}'
     self.assertFalse(widgetOptions(new, old))
 
     # Can't update by changing.
-    new = '{"widget":"TextBox","cant":"new"}'
-    old = '{"widget":"TextBox","cant":"old"}'
+    new = '{"widget":"TextBox","choices":"new"}'
+    old = '{"widget":"TextBox","choices":"old"}'
     self.assertFalse(widgetOptions(new, old))
 
     # Can't update by adding.
-    new = '{"widget":"TextBox","cant":"new"}'
+    new = '{"widget":"TextBox","choices":"new"}'
     old = '{"widget":"TextBox"}'
     self.assertFalse(widgetOptions(new, old))
 
     # Can update objects
-    new = '{"widget":"TextBox","alignment":{"prop":1},"cant":{"prop":1}}'
-    old = '{"widget":"TextBox","alignment":{"prop":2},"cant":{"prop":1}}'
+    new = '{"widget":"TextBox","alignment":{"prop":1},"choices":{"prop":1}}'
+    old = '{"widget":"TextBox","alignment":{"prop":2},"choices":{"prop":1}}'
     self.assertTrue(widgetOptions(new, old))
 
     # Can't update objects
-    new = '{"widget":"TextBox","cant":{"prop":1}}'
-    old = '{"widget":"TextBox","cant":{"prop":2}}'
+    new = '{"widget":"TextBox","choices":{"prop":1}}'
+    old = '{"widget":"TextBox","choices":{"prop":2}}'
     self.assertFalse(widgetOptions(new, old))
 
     # Can't update lists
-    new = '{"widget":"TextBox","cant":[1, 2]}'
-    old = '{"widget":"TextBox","cant":[2, 1]}'
+    new = '{"widget":"TextBox","choices":[1, 2]}'
+    old = '{"widget":"TextBox","choices":[2, 1]}'
     self.assertFalse(widgetOptions(new, old))
 
     # Can update lists
@@ -914,7 +1012,10 @@ class Address:
     self.assertTrue(widgetOptions(new, old))
 
     # Can update without changing list.
-    new = '{"widget":"TextBox","dontChange":[1, 2]}'
-    old = '{"widget":"Spinner","dontChange":[1, 2]}'
+    new = '{"widget":"TextBox","choices":[1, 2]}'
+    old = '{"widget":"Spinner","choices":[1, 2]}'
     self.assertTrue(widgetOptions(new, old))
   # pylint: enable=R0915
+
+if __name__ == "__main__":
+  unittest.main()

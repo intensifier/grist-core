@@ -2,6 +2,7 @@ import {localStorageObs} from 'app/client/lib/localStorageObs';
 import {AppModel} from 'app/client/models/AppModel';
 import {UserOrgPrefs, UserPrefs} from 'app/common/Prefs';
 import {Computed, Observable} from 'grainjs';
+import {CheckerT} from 'ts-interface-checker';
 
 interface PrefsTypes {
   userOrgPrefs: UserOrgPrefs;
@@ -12,26 +13,31 @@ function makePrefFunctions<P extends keyof PrefsTypes>(prefsTypeName: P) {
   type PrefsType = PrefsTypes[P];
 
   /**
-   * Creates an observable that returns UserOrgPrefs, and which stores them when set.
+   * Creates an observable that returns a PrefsType, and which stores changes when set.
    *
    * For anon user, the prefs live in localStorage. Note that the observable isn't actually watching
    * for changes on the server, it will only change when set.
    */
   function getPrefsObs(appModel: AppModel): Observable<PrefsType> {
-    const savedPrefs = appModel.currentValidUser ? appModel.currentOrg?.[prefsTypeName] : undefined;
-    if (savedPrefs) {
-      const prefsObs = Observable.create<PrefsType>(null, savedPrefs!);
+    if (appModel.currentValidUser) {
+      let prefs: PrefsType | undefined;
+      if (prefsTypeName === 'userPrefs') {
+        prefs = appModel.currentValidUser.prefs;
+      } else {
+        prefs = appModel.currentOrg?.[prefsTypeName];
+      }
+      const prefsObs = Observable.create<PrefsType>(null, prefs ?? {});
       return Computed.create(null, (use) => use(prefsObs))
-        .onWrite(prefs => {
-          prefsObs.set(prefs);
-          return appModel.api.updateOrg('current', {[prefsTypeName]: prefs});
+        .onWrite(newPrefs => {
+          prefsObs.set(newPrefs);
+          return appModel.api.updateOrg('current', {[prefsTypeName]: newPrefs});
         });
     } else {
       const userId = appModel.currentUser?.id || 0;
       const jsonPrefsObs = localStorageObs(`${prefsTypeName}:u=${userId}`);
       return Computed.create(null, jsonPrefsObs, (use, p) => (p && JSON.parse(p) || {}) as PrefsType)
-        .onWrite(prefs => {
-          jsonPrefsObs.set(JSON.stringify(prefs));
+        .onWrite(newPrefs => {
+          jsonPrefsObs.set(JSON.stringify(newPrefs));
         });
     }
   }
@@ -41,10 +47,30 @@ function makePrefFunctions<P extends keyof PrefsTypes>(prefsTypeName: P) {
    * stores it when set.
    */
   function getPrefObs<Name extends keyof PrefsType>(
-    prefsObs: Observable<PrefsType>, prefName: Name
-  ): Observable<PrefsType[Name]> {
-    return Computed.create(null, (use) => use(prefsObs)[prefName])
-    .onWrite(value => prefsObs.set({...prefsObs.get(), [prefName]: value}));
+    prefsObs: Observable<PrefsType>,
+    prefName: Name,
+    options: {
+      defaultValue?: Exclude<PrefsType[Name], undefined>;
+      checker?: CheckerT<PrefsType[Name]>;
+    } = {}
+  ): Observable<PrefsType[Name] | undefined> {
+    const {defaultValue, checker} = options;
+    return Computed.create(null, (use) => {
+      const prefs = use(prefsObs);
+      if (!(prefName in prefs)) { return defaultValue; }
+
+      const value = prefs[prefName];
+      if (checker) {
+        try {
+          checker.check(value);
+        } catch (e) {
+          console.error(`getPrefObs: preference ${prefName.toString()} has value of invalid type`, e);
+          return defaultValue;
+        }
+      }
+
+      return value;
+    }).onWrite(value => prefsObs.set({...prefsObs.get(), [prefName]: value}));
   }
 
   return {getPrefsObs, getPrefObs};
@@ -63,12 +89,16 @@ export const {getPrefsObs: getUserPrefsObs, getPrefObs: getUserPrefObs} = makePr
 // For preferences that store a list of items (such as seen docTours), this helper updates the
 // preference to add itemId to it (e.g. to avoid auto-starting the docTour again in the future).
 // prefKey is used only to log a more informative warning on error.
-export function markAsSeen<T>(seenIdsObs: Observable<T[] | undefined>, itemId: T) {
+export function markAsSeen<T>(seenIdsObs: Observable<T[] | undefined>, itemId: T, isSeen = true) {
   const seenIds = seenIdsObs.get() || [];
   try {
     if (!seenIds.includes(itemId)) {
       const seen = new Set(seenIds);
-      seen.add(itemId);
+      if (isSeen) {
+        seen.add(itemId);
+      } else {
+        seen.delete(itemId);
+      }
       seenIdsObs.set([...seen].sort());
     }
   } catch (e) {

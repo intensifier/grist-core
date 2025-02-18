@@ -81,8 +81,13 @@ settings = {
   "ociVersion": "1.0.0",
   "process": {
     "terminal": include_bash,
+    # Match current user id, for convenience with mounts. For some versions of
+    # gvisor, default behavior may be better - if you see "access denied" problems
+    # during imports, try commenting this section out. We could make imports work
+    # for any version of gvisor by setting mode when using tmp.dir to allow
+    # others to list directory contents.
     "user": {
-      "uid": os.getuid(),  # match current user id, for convenience with mounts
+      "uid": os.getuid(),
       "gid": 0
     },
     "args": cmd_args,
@@ -156,7 +161,12 @@ if include_bash or start:
   preserve("/usr/bin")
 
 preserve("/usr/local/lib")
-if os.path.exists('/lib64'):
+
+# Do not attempt to include symlink directories, they are not supported
+# and will cause obscure failures. On debian bookworm /lib64 is a
+# symlink and we do not appear to need it, relative to debian buster
+# where it is a real directory.
+if os.path.exists('/lib64') and not os.path.islink('/lib64'):
   preserve("/lib64")
 if os.path.exists('/usr/lib64'):
   preserve("/usr/lib64")
@@ -168,9 +178,9 @@ if not include_python2:
   # We expect python3 in /usr/bin or /usr/local/bin.
   candidates = [
     path
-    # Pick the most generic python if not matching python3.9.
+    # Pick the most generic python if not matching python3.11.
     # Sorry this is delicate because of restores, mounts, symlinks.
-    for pattern in ['python3.9', 'python3', 'python3*']
+    for pattern in ['python3.11', 'python3.10', 'python3.9', 'python3', 'python3*']
     for root in ['/usr/local', '/usr']
     for path in glob.glob(f'{root}/bin/{pattern}')
     if os.path.exists(path)

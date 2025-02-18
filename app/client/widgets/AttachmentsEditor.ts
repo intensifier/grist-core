@@ -9,12 +9,12 @@ import {selectFiles, uploadFiles} from 'app/client/lib/uploads';
 import {DocData} from 'app/client/models/DocData';
 import {MetaTableData} from 'app/client/models/TableData';
 import {basicButton, basicButtonLink, cssButtonGroup} from 'app/client/ui2018/buttons';
-import {colors, testId, vars} from 'app/client/ui2018/cssVars';
+import {testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {editableLabel} from 'app/client/ui2018/editableLabel';
 import {icon} from 'app/client/ui2018/icons';
 import {IModalControl, modal} from 'app/client/ui2018/modals';
 import {renderFileType} from 'app/client/widgets/AttachmentsWidget';
-import {NewBaseEditor, Options} from 'app/client/widgets/NewBaseEditor';
+import {FieldOptions, NewBaseEditor} from 'app/client/widgets/NewBaseEditor';
 import {CellValue} from 'app/common/DocActions';
 import {SingleCell} from 'app/common/TableData';
 import {clamp, encodeQueryParams} from 'app/common/gutil';
@@ -48,6 +48,12 @@ interface Attachment {
  * download, add or remove attachments in the edited cell.
  */
 export class AttachmentsEditor extends NewBaseEditor {
+  public static skipEditor(typedVal: CellValue|undefined, origVal: CellValue): CellValue|undefined {
+    if (Array.isArray(typedVal)) {
+      return typedVal;
+    }
+  }
+
   private _attachmentsTable: MetaTableData<'_grist_Attachments'>;
   private _docComm: DocComm;
 
@@ -56,16 +62,16 @@ export class AttachmentsEditor extends NewBaseEditor {
   private _index: LiveIndex;
   private _selected: Computed<Attachment|null>;
 
-  constructor(options: Options) {
+  constructor(options: FieldOptions) {
     super(options);
 
     const docData: DocData = options.gristDoc.docData;
     const cellValue: CellValue = options.cellValue;
-    const cell: SingleCell = {
+    const cell: SingleCell | null = options.rowId ? {
       rowId: options.rowId,
       colId: options.field.colId(),
       tableId: options.field.column().table().tableId(),
-    };
+    } : null;
 
     // editValue is abused slightly to indicate a 1-based index of the attachment.
     const initRowIndex: number|undefined = (options.editValue && parseInt(options.editValue, 0) - 1) || 0;
@@ -198,11 +204,17 @@ export class AttachmentsEditor extends NewBaseEditor {
     att.filename.set(this._attachmentsTable.getValue(att.rowId, 'fileName')!);
   }
 
-  private _getUrl(cell: SingleCell, attId: number, filename: string, inline?: boolean): string {
+  private _getUrl(
+    cell: SingleCell | null,
+    attId: number,
+    filename: string,
+    inline?: boolean
+  ): string {
     return this._docComm.docUrl('attachment') + '?' + encodeQueryParams({
       ...this._docComm.getUrlParams(),
       name: filename,
       ...cell,
+      maybeNew: 1,  // The attachment may be uploaded by the user but not stored in the cell yet.
       attId,
       ...(inline ? {inline: 1} : {})
     });
@@ -308,12 +320,12 @@ const cssCloseButton = styled('div', `
   padding: 6px;
   border-radius: 32px;
   cursor: pointer;
-  background-color: ${colors.light};
-  --icon-color: ${colors.lightGreen};
+  background-color: ${theme.attachmentsEditorButtonBg};
+  --icon-color: ${theme.attachmentsEditorButtonFg};
 
   &:hover {
-    background-color: ${colors.mediumGreyOpaque};
-    --icon-color: ${colors.darkGreen};
+    background-color: ${theme.attachmentsEditorButtonHoverBg};
+    --icon-color: ${theme.attachmentsEditorButtonHoverFg};
   }
 `);
 
@@ -329,10 +341,10 @@ const cssTitle = styled('div', `
   overflow: hidden;
 
   &:hover {
-    outline: 1px solid ${colors.slate};
+    outline: 1px solid ${theme.lightText};
   }
   &:focus-within {
-    outline: 1px solid ${colors.darkGreen};
+    outline: 1px solid ${theme.controlFg};
   }
 `);
 
@@ -355,13 +367,14 @@ const cssFileButtons = styled(cssButtonGroup, `
 `);
 
 const cssButton = styled(basicButton, `
-  background-color: ${colors.light};
+  color: ${theme.attachmentsEditorButtonFg};
+  background-color: ${theme.attachmentsEditorButtonBg};
   font-weight: normal;
   padding: 0 16px;
   border-top: none;
   border-right: none;
   border-bottom: none;
-  border-left: 1px solid ${colors.darkGrey};
+  border-left: 1px solid ${theme.attachmentsEditorButtonBorder};
   display: flex;
   align-items: center;
 
@@ -369,13 +382,14 @@ const cssButton = styled(basicButton, `
     border: none;
   }
   &:hover {
-    background-color: ${colors.mediumGreyOpaque};
-    border-color: ${colors.darkGrey};
+    color: ${theme.attachmentsEditorButtonHoverFg};
+    background-color: ${theme.attachmentsEditorButtonHoverBg};
+    border-color: ${theme.attachmentsEditorButtonBorder};
   }
 `);
 
 const cssButtonIcon = styled(icon, `
-  --icon-color: ${colors.slate};
+  --icon-color: ${theme.attachmentsEditorButtonIcon};
   margin-right: 4px;
 `);
 
@@ -390,11 +404,11 @@ const cssNextArrow = styled('div', `
   padding: 6px;
   border-radius: 32px;
   cursor: pointer;
-  background-color: ${colors.lightGreen};
-  --icon-color: ${colors.light};
+  background-color: ${theme.controlPrimaryBg};
+  --icon-color: ${theme.controlPrimaryFg};
 
   &:hover {
-    background-color: ${colors.darkGreen};
+    background-color: ${theme.controlPrimaryHoverBg};
   }
   &-left {
     transform: rotateY(180deg);
@@ -446,7 +460,7 @@ const cssDetails = styled('div', `
 `);
 
 const cssDragArea = styled(cssContent, `
-  border: 2px dashed ${colors.mediumGreyOpaque};
+  border: 2px dashed ${theme.attachmentsEditorBorder};
   height: calc(100% - 96px);
   margin-top: 64px;
   padding: 0px;

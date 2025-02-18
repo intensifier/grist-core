@@ -32,6 +32,7 @@ var dispose = require('../lib/dispose');
 var dom = require('../lib/dom');
 var {Delay} = require('../lib/Delay');
 var kd = require('../lib/koDom');
+var {makeT} = require('../lib/localization');
 var Layout = require('./Layout');
 var RecordLayoutEditor = require('./RecordLayoutEditor');
 var commands = require('./commands');
@@ -39,6 +40,8 @@ var {menuToggle} = require('app/client/ui/MenuToggle');
 var {menu} = require('../ui2018/menus');
 var {testId} = require('app/client/ui2018/cssVars');
 var {contextMenu} = require('app/client/ui/contextMenu');
+
+const t = makeT('RecordLayout');
 
 /**
  * Construct a RecordLayout.
@@ -51,7 +54,8 @@ var {contextMenu} = require('app/client/ui/contextMenu');
 function RecordLayout(options) {
   this.viewSection = options.viewSection;
   this.buildFieldDom = options.buildFieldDom;
-  this.buildContextMenu = options.buildContextMenu;
+  this.buildCardContextMenu = options.buildCardContextMenu;
+  this.buildFieldContextMenu = options.buildFieldContextMenu;
   this.isEditingLayout = ko.observable(false);
   this.editIndex = ko.observable(0);
   this.layoutEditor = ko.observable(null);    // RecordLayoutEditor when one is active.
@@ -69,6 +73,7 @@ function RecordLayout(options) {
 
   // Update the stored layoutSpecObj with any missing fields that are present in viewFields.
   this.layoutSpec = this.autoDispose(ko.computed(function() {
+    if (this.viewSection.isDisposed()) { return null; }
     return RecordLayout.updateLayoutSpecWithFields(
       this.viewSection.layoutSpecObj(), this.viewSection.viewFields().all());
   }, this).extend({rateLimit: 0})); // layoutSpecObj and viewFields should be updated together.
@@ -90,9 +95,10 @@ RecordLayout.prototype.resizeCallback = function() {
 };
 
 RecordLayout.prototype.getField = function(fieldRowId) {
-  // If fieldRowId is a string, then it's actually "colRef:label:value" placeholder that we use
-  // when adding a new field. If so, return a special object with the fields available.
-  if (typeof fieldRowId === 'string') {
+  // If fieldRowId is a string which includes ":", then it's actually "colRef:label:value"
+  // placeholder that we use when adding a new field. If so, return a special object with the fields
+  // available. Note that virtual tables also produces string fieldRowId but they have no ":".
+  if (typeof fieldRowId === 'string' && fieldRowId.includes(':')) {
     var parts = gutil.maxsplit(fieldRowId, ":", 2);
     return {
       isNewField: true,        // To make it easy to distinguish from a ViewField MetaRowModel
@@ -259,7 +265,7 @@ RecordLayout.prototype.saveLayoutSpec = async function(layoutSpec) {
   // Use separate copies of addColAction, since sendTableActions modified each in-place.
   let addActions = gutil.arrayRepeat(addColNum, 0).map(() => addColAction.slice());
 
-  await docData.bundleActions('Updating record layout.', () => {
+  await docData.bundleActions(t("Updating record layout."), () => {
     return Promise.try(() => {
       return addColNum > 0 ? docModel.dataTables[tableId].sendTableActions(addActions) : [];
     })
@@ -322,7 +328,7 @@ RecordLayout.prototype.buildLayoutDom = function(row, optCreateEditor) {
     )
   );
 
-  const sub = this.layoutSpec.subscribe((spec) => { layout.buildLayout(spec); });
+  const sub = this.layoutSpec.subscribe((spec) => { layout.buildLayout(spec, createEditor); });
 
   if (createEditor) {
     this.layoutEditor(RecordLayoutEditor.create(this, layout));
@@ -335,8 +341,8 @@ RecordLayout.prototype.buildLayoutDom = function(row, optCreateEditor) {
       this.layoutEditor.peek().dispose();
       this.layoutEditor(null);
     }) : null,
-    // enables row context menu anywhere on the card
-    contextMenu(() => this.buildContextMenu(row)),
+    // enables field context menu anywhere on the card
+    contextMenu(() => this.buildFieldContextMenu()),
     dom('div.detail_row_num',
       kd.text(() => (row._index() + 1)),
       dom.on('contextmenu', ev => {
@@ -352,7 +358,7 @@ RecordLayout.prototype.buildLayoutDom = function(row, optCreateEditor) {
           this.viewSection.hasFocus(true);
           commands.allCommands.setCursor.run(row);
         }),
-        menu(() => this.buildContextMenu(row)),
+        menu(() => this.buildCardContextMenu(row)),
         testId('card-menu-trigger')
       )
     ),

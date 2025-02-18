@@ -2,15 +2,17 @@
  * A tip for fixing an error.
  */
 export interface ApiTip {
-  action: 'add-members' | 'upgrade' |'ask-for-help';
+  action: 'add-members' | 'upgrade' | 'ask-for-help' | 'manage';
   message: string;
 }
+
+export type LimitType = 'collaborators' | 'docs' | 'workspaces' | 'assistant';
 
 /**
  * Documentation of a limit relevant to an API error.
  */
 export interface ApiLimit {
-  quantity: 'collaborators' | 'docs' | 'workspaces';  // what are we counting
+  quantity: LimitType;  // what are we counting
   subquantity?: string;    // a nuance to what we are counting
   maximum: number;         // maximum allowed
   value: number;           // current value of quantity for user
@@ -21,6 +23,8 @@ export interface ApiLimit {
  * Structured details about an API error.
  */
 export interface ApiErrorDetails {
+  code?: ApiErrorCode;
+
   limit?: ApiLimit;
 
   // If set, this is the more user-friendly message to show to the user than error.message.
@@ -31,6 +35,11 @@ export interface ApiErrorDetails {
 
   memos?: string[];
 }
+
+export type ApiErrorCode =
+  | 'UserNotConfirmed'
+  | 'FormNotFound'
+  | 'FormNotPublished';
 
 /**
  * An error with an http status code.

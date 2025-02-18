@@ -1,10 +1,14 @@
 import { isDesktop } from 'app/client/lib/browserInfo';
+import { makeT } from 'app/client/lib/localization';
 import { cssEditorInput } from "app/client/ui/HomeLeftPane";
 import { itemHeader, itemHeaderWrapper, treeViewContainer } from "app/client/ui/TreeViewComponentCss";
-import { colors } from "app/client/ui2018/cssVars";
+import { theme } from "app/client/ui2018/cssVars";
 import { icon } from "app/client/ui2018/icons";
+import { hoverTooltip, overflowTooltip } from 'app/client/ui/tooltips';
 import { menu, menuItem, menuText } from "app/client/ui2018/menus";
-import { dom, domComputed, DomElementArg, makeTestId, observable, Observable, styled } from "grainjs";
+import { Computed, dom, domComputed, DomElementArg, makeTestId, observable, Observable, styled } from "grainjs";
+
+const t = makeT('pages');
 
 const testId = makeTestId('test-docpage-');
 
@@ -31,13 +35,13 @@ export function buildPageDom(name: Observable<string>, actions: PageActions, ...
 
   const isRenaming = observable(false);
   const pageMenu = () => [
-    menuItem(() => isRenaming.set(true), "Rename", testId('rename'),
+    menuItem(() => isRenaming.set(true), t("Rename"), testId('rename'),
             dom.cls('disabled', actions.isReadonly)),
-    menuItem(actions.onRemove, 'Remove', testId('remove'),
+    menuItem(actions.onRemove, t("Remove"), testId('remove'),
              dom.cls('disabled', (use) => use(actions.isReadonly) || actions.isRemoveDisabled())),
-    menuItem(actions.onDuplicate, 'Duplicate Page', testId('duplicate'),
+    menuItem(actions.onDuplicate, t("Duplicate Page"), testId('duplicate'),
              dom.cls('disabled', actions.isReadonly)),
-    dom.maybe(actions.isReadonly, () => menuText('You do not have edit access to this document')),
+    dom.maybe(actions.isReadonly, () => menuText(t("You do not have edit access to this document"))),
   ];
   let pageElem: HTMLElement;
 
@@ -50,17 +54,21 @@ export function buildPageDom(name: Observable<string>, actions: PageActions, ...
     }
   });
 
+  const splitName = Computed.create(null, name, (use, _name) => splitPageInitial(_name));
+
   return pageElem = dom(
     'div',
     dom.autoDispose(lis),
+    dom.autoDispose(splitName),
     domComputed((use) => use(name) === '', blank => blank ? dom('div', '-') :
       domComputed(isRenaming, (isrenaming) => (
         isrenaming ?
           cssPageItem(
             cssPageInitial(
               testId('initial'),
-              dom.text((use) => Array.from(use(name))[0])
-              ),
+              dom.text((use) => use(splitName).initial),
+              cssPageInitial.cls('-emoji', (use) => use(splitName).hasEmoji),
+            ),
             cssEditorInput(
               {
                 initialValue: name.get() || '',
@@ -78,15 +86,17 @@ export function buildPageDom(name: Observable<string>, actions: PageActions, ...
           cssPageItem(
             cssPageInitial(
               testId('initial'),
-              dom.text((use) => Array.from(use(name))[0]),
+              dom.text((use) => use(splitName).initial),
+              cssPageInitial.cls('-emoji', (use) => use(splitName).hasEmoji),
             ),
             cssPageName(
-              dom.text(name),
+              dom.text((use) => use(splitName).displayName),
               testId('label'),
               dom.on('click', (ev) => isTargetSelected(ev.target as HTMLElement) && isRenaming.set(true)),
+              overflowTooltip(),
             ),
             cssPageMenuTrigger(
-              cssPageIcon('Dots'),
+              cssPageMenuIcon('Dots'),
               menu(pageMenu, {placement: 'bottom-start', parentSelectorToMark: '.' + itemHeader.className}),
               dom.on('click', (ev) => { ev.stopPropagation(); ev.preventDefault(); }),
 
@@ -103,15 +113,49 @@ export function buildPageDom(name: Observable<string>, actions: PageActions, ...
     ));
 }
 
+export function buildCensoredPage() {
+  return cssPageItem(
+    cssPageInitial(
+      testId('initial'),
+      dom.text('C'),
+    ),
+    cssCensoredPageName(
+      dom.text('CENSORED'),
+      testId('label'),
+    ),
+    hoverTooltip('This page is censored due to access rules.'),
+  );
+}
+
+// This crazy expression matches all "possible emoji" and comes from a very official source:
+// https://unicode.org/reports/tr51/#EBNF_and_Regex (linked from
+// https://stackoverflow.com/a/68146409/328565). It is processed from the original by replacing \x
+// with \u, removing whitespace, and factoring out a long subexpression.
+const emojiPart = /(?:\p{RI}\p{RI}|\p{Emoji}(?:\p{EMod}|\u{FE0F}\u{20E3}?|[\u{E0020}-\u{E007E}]+\u{E007F})?)/u;
+const pageInitialRegex = new RegExp(`^${emojiPart.source}(?:\\u{200D}${emojiPart.source})*`, "u");
+
+// Divide up the page name into an "initial" and "displayName", where an emoji initial, if
+// present, is omitted from the displayName, but a regular character used as the initial is kept.
+function splitPageInitial(name: string): {initial: string, displayName: string, hasEmoji: boolean} {
+  const m = name.match(pageInitialRegex);
+  // A common false positive is digits; those match \p{Emoji} but should not be considered emojis.
+  // (Other matching non-emojis include characters like '*', but those are nicer to show as emojis.)
+  if (m && !/^\d$/.test(m[0])) {
+    return {initial: m[0], displayName: name.slice(m[0].length).trim(), hasEmoji: true};
+  } else {
+    return {initial: Array.from(name)[0], displayName: name.trim(), hasEmoji: false};
+  }
+}
+
 const cssPageItem = styled('a', `
-  --icon-color: ${colors.slate};
   display: flex;
   flex-direction: row;
   height: 28px;
   align-items: center;
   flex-grow: 1;
   .${treeViewContainer.className}-close & {
-    margin-left: 16px;
+    display: flex;
+    justify-content: center;
   }
   &, &:hover, &:focus {
     text-decoration: none;
@@ -122,13 +166,29 @@ const cssPageItem = styled('a', `
 
 const cssPageInitial = styled('div', `
   flex-shrink: 0;
-  color: white;
+  color: ${theme.pageInitialsFg};
   border-radius: 3px;
-  background-color: ${colors.slate};
-  width: 16px;
-  height: 16px;
-  text-align: center;
+  background-color: ${theme.pageInitialsBg};
+  width: 20px;
+  height: 20px;
   margin-right: 8px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+
+  &-emoji {
+    background-color: ${theme.pageInitialsEmojiBg};
+    box-shadow: 0 0 0 1px ${theme.pageInitialsEmojiOutline};
+    font-size: 15px;
+    overflow: hidden;
+    color: ${theme.text};
+  }
+  .${treeViewContainer.className}-close & {
+    margin-right: 0;
+  }
+  .${itemHeader.className}.selected &-emoji {
+    box-shadow: none;
+  }
 `);
 
 const cssPageName = styled('div', `
@@ -139,6 +199,10 @@ const cssPageName = styled('div', `
   .${treeViewContainer.className}-close & {
     display: none;
   }
+`);
+
+const cssCensoredPageName = styled(cssPageName, `
+  color: ${theme.disabledPageFg};
 `);
 
 function onHoverSupport(yesNo: boolean) {
@@ -187,20 +251,21 @@ const cssPageMenuTrigger = styled('div', `
     }
   }
   .${itemHeaderWrapper.className}-not-dragging &:hover, &.weasel-popup-open {
-    background-color: ${colors.darkGrey};
+    background-color: ${theme.pageOptionsHoverBg};
   }
   .${itemHeaderWrapper.className}-not-dragging > .${itemHeader.className}.selected &:hover,
   .${itemHeaderWrapper.className}-not-dragging > .${itemHeader.className}.selected &.weasel-popup-open {
-    background-color: ${colors.slate};
+    background-color: ${theme.pageOptionsSelectedHoverBg};
   }
 
   .${itemHeader.className}.weasel-popup-open, .${itemHeader.className}-renaming {
-    background-color: ${colors.mediumGrey};
+    background-color: ${theme.pageHoverBg};
   }
 `);
 
-const cssPageIcon = styled(icon, `
+const cssPageMenuIcon = styled(icon, `
+  background-color: ${theme.pageOptionsFg};
   .${itemHeader.className}.selected & {
-    background-color: white;
+    background-color: ${theme.pageOptionsHoverFg};
   }
 `);

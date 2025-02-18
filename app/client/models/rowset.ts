@@ -26,6 +26,8 @@ import {DisposableWithEvents} from 'app/common/DisposableWithEvents';
 import {CompareFunc, sortedIndex} from 'app/common/gutil';
 import {SkippableRows} from 'app/common/TableData';
 import {RowFilterFunc} from "app/common/RowFilterFunc";
+import {UIRowId} from 'app/plugin/GristAPI';
+import {Observable} from 'grainjs';
 
 /**
  * Special constant value that can be used for the `rows` array for the 'rowNotify'
@@ -35,8 +37,7 @@ export const ALL: unique symbol = Symbol("ALL");
 
 export type ChangeType = 'add' | 'remove' | 'update';
 export type ChangeMethod = 'onAddRows' | 'onRemoveRows' | 'onUpdateRows';
-export type RowId = number | 'new';
-export type RowList = Iterable<RowId>;
+export type RowList = Iterable<UIRowId>;
 export type RowsChanged = RowList | typeof ALL;
 
 // ----------------------------------------------------------------------
@@ -81,10 +82,10 @@ export class RowListener extends DisposableWithEvents {
    * Subscribes to the given rowSource and adds the rows currently in it.
    */
   public subscribeTo(rowSource: RowSource): void {
-    this.onAddRows(rowSource.getAllRows());
+    this.onAddRows(rowSource.getAllRows(), rowSource);
     this.listenTo(rowSource, 'rowChange', (changeType: ChangeType, rows: RowList) => {
       const method: ChangeMethod = _changeTypes[changeType];
-      this[method](rows);
+      this[method](rows, rowSource);
     });
     this.listenTo(rowSource, 'rowNotify', this.onRowNotify);
   }
@@ -102,17 +103,17 @@ export class RowListener extends DisposableWithEvents {
   /**
    * Process row additions. To be implemented by derived classes.
    */
-  protected onAddRows(rows: RowList) { /* no-op */ }
+  protected onAddRows(rows: RowList, rowSource?: RowSource) { /* no-op */ }
 
   /**
    * Process row removals. To be implemented by derived classes.
    */
-  protected onRemoveRows(rows: RowList) { /* no-op */ }
+  protected onRemoveRows(rows: RowList, rowSource?: RowSource) { /* no-op */ }
 
   /**
    * Process row updates. To be implemented by derived classes.
    */
-  protected onUpdateRows(rows: RowList) { /* no-op */ }
+  protected onUpdateRows(rows: RowList, rowSource?: RowSource) { /* no-op */ }
 
   /**
    * Derived classes may override this event to handle row notifications. By default, it re-triggers
@@ -128,15 +129,6 @@ export class RowListener extends DisposableWithEvents {
 // ----------------------------------------------------------------------
 
 /**
- * A trivial RowSource returning a fixed list of rows.
- */
-export abstract class ArrayRowSource extends RowSource {
-  constructor(private _rows: RowId[]) { super(); }
-  public getAllRows(): RowList { return this._rows; }
-  public getNumRows(): number { return this._rows.length; }
-}
-
-/**
  * MappedRowSource wraps any other RowSource, and passes through all rows, replacing each row
  * identifier with the result of mapperFunc(row) call.
  *
@@ -145,11 +137,11 @@ export abstract class ArrayRowSource extends RowSource {
  * TODO: This class is not used anywhere at the moment, and is a candidate for removal.
  */
 export class MappedRowSource extends RowSource {
-  private _mapperFunc: (row: RowId) => RowId;
+  private _mapperFunc: (row: UIRowId) => UIRowId;
 
   constructor(
     public parentRowSource: RowSource,
-    mapperFunc: (row: RowId) => RowId,
+    mapperFunc: (row: UIRowId) => UIRowId,
   ) {
     super();
 
@@ -181,7 +173,7 @@ export class ExtendedRowSource extends RowSource {
 
   constructor(
     public parentRowSource: RowSource,
-    public extras: RowId[]
+    public extras: UIRowId[]
   ) {
     super();
 
@@ -208,9 +200,9 @@ export class ExtendedRowSource extends RowSource {
 // ----------------------------------------------------------------------
 
 interface FilterRowChanges {
-  adds?: RowId[];
-  updates?: RowId[];
-  removes?: RowId[];
+  adds?: UIRowId[];
+  updates?: UIRowId[];
+  removes?: UIRowId[];
 }
 
 /**
@@ -218,9 +210,9 @@ interface FilterRowChanges {
  * does not maintain excluded rows, and does not allow changes to filterFunc.
  */
 export class BaseFilteredRowSource extends RowListener implements RowSource {
-  protected _matchingRows: Set<RowId> = new Set();   // Set of rows matching the filter.
+  protected _matchingRows: Set<UIRowId> = new Set();   // Set of rows matching the filter.
 
-  constructor(protected _filterFunc: RowFilterFunc<RowId>) {
+  constructor(protected _filterFunc: RowFilterFunc<UIRowId>) {
     super();
   }
 
@@ -308,8 +300,8 @@ export class BaseFilteredRowSource extends RowListener implements RowSource {
   }
 
   // These are implemented by FilteredRowSource, but the base class doesn't need to do anything.
-  protected _addExcludedRow(row: RowId): void { /* no-op */ }
-  protected _deleteExcludedRow(row: RowId): boolean { return true; }
+  protected _addExcludedRow(row: UIRowId): void { /* no-op */ }
+  protected _deleteExcludedRow(row: UIRowId): boolean { return true; }
 }
 
 /**
@@ -320,13 +312,13 @@ export class BaseFilteredRowSource extends RowListener implements RowSource {
  * FilteredRowSource is also a RowListener, so to subscribe to a rowSource, use `subscribeTo()`.
  */
 export class FilteredRowSource extends BaseFilteredRowSource {
-  private _excludedRows: Set<RowId> = new Set();   // Set of rows NOT matching the filter.
+  private _excludedRows: Set<UIRowId> = new Set();   // Set of rows NOT matching the filter.
 
   /**
    * Change the filter function. This may trigger 'remove' and 'add' events as necessary to indicate
    * that rows stopped or started matching the new filter.
    */
-  public updateFilter(filterFunc: RowFilterFunc<RowId>) {
+  public updateFilter(filterFunc: RowFilterFunc<UIRowId>) {
     this._filterFunc = filterFunc;
     const changes: FilterRowChanges = {};
     // After the first call, _excludedRows may have additional rows, but there is no harm in it,
@@ -355,8 +347,8 @@ export class FilteredRowSource extends BaseFilteredRowSource {
     return this._excludedRows.values();
   }
 
-  protected _addExcludedRow(row: RowId): void { this._excludedRows.add(row); }
-  protected _deleteExcludedRow(row: RowId): boolean { return this._excludedRows.delete(row); }
+  protected _addExcludedRow(row: UIRowId): void { this._excludedRows.add(row); }
+  protected _deleteExcludedRow(row: UIRowId): boolean { return this._excludedRows.delete(row); }
 }
 
 // ----------------------------------------------------------------------
@@ -367,7 +359,7 @@ export class FilteredRowSource extends BaseFilteredRowSource {
  * Private helper object that maintains a set of rows for a particular group.
  */
 class RowGroupHelper<Value> extends RowSource {
-  private _rows: Set<RowId> = new Set();
+  private _rows: Set<UIRowId> = new Set();
   constructor(public readonly groupValue: Value) {
     super();
   }
@@ -390,7 +382,10 @@ class RowGroupHelper<Value> extends RowSource {
 }
 
 // ----------------------------------------------------------------------
-
+/**
+ * Helper function that does map.get(key).push(r), creating an Array for the given key if
+ * necessary.
+ */
 function _addToMapOfArrays<K, V>(map: Map<K, V[]>, key: K, r: V): void {
   let arr = map.get(key);
   if (!arr) { map.set(key, arr = []); }
@@ -407,12 +402,12 @@ function _addToMapOfArrays<K, V>(map: Map<K, V[]>, key: K, r: V): void {
  */
 export class RowGrouping<Value> extends RowListener {
   // Maps row identifiers to groupValues.
-  private _rowsToValues: Map<RowId, Value> = new Map();
+  private _rowsToValues: Map<UIRowId, Value> = new Map();
 
   // Maps group values to RowGroupHelpers
   private _valuesToGroups: Map<Value, RowGroupHelper<Value>> = new Map();
 
-  constructor(private _groupFunc: (row: RowId) => Value) {
+  constructor(private _groupFunc: (row: UIRowId) => Value) {
     super();
 
     // On disposal, dispose all RowGroupHelpers that we maintain.
@@ -436,11 +431,6 @@ export class RowGrouping<Value> extends RowListener {
   }
 
   // Implementation of the RowListener interface.
-
-  /**
-   * Helper function that does map.get(key).push(r), creating an Array for the given key if
-   * necessary.
-   */
 
   public onAddRows(rows: RowList) {
     const groupedRows = new Map();
@@ -539,15 +529,15 @@ export class RowGrouping<Value> extends RowListener {
  * SortedRowSet re-emits 'rowNotify(rows, value)' events from RowSources that it subscribes to.
  */
 export class SortedRowSet extends RowListener {
-  private _allRows: Set<RowId> = new Set();
+  private _allRows: Set<UIRowId> = new Set();
   private _isPaused: boolean = false;
-  private _koArray: KoArray<RowId>;
+  private _koArray: KoArray<UIRowId>;
   private _keepFunc?: (rowId: number|'new') => boolean;
 
-  constructor(private _compareFunc: CompareFunc<RowId>,
+  constructor(private _compareFunc: CompareFunc<UIRowId>,
               private _skippableRows?: SkippableRows) {
     super();
-    this._koArray = this.autoDispose(koArray<RowId>());
+    this._koArray = this.autoDispose(koArray<UIRowId>());
     this._keepFunc = _skippableRows?.getKeepFunc();
   }
 
@@ -573,7 +563,7 @@ export class SortedRowSet extends RowListener {
   /**
    * Re-sorts the array according to the new compareFunc.
    */
-  public updateSort(compareFunc: CompareFunc<RowId>): void {
+  public updateSort(compareFunc: CompareFunc<UIRowId>): void {
     this._compareFunc = compareFunc;
     if (!this._isPaused) {
       this._koArray.assign(Array.from(this._koArray.peek()).sort(this._compareFunc));
@@ -651,7 +641,7 @@ export class SortedRowSet extends RowListener {
 
   // Filter out any rows that should be skipped. This is a no-op if no _keepFunc was found.
   // All rows that sort within nContext rows of something meant to be kept are also kept.
-  private _keep(rows: RowId[], nContext: number = 2) {
+  private _keep(rows: UIRowId[], nContext: number = 2) {
     // Nothing to be done if there's no _keepFunc.
     if (!this._keepFunc) { return rows; }
 
@@ -707,6 +697,41 @@ export class SortedRowSet extends RowListener {
   }
 }
 
+type RowTester = (rowId: UIRowId) => boolean;
+/**
+ * RowWatcher is a RowListener that maintains an observable function that checks whether a row
+ * is in the connected RowSource.
+ */
+export class RowWatcher extends RowListener {
+  /**
+   * Observable function that returns true if the row is in the connected RowSource.
+   */
+  public rowFilter: Observable<RowTester> = Observable.create(this, () => false);
+  // We count the number of times the row is added or removed from the source.
+  // In most cases row is added and removed only once.
+  private _rowCounter: Map<UIRowId, number> = new Map();
+
+  public clear() {
+    this._rowCounter.clear();
+    this.rowFilter.set(() => false);
+    this.stopListening();
+  }
+
+  protected onAddRows(rows: RowList) {
+    for (const r of rows) {
+      this._rowCounter.set(r, (this._rowCounter.get(r) || 0) + 1);
+    }
+    this.rowFilter.set((row) => (this._rowCounter.get(row) ?? 0) > 0);
+  }
+
+  protected onRemoveRows(rows: RowList) {
+    for (const r of rows) {
+      this._rowCounter.set(r, (this._rowCounter.get(r) || 0) - 1);
+    }
+    this.rowFilter.set((row) => (this._rowCounter.get(row) ?? 0) > 0);
+  }
+}
+
 function isSmallChange(rows: RowList) {
   return Array.isArray(rows) && rows.length <= 2;
 }
@@ -738,4 +763,45 @@ function _allRowsSorted<T>(array: T[], allRows: Set<T>, sortedRows: Iterable<T>,
     last = index;
   }
   return true;
+}
+
+
+/**
+ * Track rows that should temporarily be visible even if they don't match filters.
+ * This is so that a newly added row doesn't immediately disappear, which would be confusing.
+ * This doesn't have much to do with BaseFilteredRowSource, it's just reusing some implementation.
+ */
+export class ExemptFromFilterRowSource extends BaseFilteredRowSource {
+  public constructor() {
+    super(() => false);
+  }
+
+  /**
+   * Call this when one or more new rows are added to keep them temporarily visible.
+   */
+  public addExemptRows(rows: RowList) {
+    const newRows = [];
+    for (const r of rows) {
+      if (!this._matchingRows.has(r)) {
+        this._matchingRows.add(r);
+        newRows.push(r);
+      }
+    }
+    if (newRows.length > 0) {
+      this.trigger('rowChange', 'add', newRows);
+    }
+  }
+
+  public addExemptRow(rowId: number) {
+    this.addExemptRows([rowId]);
+  }
+
+  /**
+   * Call this when linking or filters change to clear out the temporary rows.
+   */
+  public reset() {
+    this.onRemoveRows(this.getAllRows());
+  }
+
+  public onUpdateRows() { /* no-op */ }
 }

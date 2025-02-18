@@ -3,17 +3,24 @@
  */
 import {arrayToString} from 'app/common/arrayToString';
 import * as marshal from 'app/common/marshal';
+import {create} from 'app/server/lib/create';
 import {ISandbox, ISandboxCreationOptions, ISandboxCreator} from 'app/server/lib/ISandbox';
 import log from 'app/server/lib/log';
-import {DirectProcessControl, ISandboxControl, NoProcessControl, ProcessInfo,
-        SubprocessControl} from 'app/server/lib/SandboxControl';
+import {getAppRoot, getAppRootFor, getUnpackedAppRoot} from 'app/server/lib/places';
+import {
+  DirectProcessControl,
+  ISandboxControl,
+  NoProcessControl,
+  ProcessInfo,
+  SubprocessControl
+} from 'app/server/lib/SandboxControl';
 import * as sandboxUtil from 'app/server/lib/sandboxUtil';
 import * as shutdown from 'app/server/lib/shutdown';
-import {ChildProcess, spawn} from 'child_process';
+import {ChildProcess, fork, spawn, SpawnOptionsWithoutStdio} from 'child_process';
+import * as fs from 'fs';
+import * as _ from 'lodash';
 import * as path from 'path';
 import {Stream, Writable} from 'stream';
-import * as _ from 'lodash';
-import * as fs from 'fs';
 import * as which from 'which';
 
 type SandboxMethod = (...args: any[]) => any;
@@ -63,10 +70,18 @@ export interface ISandboxOptions {
  * We interact with sandboxes as a separate child process. Data engine work is done
  * across standard input and output streams from and to this process. We also monitor
  * and control resource utilization via a distinct control interface.
+ *
+ * More recently, a sandbox may not be a separate OS process, but (for
+ * example) a web worker. In this case, a pair of callbacks (getData and
+ * sendData) replace pipes.
  */
-interface SandboxProcess {
-  child: ChildProcess;
-  control: ISandboxControl;
+export interface SandboxProcess {
+  child?: ChildProcess;
+  control: () => ISandboxControl;
+  dataToSandboxDescriptor?: number;    // override sandbox's 'stdin' for data
+  dataFromSandboxDescriptor?: number;  // override sandbox's 'stdout' for data
+  getData?: (cb: (data: any) => void) => void;  // use a callback instead of a pipe to get data
+  sendData?: (data: any) => void;  // use a callback instead of a pipe to send data
 }
 
 type ResolveRejectPair = [(value?: any) => void, (reason?: unknown) => void];
@@ -80,7 +95,7 @@ const recordBuffersRoot = process.env.RECORD_SANDBOX_BUFFERS_DIR;
 
 export class NSandbox implements ISandbox {
 
-  public readonly childProc: ChildProcess;
+  public readonly childProc?: ChildProcess;
   private _control: ISandboxControl;
   private _logTimes: boolean;
   private _exportedFunctions: {[name: string]: SandboxMethod};
@@ -93,8 +108,9 @@ export class NSandbox implements ISandbox {
   private _isWriteClosed = false;
 
   private _logMeta: log.ILogMeta;
-  private _streamToSandbox: Writable;
+  private _streamToSandbox?: Writable;
   private _streamFromSandbox: Stream;
+  private _dataToSandbox?: (data: any) => void;
   private _lastStderr: Uint8Array;  // Record last error line seen.
 
   // Create a unique subdirectory for each sandbox process so they can be replayed separately
@@ -118,42 +134,33 @@ export class NSandbox implements ISandbox {
     this._exportedFunctions = options.exports || {};
 
     const sandboxProcess = spawner(options);
-    this._control = sandboxProcess.control;
     this.childProc = sandboxProcess.child;
+    this._logMeta = {sandboxPid: this.childProc?.pid, ...options.logMeta};
 
-    this._logMeta = {sandboxPid: this.childProc.pid, ...options.logMeta};
+    // Handle childProc events early, especially the 'error' event which may lead to node exiting.
+    this.childProc?.on('close', this._onExit.bind(this));
+    this.childProc?.on('error', this._onError.bind(this));
 
-    if (options.minimalPipeMode) {
-      log.rawDebug("3-pipe Sandbox started", this._logMeta);
-      this._streamToSandbox = this.childProc.stdin!;
-      this._streamFromSandbox = this.childProc.stdout!;
-    } else {
-      log.rawDebug("5-pipe Sandbox started", this._logMeta);
-      this._streamToSandbox = (this.childProc.stdio as Stream[])[3] as Writable;
-      this._streamFromSandbox = (this.childProc.stdio as Stream[])[4];
-      this.childProc.stdout!.on('data', sandboxUtil.makeLinePrefixer('Sandbox stdout: ', this._logMeta));
-    }
-    const sandboxStderrLogger = sandboxUtil.makeLinePrefixer('Sandbox stderr: ', this._logMeta);
-    this.childProc.stderr!.on('data', data => {
-      this._lastStderr = data;
-      sandboxStderrLogger(data);
-    });
+    this._control = sandboxProcess.control();
 
-    this.childProc.on('close', this._onExit.bind(this));
-    this.childProc.on('error', this._onError.bind(this));
-
-    this._streamFromSandbox.on('data', (data) => this._onSandboxData(data));
-    this._streamFromSandbox.on('end', () => this._onSandboxClose());
-    this._streamFromSandbox.on('error', (err) => {
-      log.rawError(`Sandbox error reading: ${err}`, this._logMeta);
-      this._onSandboxClose();
-    });
-
-    this._streamToSandbox.on('error', (err) => {
-      if (!this._isWriteClosed) {
-        log.rawError(`Sandbox error writing: ${err}`, this._logMeta);
+    if (this.childProc) {
+      if (options.minimalPipeMode) {
+        this._initializeMinimalPipeMode(sandboxProcess);
+      } else {
+        this._initializeFivePipeMode(sandboxProcess);
       }
-    });
+    } else {
+      // No child process. In this case, there should be a callback for
+      // receiving and sending data.
+      if (!sandboxProcess.getData) {
+        throw new Error('no way to get data from sandbox');
+      }
+      if (!sandboxProcess.sendData) {
+        throw new Error('no way to send data to sandbox');
+      }
+      sandboxProcess.getData((data) => this._onSandboxData(data));
+      this._dataToSandbox = sandboxProcess.sendData;
+    }
 
     // On shutdown, shutdown the child process cleanly, and wait for it to exit.
     shutdown.addCleanupHandler(this, this.shutdown);
@@ -182,9 +189,9 @@ export class NSandbox implements ISandbox {
 
     const result = await new Promise<void>((resolve, reject) => {
       if (this._isWriteClosed) { resolve(); }
-      this.childProc.on('error', reject);
-      this.childProc.on('close', resolve);
-      this.childProc.on('exit', resolve);
+      this.childProc?.on('error', reject);
+      this.childProc?.on('close', resolve);
+      this.childProc?.on('exit', resolve);
       this._close();
     }).finally(() => this._control.close());
 
@@ -200,10 +207,19 @@ export class NSandbox implements ISandbox {
    * @param args Arguments to pass to the given function.
    * @returns A promise for the return value from the Python function.
    */
-  public pyCall(funcName: string, ...varArgs: unknown[]): Promise<any> {
+  public async pyCall(funcName: string, ...varArgs: unknown[]): Promise<any> {
     const startTime = Date.now();
     this._sendData(sandboxUtil.CALL, Array.from(arguments));
-    return this._pyCallWait(funcName, startTime);
+    const slowCallCheck = setTimeout(() => {
+      // Log calls that take some time, can be a useful symptom of misconfiguration
+      // (or just benign if the doc is big).
+      log.rawWarn('Slow pyCall', {...this._logMeta, funcName});
+    }, 10000);
+    try {
+      return await this._pyCallWait(funcName, startTime);
+    } finally {
+      clearTimeout(slowCallCheck);
+    }
   }
 
   /**
@@ -212,6 +228,87 @@ export class NSandbox implements ISandbox {
   public async reportMemoryUsage() {
     const {memory} = await this._control.getUsage();
     log.rawDebug('Sandbox memory', {memory, ...this._logMeta});
+  }
+
+  public isProcessDown() {
+    return this._isReadClosed || this._isWriteClosed;
+  }
+
+  public getFlavor() {
+    return this._logMeta.flavor;
+  }
+
+  /**
+   * Get ready to communicate with a sandbox process using stdin,
+   * stdout, and stderr.
+   */
+  private _initializeMinimalPipeMode(sandboxProcess: SandboxProcess) {
+    log.rawDebug("3-pipe Sandbox started", this._logMeta);
+    if (!this.childProc) {
+      throw new Error('child process required');
+    }
+    if (sandboxProcess.dataToSandboxDescriptor) {
+      this._streamToSandbox =
+        (this.childProc.stdio as Stream[])[sandboxProcess.dataToSandboxDescriptor] as Writable;
+    } else {
+      this._streamToSandbox = this.childProc.stdin!;
+    }
+    if (sandboxProcess.dataFromSandboxDescriptor) {
+      this._streamFromSandbox =
+        (this.childProc.stdio as Stream[])[sandboxProcess.dataFromSandboxDescriptor];
+    } else {
+      this._streamFromSandbox = this.childProc.stdout!;
+    }
+    this._initializeStreamEvents();
+  }
+
+  /**
+   * Get ready to communicate with a sandbox process using stdin,
+   * stdout, and stderr, and two extra FDs. This was a nice way
+   * to have a clean, separate data channel, when supported.
+   */
+  private _initializeFivePipeMode(sandboxProcess: SandboxProcess) {
+    log.rawDebug("5-pipe Sandbox started", this._logMeta);
+    if (!this.childProc) {
+      throw new Error('child process required');
+    }
+    if (sandboxProcess.dataFromSandboxDescriptor || sandboxProcess.dataToSandboxDescriptor) {
+      throw new Error('cannot override file descriptors in 5 pipe mode');
+    }
+    this._streamToSandbox = (this.childProc.stdio as Stream[])[3] as Writable;
+    this._streamFromSandbox = (this.childProc.stdio as Stream[])[4];
+    this.childProc.stdout!.on('data', sandboxUtil.makeLinePrefixer('Sandbox stdout: ', this._logMeta));
+    this._initializeStreamEvents();
+  }
+
+  /**
+   * Set up logging and events on streams to/from a sandbox.
+   */
+  private _initializeStreamEvents() {
+    if (!this.childProc) {
+      throw new Error('child process required');
+    }
+    if (!this._streamToSandbox) {
+      throw new Error('expected streamToSandbox to be configured');
+    }
+    const sandboxStderrLogger = sandboxUtil.makeLogLinePrefixer('Sandbox stderr: ', this._logMeta);
+    this.childProc.stderr!.on('data', data => {
+      this._lastStderr = data;
+      sandboxStderrLogger(data);
+    });
+
+    this._streamFromSandbox.on('data', (data) => this._onSandboxData(data));
+    this._streamFromSandbox.on('end', () => this._onSandboxClose());
+    this._streamFromSandbox.on('error', (err) => {
+      log.rawError(`Sandbox error reading: ${err}`, this._logMeta);
+      this._onSandboxClose();
+    });
+
+    this._streamToSandbox.on('error', (err) => {
+      if (!this._isWriteClosed) {
+        log.rawError(`Sandbox error writing: ${err}`, this._logMeta);
+      }
+    });
   }
 
   private async _pyCallWait(funcName: string, startTime: number): Promise<any> {
@@ -223,17 +320,21 @@ export class NSandbox implements ISandbox {
       throw new sandboxUtil.SandboxError(e.message);
     } finally {
       if (this._logTimes) {
-        log.rawDebug(`Sandbox pyCall[${funcName}] took ${Date.now() - startTime} ms`, this._logMeta);
+        log.rawDebug('NSandbox pyCall', {
+          ...this._logMeta,
+          funcName,
+          loadMs: Date.now() - startTime,
+        });
       }
     }
   }
 
 
   private _close() {
-    this._control.prepareToClose();
+    this._control?.prepareToClose();    // ?. operator in case _control failed to get initialized.
     if (!this._isWriteClosed) {
       // Close the pipe to the sandbox, which should cause the sandbox to exit cleanly.
-      this._streamToSandbox.end();
+      this._streamToSandbox?.end();
       this._isWriteClosed = true;
     }
   }
@@ -268,9 +369,16 @@ export class NSandbox implements ISandbox {
     if (this._recordBuffersDir) {
       fs.appendFileSync(path.resolve(this._recordBuffersDir, "input"), buf);
     }
-    return this._streamToSandbox.write(buf);
+    if (this._streamToSandbox) {
+      return this._streamToSandbox.write(buf);
+    } else {
+      if (!this._dataToSandbox) {
+        throw new Error('no way to send data to sandbox');
+      }
+      this._dataToSandbox(buf);
+      return true;
+    }
   }
-
 
   /**
    * Process a buffer of data received from the sandbox process.
@@ -365,6 +473,11 @@ const spawners = {
   docker,             // Run sandboxes in distinct docker containers.
   gvisor,             // Gvisor's runsc sandbox.
   macSandboxExec,     // Use "sandbox-exec" on Mac.
+  pyodide,            // Run data engine using pyodide.
+  skip: unsandboxed,  // Same as unsandboxed. Used to mean that the
+                      // user deliberately doesn't want sandboxing.
+                      // The "unsandboxed" setting is ambiguous in this
+                      // respect.
 };
 
 function isFlavor(flavor: string): flavor is keyof typeof spawners {
@@ -377,8 +490,8 @@ function isFlavor(flavor: string): flavor is keyof typeof spawners {
  * grist-core), and trying to regularize creation options a bit.
  *
  * The flavor of sandbox to use can be overridden by some environment variables:
- *   - GRIST_SANDBOX_FLAVOR: should be one of the spawners (pynbox, unsandboxed, docker,
- *     gvisor, macSandboxExec)
+ *   - GRIST_SANDBOX_FLAVOR: should be one of the spawners (gvisor, unsandboxed, docker,
+ *     macSandboxExec, pynbox)
  *   - GRIST_SANDBOX: a program or image name to run as the sandbox.  Not needed for
  *     pynbox (it is either built in or not available).  For unsandboxed, should be an
  *     absolute path to python within a virtualenv with all requirements installed.
@@ -386,23 +499,31 @@ function isFlavor(flavor: string): flavor is keyof typeof spawners {
  *     in `sandbox/docker`) or a derived image.  For gvisor, it should be the full path
  *     to `sandbox/gvisor/run.py` (if runsc available locally) or to
  *     `sandbox/gvisor/wrap_in_docker.sh` (if runsc should be run using the docker
- *     image built in that directory).  Gvisor is not yet available in grist-core.
+ *     image built in that directory).
  *   - PYTHON_VERSION: for gvisor, this is mandatory, and must be set to "2" or "3".
  *     It is ignored by other flavors.
  */
 export class NSandboxCreator implements ISandboxCreator {
-  private _flavor: keyof typeof spawners;
+  private _flavor: string;
+  private _spawner: SpawnFn;
   private _command?: string;
   private _preferredPythonVersion?: string;
 
   public constructor(options: {
-    defaultFlavor: keyof typeof spawners,
+    defaultFlavor: string,
     command?: string,
     preferredPythonVersion?: string,
   }) {
     const flavor = options.defaultFlavor;
     if (!isFlavor(flavor)) {
-      throw new Error(`Unrecognized sandbox flavor: ${flavor}`);
+      const variants = create.getSandboxVariants?.();
+      if (!variants?.[flavor]) {
+        throw new Error(`Unrecognized sandbox flavor: ${flavor}`);
+      } else {
+        this._spawner = variants[flavor];
+      }
+    } else {
+      this._spawner = spawners[flavor];
     }
     this._flavor = flavor;
     this._command = options.command;
@@ -432,12 +553,12 @@ export class NSandboxCreator implements ISandboxCreator {
       importDir: options.importMount,
       ...options.sandboxOptions,
     };
-    return new NSandbox(translatedOptions, spawners[this._flavor]);
+    return new NSandbox(translatedOptions, this._spawner);
   }
 }
 
 // A function that takes sandbox options and starts a sandbox process.
-type SpawnFn = (options: ISandboxOptions) => SandboxProcess;
+export type SpawnFn = (options: ISandboxOptions) => SandboxProcess;
 
 /**
  * Helper function to run a nacl sandbox. It takes care of most arguments, similarly to
@@ -480,7 +601,7 @@ function pynbox(options: ISandboxOptions): SandboxProcess {
 
   const noLog = unsilenceLog ? [] :
     (process.env.OS === 'Windows_NT' ? ['-l', 'NUL'] : ['-l', '/dev/null']);
-  const child = spawn('sandbox/nacl/bin/sel_ldr', [
+  const child = adjustedSpawn('sandbox/nacl/bin/sel_ldr', [
     '-B', './sandbox/nacl/lib/irt_core.nexe', '-m', './sandbox/nacl/root:/:ro',
     ...noLog,
     ...wrapperArgs.get(),
@@ -488,7 +609,7 @@ function pynbox(options: ISandboxOptions): SandboxProcess {
     '--library-path', '/slib', '/python/bin/python2.7.nexe',
     ...pythonArgs
   ], spawnOptions);
-  return {child, control: new DirectProcessControl(child, options.logMeta)};
+  return {child, control: () => new DirectProcessControl(child, options.logMeta)};
 }
 
 /**
@@ -517,9 +638,47 @@ function unsandboxed(options: ISandboxOptions): SandboxProcess {
     spawnOptions.stdio.push('pipe', 'pipe');
   }
   const command = findPython(options.command, options.preferredPythonVersion);
-  const child = spawn(command, pythonArgs,
+  const child = adjustedSpawn(command, pythonArgs,
                       {cwd: path.join(process.cwd(), 'sandbox'), ...spawnOptions});
-  return {child, control: new DirectProcessControl(child, options.logMeta)};
+  return {child, control: () => new DirectProcessControl(child, options.logMeta)};
+}
+
+function pyodide(options: ISandboxOptions): SandboxProcess {
+  const paths = getAbsolutePaths(options);
+  // We will fork with three regular pipes (stdin, stdout, stderr), then
+  // ipc (mandatory for calling fork), and a replacement pipe for stdin
+  // and for stdout.
+  // The regular stdin always opens non-blocking in node, which is a pain
+  // in this case, so we just use a different pipe. There's a different
+  // problem with stdout, with the same solution.
+  const spawnOptions = {
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc', 'pipe', 'pipe'] as Array<'pipe'|'ipc'>,
+    env: {
+      PYTHONPATH: paths.engine,
+      IMPORTDIR: options.importDir,
+      ...getInsertedEnv(options),
+      ...getWrappingEnv(options),
+    }
+  };
+  const base = getUnpackedAppRoot();
+  const child = fork(path.join(base, 'sandbox', 'pyodide', 'pipe.js'),
+                     {cwd: path.join(process.cwd(), 'sandbox'), ...spawnOptions});
+  return {
+    child,
+    control: () => new DirectProcessControl(child, options.logMeta),
+    dataToSandboxDescriptor: 4,  // Cannot use normal descriptor, node
+    // makes it non-blocking. Can be worked around in linux and osx, but
+    // for windows just using a different file descriptor seems simplest.
+    // In the sandbox, calling async methods from emscripten code is
+    // possible but would require more changes to the data engine code
+    // than seems reasonable at this time. The top level sandbox.run
+    // can be tweaked to step operations, which actually works for a
+    // lot of things, but not for cases where the sandbox calls back
+    // into node (e.g. for column type guessing). TLDR: just switching
+    // to FD 4 and reading synchronously is more practical solution.
+    dataFromSandboxDescriptor: 5, // There's an equally long but different
+    // story about why stdout is a bit messed up under pyodide right now.
+  };
 }
 
 /**
@@ -570,15 +729,9 @@ function gvisor(options: ISandboxOptions): SandboxProcess {
   // Check for local virtual environments created with core's
   // install:python2 or install:python3 targets. They'll need
   // some extra sharing to make available in the sandbox.
-  // This appears to currently be incompatible with checkpoints?
-  // Shares and checkpoints interact delicately because the file
-  // handle layout/ordering needs to remain exactly the same.
-  // Fixable no doubt, but for now I just disable this convenience
-  // if checkpoints are in use.
-  const venv = path.join(process.cwd(),
+  const venv = path.join(getAppRootFor(getAppRoot(), 'sandbox'),
                          pythonVersion === '2' ? 'venv' : 'sandbox_venv3');
-  const useCheckpoint = process.env.GRIST_CHECKPOINT && !paths.importDir;
-  if (fs.existsSync(venv) && !useCheckpoint) {
+  if (fs.existsSync(venv)) {
     wrapperArgs.addMount(venv);
     wrapperArgs.push('-s', path.join(venv, 'bin', 'python'));
   }
@@ -589,18 +742,23 @@ function gvisor(options: ISandboxOptions): SandboxProcess {
   // between the checkpoint and how it gets used later).
   // If a sandbox is being used for import, it will have a special mount we can't
   // deal with easily right now. Should be possible to do in future if desired.
-  if (options.useGristEntrypoint && pythonVersion === '3' && useCheckpoint) {
+  if (options.useGristEntrypoint && pythonVersion === '3' && process.env.GRIST_CHECKPOINT && !paths.importDir) {
     if (process.env.GRIST_CHECKPOINT_MAKE) {
       const child =
-        spawn(command, [...wrapperArgs.get(), '--checkpoint', process.env.GRIST_CHECKPOINT!,
+        adjustedSpawn(command, [...wrapperArgs.get(), '--checkpoint', process.env.GRIST_CHECKPOINT!,
                         `python${pythonVersion}`, '--', ...pythonArgs]);
       // We don't want process control for this.
-      return {child, control: new NoProcessControl(child)};
+      return {child, control: () => new NoProcessControl(child)};
     }
     wrapperArgs.push('--restore');
     wrapperArgs.push(process.env.GRIST_CHECKPOINT!);
   }
-  const child = spawn(command, [...wrapperArgs.get(), `python${pythonVersion}`, '--', ...pythonArgs]);
+  const child = adjustedSpawn(command, [...wrapperArgs.get(), `python${pythonVersion}`, '--', ...pythonArgs]);
+  const childPid = child.pid;
+  if (!childPid) {
+    throw new Error(`failed to spawn python${pythonVersion}`);
+  }
+
   // For gvisor under ptrace, main work is done by a traced process identifiable as
   // being labeled "exe" and having a parent also labeled "exe".
   const recognizeTracedProcess = (p: ProcessInfo) => {
@@ -611,8 +769,8 @@ function gvisor(options: ISandboxOptions): SandboxProcess {
     return p.label.includes('runsc-sandbox');
   };
   // If docker is in use, this process control will log a warning message and do nothing.
-  return {child, control: new SubprocessControl({
-    pid: child.pid,
+  return {child, control: () => new SubprocessControl({
+    pid: childPid,
     recognizers: {
       sandbox: recognizeSandboxProcess,   // this process we start and stop
       memory: recognizeTracedProcess,     // measure memory for the ptraced process
@@ -660,7 +818,7 @@ function docker(options: ISandboxOptions): SandboxProcess {
     ...pythonArgs,
   ]);
   log.rawDebug("cannot do process control via docker yet", {...options.logMeta});
-  return {child, control: new NoProcessControl(child)};
+  return {child, control: () => new NoProcessControl(child)};
 }
 
 /**
@@ -687,7 +845,7 @@ function macSandboxExec(options: ISandboxOptions): SandboxProcess {
     ...getWrappingEnv(options),
   };
   const command = findPython(options.command, options.preferredPythonVersion);
-  const realPath = fs.realpathSync(command);
+  const realPath = realpathSync(command);
   log.rawDebug("macSandboxExec found a python", {...options.logMeta, command: realPath});
 
   // Prepare sandbox profile
@@ -737,6 +895,7 @@ function macSandboxExec(options: ISandboxOptions): SandboxProcess {
   // From another python installation variant.
   profile.push(`(allow file-read* (subpath "/usr/lib/"))`);
   profile.push(`(allow file-read* (subpath "/System/Library/Frameworks/"))`);
+  profile.push(`(allow file-read* (subpath "/Library/Apple/usr/libexec/oah/"))`);
 
   // Give access to Grist material.
   const cwd = path.join(process.cwd(), 'sandbox');
@@ -749,7 +908,7 @@ function macSandboxExec(options: ISandboxOptions): SandboxProcess {
   const profileString = profile.join('\n');
   const child = spawn('/usr/bin/sandbox-exec', ['-p', profileString, command, ...pythonArgs],
                       {cwd, env});
-  return {child, control: new DirectProcessControl(child, options.logMeta)};
+  return {child, control: () => new DirectProcessControl(child, options.logMeta)};
 }
 
 /**
@@ -804,11 +963,11 @@ function getAbsolutePaths(options: ISandboxOptions) {
   // Get path to sandbox directory - this is a little idiosyncratic to work well
   // in grist-core.  It is important to use real paths since we may be viewing
   // the file system through a narrow window in a container.
-  const sandboxDir = path.join(fs.realpathSync(path.join(process.cwd(), 'sandbox', 'grist')),
+  const sandboxDir = path.join(realpathSync(path.join(process.cwd(), 'sandbox', 'grist')),
                                '..');
   // Copy plugin options, and then make them absolute.
   if (options.importDir) {
-    options.importDir = fs.realpathSync(options.importDir);
+    options.importDir = realpathSync(options.importDir);
   }
   return {
     sandboxDir,
@@ -862,26 +1021,36 @@ const FAKETIME = '2020-01-01 00:00:00';
  * Find a plausible version of python to run, if none provided.
  * The preferred version is only used if command is not specified.
  */
-function findPython(command: string|undefined, preferredVersion?: string) {
+function findPython(command: string|undefined, preferredVersion?: string): string {
   if (command) { return command; }
   // No command specified.  In this case, grist-core looks for a "venv"
   // virtualenv; a python3 virtualenv would be in "sandbox_venv3".
   // TODO: rationalize this, it is a product of haphazard growth.
   const prefs = preferredVersion === '2' ? ['venv', 'sandbox_venv3'] : ['sandbox_venv3', 'venv'];
   for (const venv of prefs) {
-    const pythonPath = path.join(process.cwd(), venv, 'bin', 'python');
-    if (fs.existsSync(pythonPath)) {
-      command = pythonPath;
-      break;
+    const base = getUnpackedAppRoot();
+    // Try a battery of possible python executable paths when python is installed
+    // in a standalone directory.
+    // This battery of possibilities comes from Electron packaging, where python
+    // is bundled with Grist. Not all the possibilities are needed (there are
+    // multiple popular python bundles per OS).
+    for (const possiblePath of [['bin', 'python'], ['bin', 'python3'],
+                                ['Scripts', 'python.exe'], ['python.exe']] as const) {
+      const pythonPath = path.join(base, venv, ...possiblePath);
+      if (fs.existsSync(pythonPath)) {
+        return pythonPath;
+      }
     }
   }
   // Fall back on system python.
-  if (!command) {
-    command = which.sync(preferredVersion === '2' ? 'python2' : 'python3', {nothrow: true})
-      || which.sync(preferredVersion === '2' ? 'python2.7' : 'python3.9', {nothrow: true})
-      || which.sync('python');
+  const systemPrefs = preferredVersion === '2' ? ['2.7', '2', ''] : ['3.11', '3.10', '3.9', '3', ''];
+  for (const version of systemPrefs) {
+    const pythonPath = which.sync(`python${version}`, {nothrow: true});
+    if (pythonPath) {
+      return pythonPath;
+    }
   }
-  return command;
+  throw new Error('Cannot find Python');
 }
 
 /**
@@ -907,9 +1076,6 @@ export function createSandbox(defaultFlavorSpec: string, options: ISandboxCreati
     const flavor = parts[parts.length - 1];
     const version = parts.length === 2 ? parts[0] : '*';
     if (preferredPythonVersion === version || version === '*' || !preferredPythonVersion) {
-      if (!isFlavor(flavor)) {
-        throw new Error(`Unrecognized sandbox flavor: ${flavor}`);
-      }
       const creator = new NSandboxCreator({
         defaultFlavor: flavor,
         command: process.env['GRIST_SANDBOX' + (preferredPythonVersion||'')] ||
@@ -920,4 +1086,26 @@ export function createSandbox(defaultFlavorSpec: string, options: ISandboxCreati
     }
   }
   throw new Error('Failed to create a sandbox');
+}
+
+/**
+ * The realpath function may not be available, just return the
+ * path unchanged if it is not. Specifically, this happens when
+ * compiled for use in a browser environment.
+ */
+function realpathSync(src: string) {
+  try {
+    return fs.realpathSync(src);
+  } catch (e) {
+    return src;
+  }
+}
+
+function adjustedSpawn(cmd: string, args: string[], options?: SpawnOptionsWithoutStdio) {
+  const oomScoreAdj = process.env.GRIST_SANDBOX_OOM_SCORE_ADJ;
+  if (oomScoreAdj) {
+    return spawn('choom', ['-n', oomScoreAdj, '--', cmd, ...args], options);
+  } else {
+    return spawn(cmd, args, options);
+  }
 }

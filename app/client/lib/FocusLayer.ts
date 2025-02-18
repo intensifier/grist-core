@@ -10,7 +10,7 @@
 import * as Mousetrap from 'app/client/lib/Mousetrap';
 import {arrayRemove} from 'app/common/gutil';
 import {RefCountMap} from 'app/common/RefCountMap';
-import {Disposable, dom} from 'grainjs';
+import {Disposable, dom, DomMethod} from 'grainjs';
 
 /**
  * The default focus is organized into layers. A layer determines when focus should move to the
@@ -82,7 +82,7 @@ class FocusLayerManager extends Disposable {
     this._focusLayers.push(layer);
     // Move the focus to the new layer. Not just grabFocus, because if the focus is on the previous
     // layer's defaultFocusElem, the new layer might consider it "allowed" and never get the focus.
-    setTimeout(() => layer.defaultFocusElem.focus(), 0);
+    setTimeout(() => layer.defaultFocusElem.focus({preventScroll: true}), 0);
   }
 
   public removeLayer(layer: FocusLayer) {
@@ -121,7 +121,7 @@ class FocusLayerManager extends Disposable {
       watchElementForBlur(document.activeElement, () => this.grabFocus());
       layer.onDefaultBlur();
     } else {
-      layer.defaultFocusElem.focus();
+      layer.defaultFocusElem.focus({preventScroll: true});
       layer.onDefaultFocus();
     }
   }
@@ -134,6 +134,17 @@ export class FocusLayer extends Disposable implements FocusLayerOptions {
   // FocusLayer.grabFocus() allows triggering the focus check manually.
   public static grabFocus() {
     _focusLayerManager.get(null)?.grabFocus();
+  }
+
+  /**
+   * Creates a new FocusLayer and attaches it to the given element. The layer will be disposed
+   * automatically when the element is removed from the DOM.
+   */
+  public static attach(options: Partial<FocusLayerOptions>): DomMethod<HTMLElement> {
+    return (element: HTMLElement) => {
+      const layer = FocusLayer.create(null, {defaultFocusElem: element, ...options});
+      dom.autoDisposeElem(element, layer);
+    };
   }
 
   public defaultFocusElem: HTMLElement;

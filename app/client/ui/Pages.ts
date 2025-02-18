@@ -1,19 +1,23 @@
 import {createGroup} from 'app/client/components/commands';
-import {duplicatePage} from 'app/client/components/duplicatePage';
+import {buildDuplicatePageDialog} from 'app/client/components/duplicatePage';
 import {GristDoc} from 'app/client/components/GristDoc';
+import {makeT} from 'app/client/lib/localization';
+import {logTelemetryEvent} from 'app/client/lib/telemetry';
 import {PageRec} from 'app/client/models/DocModel';
 import {urlState} from 'app/client/models/gristUrlState';
 import MetaTableModel from 'app/client/models/MetaTableModel';
 import {find as findInTree, fromTableData, TreeItemRecord, TreeRecord,
         TreeTableData} from 'app/client/models/TreeModel';
 import {TreeViewComponent} from 'app/client/ui/TreeViewComponent';
-import {labeledCircleCheckbox} from 'app/client/ui2018/checkbox';
-import {colors} from 'app/client/ui2018/cssVars';
+import {cssRadioCheckboxOptions, radioCheckboxOption} from 'app/client/ui2018/checkbox';
+import {theme} from 'app/client/ui2018/cssVars';
 import {cssLink} from 'app/client/ui2018/links';
 import {ISaveModalOptions, saveModal} from 'app/client/ui2018/modals';
-import {buildPageDom, PageActions} from 'app/client/ui2018/pages';
+import {buildCensoredPage, buildPageDom, PageActions} from 'app/client/ui2018/pages';
 import {mod} from 'app/common/gutil';
-import {Computed, Disposable, dom, DomContents, fromKo, makeTestId, observable, Observable, styled} from 'grainjs';
+import {Computed, Disposable, dom, fromKo, makeTestId, observable, Observable, styled} from 'grainjs';
+
+const t = makeT('Pages');
 
 // build dom for the tree view of pages
 export function buildPagesDom(owner: Disposable, activeDoc: GristDoc, isOpen: Observable<boolean>) {
@@ -21,11 +25,12 @@ export function buildPagesDom(owner: Disposable, activeDoc: GristDoc, isOpen: Ob
   const buildDom = buildDomFromTable.bind(null, pagesTable, activeDoc);
 
   const records = Computed.create<TreeRecord[]>(owner, (use) =>
-    use(activeDoc.docModel.visibleDocPages).map(page => ({
+    use(activeDoc.docModel.menuPages).map(page => ({
       id: page.getRowId(),
       indentation: use(page.indentation),
       pagePos: use(page.pagePos),
       viewRef: use(page.viewRef),
+      hidden: use(page.isCensored),
     }))
   );
   const getTreeTableData = (): TreeTableData => ({
@@ -55,7 +60,12 @@ export function buildPagesDom(owner: Disposable, activeDoc: GristDoc, isOpen: Ob
 
 const testId = makeTestId('test-removepage-');
 
-function buildDomFromTable(pagesTable: MetaTableModel<PageRec>, activeDoc: GristDoc, pageId: number) {
+function buildDomFromTable(pagesTable: MetaTableModel<PageRec>, activeDoc: GristDoc, pageId: number, hidden: boolean) {
+
+  if (hidden) {
+    return buildCensoredPage();
+  }
+
   const {isReadonly} = activeDoc;
   const pageName = pagesTable.rowModels[pageId].view.peek().name;
   const viewId = pagesTable.rowModels[pageId].view.peek().id.peek();
@@ -63,8 +73,7 @@ function buildDomFromTable(pagesTable: MetaTableModel<PageRec>, activeDoc: Grist
   const actions: PageActions = {
     onRename: (newName: string) => newName.length && pageName.saveOnly(newName),
     onRemove: () => removeView(activeDoc, viewId, pageName.peek()),
-    // TODO: duplicate should prompt user for confirmation
-    onDuplicate: () => duplicatePage(activeDoc, pageId),
+    onDuplicate: () => buildDuplicatePageDialog(activeDoc, pageId),
     // Can't remove last visible page
     isRemoveDisabled: () => activeDoc.docModel.visibleDocPages.peek().length <= 1,
     isReadonly
@@ -74,10 +83,12 @@ function buildDomFromTable(pagesTable: MetaTableModel<PageRec>, activeDoc: Grist
 }
 
 function removeView(activeDoc: GristDoc, viewId: number, pageName: string) {
+  logTelemetryEvent('deletedPage', {full: {docIdDigest: activeDoc.docId()}});
+
   const docData = activeDoc.docData;
   // Create a set with tables on other pages (but not on this one).
   const tablesOnOtherViews = new Set(activeDoc.docModel.viewSections.rowModels
-    .filter(vs => !vs.isRaw.peek() && vs.parentId.peek() !== viewId)
+    .filter(vs => !vs.isRaw.peek() && !vs.isRecordCard.peek() && vs.parentId.peek() !== viewId)
     .map(vs => vs.tableRef.peek()));
 
   // Check if this page is a last page for some tables.
@@ -91,11 +102,11 @@ function removeView(activeDoc: GristDoc, viewId: number, pageName: string) {
   const removePage = () => [['RemoveRecord', '_grist_Views', viewId]];
   const removeAll = () => [
     ...removePage(),
-    ...notVisibleTables.map(t => ['RemoveTable', t.tableId.peek()])
+    ...notVisibleTables.map(tb => ['RemoveTable', tb.tableId.peek()])
   ];
 
   if (notVisibleTables.length) {
-    const tableNames = notVisibleTables.map(t => t.tableNameDef.peek());
+    const tableNames = notVisibleTables.map(tb => tb.tableNameDef.peek());
     buildPrompt(tableNames, async (option) => {
       // Errors are handled in the dialog.
       if (option === 'data') {
@@ -128,15 +139,15 @@ function buildPrompt(tableNames: string[], onSave: (option: RemoveOption) => Pro
     const saveDisabled = Computed.create(owner, use => use(selected) === '');
     const saveFunc = () => onSave(selected.get());
     return {
-      title: `The following table${tableNames.length > 1 ? 's' : ''} will no longer be visible`,
+      title: t('The following tables will no longer be visible', { count: tableNames.length }),
       body: dom('div',
         testId('popup'),
         buildWarning(tableNames),
-        cssOptions(
-          buildOption(selected, 'data', `Delete data and this page.`),
-          buildOption(selected, 'page',
-            [
-              `Delete this page, but do not delete data. `,
+        cssRadioCheckboxOptions(
+          radioCheckboxOption(selected, 'data', t("Delete data and this page.")),
+          radioCheckboxOption(selected, 'page',
+            [ // TODO i18n
+              `Keep data and delete page. `,
               `Table will remain available in `,
               cssLink(urlState().setHref({docPage: 'data'}), 'raw data page', { target: '_blank'}),
               `.`
@@ -144,7 +155,7 @@ function buildPrompt(tableNames: string[], onSave: (option: RemoveOption) => Pro
         )
       ),
       saveDisabled,
-      saveLabel: 'Delete',
+      saveLabel: t("Delete"),
       saveFunc,
       width: 'fixed-wide',
       extraButtons: [],
@@ -152,53 +163,12 @@ function buildPrompt(tableNames: string[], onSave: (option: RemoveOption) => Pro
   });
 }
 
-function buildOption(value: Observable<RemoveOption>, id: RemoveOption, content: DomContents) {
-  const selected = Computed.create(null, use => use(value) === id)
-    .onWrite(val => val ? value.set(id) : void 0);
-  return dom.update(
-    labeledCircleCheckbox(selected, content, dom.autoDispose(selected)),
-    testId(`option-${id}`),
-    cssBlockCheckbox.cls(''),
-    cssBlockCheckbox.cls('-block', selected),
-  );
-}
 
 function buildWarning(tables: string[]) {
   return cssWarning(
-    dom.forEach(tables, (t) => cssTableName(t, testId('table')))
+    dom.forEach(tables, (tb) => cssTableName(tb, testId('table')))
   );
 }
-
-const cssOptions = styled('div', `
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-`);
-
-// We need to reset top and left of ::before element, as it is wrongly set
-// on the inline checkbox.
-// To simulate radio button behavior, we will block user input after option is selected, because
-// checkbox doesn't support two-way binding.
-const cssBlockCheckbox = styled('div', `
-  display: flex;
-  padding: 10px 8px;
-  border: 1px solid ${colors.mediumGrey};
-  border-radius: 3px;
-  cursor: pointer;
-  & input::before, & input::after  {
-    top: unset;
-    left: unset;
-  }
-  &:hover {
-    border-color: ${colors.lightGreen};
-  }
-  &-block {
-    pointer-events: none;
-  }
-  &-block a {
-    pointer-events: all;
-  }
-`);
 
 const cssWarning = styled('div', `
   display: flex;
@@ -208,7 +178,8 @@ const cssWarning = styled('div', `
 `);
 
 const cssTableName = styled('div', `
-  background: #eee;
+  color: ${theme.choiceTokenFg};
+  background-color: ${theme.choiceTokenBg};
   padding: 3px 6px;
   border-radius: 4px;
 `);

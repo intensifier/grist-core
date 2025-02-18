@@ -1,11 +1,11 @@
+import logging
 import actions
-import logger
 
 import testsamples
 import testutil
 import test_engine
 
-log = logger.Logger(__name__, logger.INFO)
+log = logging.getLogger(__name__)
 
 def _bulk_update(table_name, col_names, row_data):
   return actions.BulkUpdateRecord(
@@ -756,7 +756,30 @@ return ",".join(str(r.id) for r in Students.lookupRecords(firstName=fn, lastName
       "SCHEMA": [
         [1, "Table1", [
           [1, "num", "Numeric", False, "", "", ""],
-          [2, "lookup", "Any", True, "Table1.lookupRecords(sort_by='num').num", "", ""],
+          [4, "is_num", "Any", True,
+           "isinstance($num, float)", "", ""],
+          [2, "lookup", "Any", True,
+           "Table1.lookupRecords(sort_by='num').num", "", ""],
+          [3, "lookup_reverse", "Any", True,
+           "Table1.lookupRecords(sort_by='-num').num", "", ""],
+          [5, "lookup_first", "Any", True,
+           "Table1.lookupOne().num", "", ""],
+          [6, "lookup_min", "Any", True,
+           "Table1.lookupOne(sort_by='num').num", "", ""],
+          [7, "lookup_min_num", "Any", True,
+           "Table1.lookupOne(is_num=True, sort_by='num').num", "", ""],
+          [8, "lookup_max", "Any", True,
+           "Table1.lookupOne(sort_by='-num').num", "", ""],
+          [9, "lookup_max_num",
+           "Any", True,
+           "Table1.lookupOne(is_num=True, sort_by='-num').num", "", ""],
+
+          [10, "lookup_2a", "Any", True,
+           "Table1.lookupRecords(order_by=('is_num', 'num')).num", "", ""],
+          [10, "lookup_2b", "Any", True,
+           "Table1.lookupRecords(order_by=('is_num', '-num')).num", "", ""],
+          [10, "lookup_2c", "Any", True,
+           "Table1.lookupRecords(order_by=('-is_num', 'num')).num", "", ""],
         ]]
       ],
       "DATA": {
@@ -774,8 +797,47 @@ return ",".join(str(r.id) for r in Students.lookupRecords(firstName=fn, lastName
 
     self.assertTableData(
       "Table1", cols="subset", rows="subset", data=[
-        ["id", "lookup"],
-        [1, [None, 0, 1, 2, 3, 'foo']],
+        ["id",
+         "lookup",
+         "lookup_reverse",
+         "lookup_first",
+         "lookup_min", "lookup_min_num",
+         "lookup_max", "lookup_max_num",
+         "lookup_2a", "lookup_2b", "lookup_2c"],
+        [1,
+         [None, 0, 1, 2, 3, 'foo'],
+         ['foo', 3, 2, 1, 0, None],
+         2,  # lookup_first: first record (by id)
+         None, 0,  # lookup_min[_num]
+         'foo', 3,  # lookup_max[_num]
+        [None, 'foo', 0, 1, 2, 3],   # lookup_2a ('is_num', 'num')
+        ['foo', None, 3, 2, 1, 0],   # lookup_2b ('is_num', '-num')
+        [0, 1, 2, 3, None, 'foo'],   # lookup_2c ('-is_num', 'num')
+        ]
+      ])
+
+    # Ensure that changes in values used for sorting result in updates,
+    # and produce correctly sorted updates.
+    self.update_record("Table1", 2, num=100)
+    self.assertTableData(
+      "Table1", cols="subset", rows="subset", data=[
+        ["id",
+         "lookup",
+         "lookup_reverse",
+         "lookup_first",
+         "lookup_min", "lookup_min_num",
+         "lookup_max", "lookup_max_num",
+         "lookup_2a", "lookup_2b", "lookup_2c"],
+        [1,
+         [None, 0, 2, 3, 100, 'foo'],
+         ['foo', 100, 3, 2, 0, None],
+         2,  # lookup_first: first record (by id)
+         None, 0,  # lookup_min[_num]
+         'foo', 100,  # lookup_max[_num]
+        [None, 'foo', 0, 2, 3, 100],   # lookup_2a ('is_num', 'num')
+        ['foo', None, 100, 3, 2, 0],   # lookup_2b ('is_num', '-num')
+        [0, 2, 3, 100, None, 'foo'],   # lookup_2c ('-is_num', 'num')
+        ]
       ])
 
   def test_conversion(self):

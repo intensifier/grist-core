@@ -1,126 +1,90 @@
+/**
+ * Overview of Excel exports, which now use worker-threads.
+ *
+ * 1. The flow starts with the streamXLSX() method called in the main thread.
+ * 2. It uses the 'piscina' library to call a makeXLSX* method in a worker thread, registered in
+ *    workerExporter.ts, to export full doc, a table, or a section.
+ * 3. Each of those methods calls a doMakeXLSX* method defined in that file. I.e. downloadXLSX()
+ *    is called in the main thread, but makeXLSX() and doMakeXLSX() are called in the worker thread.
+ * 4. doMakeXLSX* methods get data using an ActiveDocSource, which uses Rpc (from grain-rpc
+ *    module) to request data over a message port from the ActiveDoc in the main thread.
+ * 5. The resulting stream of Excel data is streamed back to the main thread using Rpc too.
+ */
 import {ActiveDoc} from 'app/server/lib/ActiveDoc';
-import {createExcelFormatter} from 'app/server/lib/ExcelFormatter';
-import {ExportData, exportDoc} from 'app/server/lib/Export';
-import {Alignment, Border, Fill, Workbook} from 'exceljs';
-import * as express from 'express';
+import {ActiveDocSource, ActiveDocSourceDirect, ExportParameters} from 'app/server/lib/Export';
 import log from 'app/server/lib/log';
-import contentDisposition from 'content-disposition';
+import {addAbortHandler} from 'app/server/lib/requestUtils';
+import * as express from 'express';
+import {Rpc} from 'grain-rpc';
+import {AbortController} from 'node-abort-controller';
+import {Writable} from 'stream';
+import {MessageChannel} from 'worker_threads';
+import Piscina from 'piscina';
 
-export interface DownloadXLSXOptions {
-  filename: string;
+// If this file is imported from within a worker thread, we'll create more thread pools from each
+// thread, with a potential for an infinite loop of doom. Better to catch that early.
+if (Piscina.isWorkerThread) {
+  throw new Error("ExportXLSX must not be imported from within a worker thread");
 }
 
+// Configure the thread-pool to use for exporting XLSX files.
+const exportPool = new Piscina({
+  filename: __dirname + '/workerExporter.js',
+  minThreads: 0,
+  maxThreads: 4,
+  maxQueue: 100,          // Fail if this many tasks are already waiting for a thread.
+  idleTimeout: 10_000,    // Drop unused threads after 10s of inactivity.
+});
+
 /**
- * Converts `activeDoc` to CSV and sends the converted data through `res`.
+ * Converts `activeDoc` to XLSX and sends to the given outputStream.
  */
-export async function downloadXLSX(activeDoc: ActiveDoc, req: express.Request,
-                                   res: express.Response, {filename}: DownloadXLSXOptions) {
+export async function streamXLSX(activeDoc: ActiveDoc, req: express.Request,
+                                 outputStream: Writable, options: ExportParameters) {
   log.debug(`Generating .xlsx file`);
-  const data = await makeXLSX(activeDoc, req);
-  res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', contentDisposition(filename + '.xlsx'));
-  res.send(data);
-  log.debug('XLSX file generated');
-}
+  const testDates = (req.hostname === 'localhost');
 
-/**
- * Creates excel document with all tables from an active Grist document.
- */
-export async function makeXLSX(
-  activeDoc: ActiveDoc,
-  req: express.Request): Promise<ArrayBuffer> {
-  const content = await exportDoc(activeDoc, req);
-  const data = await convertToExcel(content, req.hostname === 'localhost');
-  return data;
-}
-
-/**
- * Converts export data to an excel file.
- */
-async function convertToExcel(tables: ExportData[], testDates: boolean) {
-  // Create workbook and add single sheet to it.
-  const wb = new Workbook();
-  if (testDates) {
-    // HACK: for testing, we will keep static dates
-    const date = new Date(Date.UTC(2018, 11, 1, 0, 0, 0));
-    wb.modified = date;
-    wb.created = date;
-    wb.lastPrinted = date;
-    wb.creator = 'test';
-    wb.lastModifiedBy = 'test';
-  }
-  // Prepare border - some of the cells can have background colors, in that case border will
-  // not be visible
-  const borderStyle: Border = {
-    color: { argb: 'FFE2E2E3' }, // dark gray - default border color for gdrive
-    style: 'thin'
-  };
-  const borders = {
-    left: borderStyle,
-    right: borderStyle,
-    top: borderStyle,
-    bottom: borderStyle
-  };
-  const headerBackground: Fill = {
-    type: 'pattern',
-    pattern: 'solid',
-    fgColor: { argb: 'FFEEEEEE' } // gray
-  };
-  const headerFontColor = {
-    color: {
-      argb: 'FF000000' // black
-    }
-  };
-  const centerAlignment: Partial<Alignment> = {
-    horizontal: 'center'
-  };
-  for (const table of tables) {
-    const { columns, rowIds, access, tableName } = table;
-    const ws = wb.addWorksheet(sanitizeWorksheetName(tableName));
-    // Build excel formatters.
-    const formatters = columns.map(col => createExcelFormatter(col.type, col.widgetOptions));
-    // Generate headers for all columns with correct styles for whole column.
-    // Actual header style for a first row will be overwritten later.
-    ws.columns = columns.map((col, c) => ({ header: col.label, style: formatters[c].style() }));
-    // Populate excel file with data
-    rowIds.forEach(row => {
-      ws.addRow(access.map((getter, c) => formatters[c].formatAny(getter(row))));
+  const { port1, port2 } = new MessageChannel();
+  try {
+    const rpc = new Rpc({
+      sendMessage: async (m) => port1.postMessage(m),
+      logger: { info: m => {}, warn: m => log.warn(m) },
     });
-    // style up the header row
-    for (let i = 1; i <= columns.length; i++) {
-      // apply to all rows (including header)
-      ws.getColumn(i).border = borders;
-      // apply only to header
-      const header = ws.getCell(1, i);
-      header.fill = headerBackground;
-      header.font = headerFontColor;
-      header.alignment = centerAlignment;
-    }
-    // Make each column a little wider.
-    ws.columns.forEach(column => {
-      if (!column.header) {
-        return;
-      }
-      // 14 points is about 100 pixels in a default font (point is around 7.5 pixels)
-      column.width = column.header.length < 14 ? 14 : column.header.length;
+    rpc.registerImpl<ActiveDocSource>("activeDocSource", new ActiveDocSourceDirect(activeDoc, req));
+    rpc.on('message', (chunk) => { outputStream.write(chunk); });
+    port1.on('message', (m) => rpc.receiveMessage(m));
+
+    // For request cancelling to work, remember that such requests are forwarded via DocApiForwarder.
+    const abortController = new AbortController();
+    const cancelWorker = () => abortController.abort();
+
+    // When the worker thread is done, it closes the port on its side, and we listen to that to
+    // end the original request (the incoming HTTP request, in case of a download).
+    port1.on('close', () => {
+      outputStream.end();
+      req.off('close', cancelWorker);
     });
+
+    addAbortHandler(req, outputStream, cancelWorker);
+
+    const run = (method: string, ...args: any[]) => exportPool.run({port: port2, testDates, args}, {
+      name: method,
+      signal: abortController.signal,
+      transferList: [port2],
+    });
+
+    // hanlding 3 cases : full XLSX export (full file), view xlsx export, table xlsx export
+    try {
+      await run('makeXLSXFromOptions', options);
+      log.debug('XLSX file generated');
+    } catch (e) {
+      // We fiddle with errors in workerExporter to preserve extra properties like 'status'. Make
+      // the result an instance of Error again here (though we won't know the exact class).
+      throw (e instanceof Error) ? e : Object.assign(new Error(e.message), e);
+    }
+  } finally {
+    port1.close();
+    port2.close();
   }
-
-  return await wb.xlsx.writeBuffer();
 }
 
-/**
- * Removes invalid characters, see https://github.com/exceljs/exceljs/pull/1484
- */
-export function sanitizeWorksheetName(tableName: string): string {
-  return tableName
-    // Convert invalid characters to spaces
-    .replace(/[*?:/\\[\]]/g, ' ')
-
-    // Collapse multiple spaces into one
-    .replace(/\s+/g, ' ')
-
-    // Trim spaces and single quotes from the ends
-    .replace(/^['\s]+/, '')
-    .replace(/['\s]+$/, '');
-}

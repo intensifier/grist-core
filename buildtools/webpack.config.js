@@ -1,13 +1,26 @@
+const fs = require('fs');
 const MomentLocalesPlugin = require('moment-locales-webpack-plugin');
 const { ProvidePlugin } = require('webpack');
 const path = require('path');
+
+// Get path to top-level node_modules if in a yarn workspace.
+// Otherwise node_modules one level up won't get resolved.
+// This is used in Electron packaging.
+const base = path.dirname(path.dirname(require.resolve('grainjs/package.json')));
 
 module.exports = {
   target: 'web',
   entry: {
     main: "app/client/app",
     errorPages: "app/client/errorMain",
-    account: "app/client/accountMain",
+    apiconsole: "app/client/apiconsole",
+    billing: "app/client/billingMain",
+    form: "app/client/formMain",
+    // Include client test harness if it is present (it won't be in
+    // docker image).
+    ...(fs.existsSync("test/client-harness/client.js") ? {
+      test: "test/client-harness/client",
+    } : {}),
   },
   output: {
     filename: "[name].bundle.js",
@@ -37,10 +50,12 @@ module.exports = {
       path.resolve('.'),
       path.resolve('./ext'),
       path.resolve('./stubs'),
-      path.resolve('./node_modules')
+      path.resolve('./node_modules'),
+      base,
     ],
     fallback: {
       'path': require.resolve("path-browserify"),
+      'process': require.resolve("process/browser"),
     },
   },
   module: {
@@ -49,7 +64,6 @@ module.exports = {
         test: /\.(js|ts)?$/,
         loader: 'esbuild-loader',
         options: {
-          loader: 'ts',
           target: 'es2017',
           sourcemap: true,
         },
@@ -58,16 +72,26 @@ module.exports = {
       { test: /\.js$/,
         use: ["source-map-loader"],
         enforce: "pre"
+      },
+      {
+        test: /\.css$/,
+        type: 'asset/resource'
       }
     ]
   },
   plugins: [
     // Some modules assume presence of Buffer and process.
     new ProvidePlugin({
-      process: 'process/browser',
+      process: 'process',
       Buffer: ['buffer', 'Buffer']
     }),
     // To strip all locales except “en”
     new MomentLocalesPlugin()
   ],
+  externals: {
+    // for test bundle: jsdom should not be touched within browser
+    jsdom: 'alert',
+    // for test bundle: jquery will be available as jQuery
+    jquery: 'jQuery'
+  },
 };

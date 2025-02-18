@@ -1,12 +1,13 @@
 # pylint: disable=unused-argument
 
 from __future__ import absolute_import
+
+import datetime
 import math as _math
 import operator
-import os
 import random
 import uuid
-from functools import reduce
+from functools import reduce  # pylint: disable=redefined-builtin
 
 from six.moves import zip, xrange
 import six
@@ -19,10 +20,12 @@ import roman
 def _chain(*values_or_iterables):
   for v in values_or_iterables:
     try:
-      for x in v:
-        yield x
+      v = iter(v)
     except TypeError:
       yield v
+    else:
+      for x in v:
+        yield x
 
 
 # Iterates through iterable or other arguments, skipping non-numeric ones.
@@ -36,6 +39,13 @@ def _chain_numeric(*values_or_iterables):
 def _chain_numeric_a(*values_or_iterables):
   for v in _chain(*values_or_iterables):
     yield int(v) if ISLOGICAL(v) else v if ISNUMBER(v) else 0
+
+
+# Iterates through iterable or other arguments, only including numbers, dates, and datetimes.
+def _chain_numeric_or_date(*values_or_iterables):
+  for v in _chain(*values_or_iterables):
+    if ISNUMBER(v) and not ISLOGICAL(v) or isinstance(v, (datetime.date, datetime.datetime)):
+      yield v
 
 
 def _round_toward_zero(value):
@@ -480,6 +490,25 @@ def MULTINOMIAL(value1, *more_values):
     res *= COMBIN(s, v)
   return res
 
+def NUM(value):
+  """
+  For a Python floating-point value that's actually an integer, returns a Python integer type.
+  Otherwise, returns the value unchanged. This is helpful sometimes when a value comes from a
+  Numeric Grist column (represented as floats), but when int values are actually expected.
+
+  >>> NUM(-17.0)
+  -17
+  >>> NUM(1.5)
+  1.5
+  >>> NUM(4)
+  4
+  >>> NUM("NA")
+  'NA'
+  """
+  if isinstance(value, float) and value.is_integer():
+    return int(value)
+  return value
+
 def ODD(value):
   """
   Rounds a number up to the nearest odd integer.
@@ -858,12 +887,21 @@ def TRUNC(value, places=0):
 def UUID():
   """
   Generate a random UUID-formatted string identifier.
+
   Since UUID() produces a different value each time it's called, it is best to use it in
   [trigger formula](formulas.md#trigger-formulas) for new records.
-  This would only calculate UUID() once and freeze the calculated value. By contrast, a regular formula
-  may get recalculated any time the document is reloaded, producing a different value for UUID() each time.
+  This would only calculate UUID() once and freeze the calculated value. By contrast, a regular
+  formula may get recalculated any time the document is reloaded, producing a different value for
+  UUID() each time.
   """
-  if six.PY2:
-    return str(uuid.UUID(bytes=[chr(random.randrange(0, 256)) for _ in xrange(0, 16)], version=4))
-  else:
-    return str(uuid.UUID(bytes=bytes([random.randrange(0, 256) for _ in range(0, 16)]), version=4))
+  try:
+    uid = uuid.uuid4()
+  except Exception:
+    # Pynbox doesn't support the above because it doesn't support `os.urandom()`.
+    # Using the `random` module is less secure but should be OK.
+    if six.PY2:
+      byts = [chr(random.randrange(0, 256)) for _ in xrange(0, 16)]
+    else:
+      byts = bytes([random.randrange(0, 256) for _ in range(0, 16)])
+    uid = uuid.UUID(bytes=byts, version=4)
+  return str(uid)

@@ -15,12 +15,12 @@
 
 // tslint:disable:unified-signatures
 
+import {logTelemetryEvent} from 'app/client/lib/telemetry';
 import {AppModel} from 'app/client/models/AppModel';
 import {reportWarning} from 'app/client/models/errors';
 import {IAppError} from 'app/client/models/NotifyModel';
 import {GristLoadConfig} from 'app/common/gristUrls';
 import {timeFormat} from 'app/common/timeFormat';
-import {ActiveSessionInfo} from 'app/common/UserAPI';
 import * as version from 'app/common/version';
 import {dom} from 'grainjs';
 import identity = require('lodash/identity');
@@ -54,6 +54,11 @@ interface ISessionData {
   [key: string]: string;
 }
 
+interface ICallbackAttributes {
+  id?: string;
+  query?: string;
+}
+
 /**
  * This provides the HelpScout Beacon API, taking care of initializing Beacon on first use.
  */
@@ -65,7 +70,8 @@ export function Beacon(method: 'navigate', route: string): void;
 export function Beacon(method: 'identify', userObj: IUserObj): void;
 export function Beacon(method: 'prefill', formObj: IFormObj): void;
 export function Beacon(method: 'config', configObj: object): void;
-export function Beacon(method: 'on'|'once', event: string, callback: () => void): void;
+export function Beacon(method: 'on'|'once', event: string,
+  callback: (attrs?: ICallbackAttributes) => void): void;
 export function Beacon(method: 'off', event: string, callback?: () => void): void;
 export function Beacon(method: 'session-data', data: ISessionData): void;
 export function Beacon(method: BeaconCmd): void;
@@ -187,6 +193,15 @@ function _beaconOpen(userObj: IUserObj|null, options: IBeaconOpenOptions) {
   if (!skipNav) {
     Beacon('navigate', route);
   }
+
+  Beacon('once', 'open', () => logTelemetryEvent('beaconOpen'));
+  Beacon('on', 'article-viewed', (article) => logTelemetryEvent('beaconArticleViewed', {
+    full: {articleId: article!.id},
+  }));
+  Beacon('on', 'email-sent', () => logTelemetryEvent('beaconEmailSent'));
+  Beacon('on', 'search', (search) => logTelemetryEvent('beaconSearch', {
+    full: {searchQuery: search!.query},
+  }));
 }
 
 function fixBeaconBaseHref() {
@@ -233,7 +248,7 @@ function getBeaconUserObj(appModel: AppModel|null): IUserObj|null {
   if (!appModel) { return null; }
 
   // ActiveSessionInfo["user"] includes optional helpScoutSignature too.
-  const user = appModel.currentValidUser as ActiveSessionInfo["user"]|null;
+  const user = appModel.currentValidUser;
 
   // For anon user, don't attempt to identify anything. Even the "company" field (when anon on a
   // team doc) isn't useful, because the user may be external to the company.

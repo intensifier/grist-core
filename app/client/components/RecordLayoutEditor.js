@@ -2,8 +2,11 @@ var _ = require('underscore');
 var BackboneEvents = require('backbone').Events;
 
 var dispose = require('app/client/lib/dispose');
+var {makeT} = require('app/client/lib/localization');
 var commands = require('./commands');
 var LayoutEditor = require('./LayoutEditor');
+
+const t = makeT('RecordLayoutEditor');
 const {basicButton, cssButton, primaryButton} = require('app/client/ui2018/buttons');
 const {icon} = require('app/client/ui2018/icons');
 const {menu, menuDivider, menuItem} = require('app/client/ui2018/menus');
@@ -90,13 +93,13 @@ RecordLayoutEditor.prototype.buildEditorDom = function() {
   };
 
   return cssControls(
-    basicButton('Add Field', cssCollapseIcon('Collapse'),
+    basicButton(t('Add Field'), cssCollapseIcon('Collapse'),
       menu((ctl) => [
-        menuItem(() => addNewField(), 'Create New Field'),
+        menuItem(() => addNewField(), t('Create New Field')),
         dom.maybe((use) => use(this._hiddenColumns).length > 0,
           () => menuDivider()),
         dom.forEach(this._hiddenColumns, (col) =>
-          menuItem(() => showField(col), `Show field ${col.label()}`)
+          menuItem(() => showField(col), t("Show field {{- label}}", {label:col.label()}))
         ),
         testId('edit-layout-add-menu'),
       ]),
@@ -110,10 +113,10 @@ RecordLayoutEditor.prototype.buildEditorDom = function() {
 
 RecordLayoutEditor.prototype.buildFinishButtons = function() {
   return [
-    primaryButton('Save Layout',
+    primaryButton(t('Save Layout'),
       dom.on('click', () => commands.allCommands.accept.run()),
     ),
-    basicButton('Cancel',
+    basicButton(t('Cancel'),
       dom.on('click', () => commands.allCommands.cancel.run()),
       {style: 'margin-left: 8px'},
     ),
@@ -122,12 +125,13 @@ RecordLayoutEditor.prototype.buildFinishButtons = function() {
 
 RecordLayoutEditor.prototype.buildLeafDom = function() {
   return dom('div.layout_grabbable.g_record_layout_editing',
-    dom('div.g_record_delete_field.glyphicon.glyphicon-remove',
+    cssIconEyeClose(
       dom.on('mousedown', (ev) => ev.stopPropagation()),
       dom.on('click', (ev, elem) => {
         ev.preventDefault();
         ev.stopPropagation();
-        this.layoutEditor.removeContainingBox(elem);
+        const box = this.layoutEditor.getBoxFromElement(elem);
+        this.layoutEditor.removeContainingBox(box);
       })
     )
   );
@@ -146,5 +150,19 @@ const cssControls = styled('div', `
 const cssCollapseIcon = styled(icon, `
   margin: -3px -2px -2px 2px;
 `);
+
+const cssIconEyeClose = styled('div.g_record_delete_field', `
+  &::before {
+    display: block;
+    background-color: var(--grist-color-dark-text);
+    content: ' ';
+    mask-image: var(--icon-EyeHide);
+    width: 14px;
+    height: 14px;
+    mask-size: contain;
+    mask-repeat: no-repeat;
+  }
+`
+);
 
 module.exports = RecordLayoutEditor;

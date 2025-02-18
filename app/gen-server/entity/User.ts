@@ -1,11 +1,13 @@
 import {UserOptions} from 'app/common/UserAPI';
 import {nativeValues} from 'app/gen-server/lib/values';
-import {BaseEntity, Column, Entity, JoinTable, ManyToMany, OneToMany, OneToOne,
+import {makeId} from 'app/server/lib/idUtils';
+import {BaseEntity, BeforeInsert, Column, Entity, JoinTable, ManyToMany, OneToMany, OneToOne,
         PrimaryGeneratedColumn} from "typeorm";
 
 import {Group} from "./Group";
 import {Login} from "./Login";
 import {Organization} from "./Organization";
+import {Pref} from './Pref';
 
 @Entity({name: 'users'})
 export class User extends BaseEntity {
@@ -13,7 +15,7 @@ export class User extends BaseEntity {
   @PrimaryGeneratedColumn()
   public id: number;
 
-  @Column()
+  @Column({type: String})
   public name: string;
 
   @Column({name: 'api_key', type: String, nullable: true})
@@ -24,14 +26,20 @@ export class User extends BaseEntity {
   @Column({name: 'picture', type: String, nullable: true})
   public picture: string | null;
 
-  @Column({name: 'first_login_at', type: Date, nullable: true})
+  @Column({name: 'first_login_at', type: nativeValues.dateTimeType, nullable: true})
   public firstLoginAt: Date | null;
+
+  @Column({name: 'last_connection_at', type: nativeValues.dateTimeType, nullable: true})
+  public lastConnectionAt: Date | null;
 
   @OneToOne(type => Organization, organization => organization.owner)
   public personalOrg: Organization;
 
   @OneToMany(type => Login, login => login.user)
   public logins: Login[];
+
+  @OneToMany(type => Pref, pref => pref.user)
+  public prefs: Pref[];
 
   @ManyToMany(type => Group)
   @JoinTable({
@@ -41,7 +49,7 @@ export class User extends BaseEntity {
   })
   public groups: Group[];
 
-  @Column({name: 'is_first_time_user', default: false})
+  @Column({name: 'is_first_time_user', type: Boolean, default: false})
   public isFirstTimeUser: boolean;
 
   @Column({name: 'options', type: nativeValues.jsonEntityType, nullable: true})
@@ -49,6 +57,22 @@ export class User extends BaseEntity {
 
   @Column({name: 'connect_id', type: String, nullable: true})
   public connectId: string | null;
+
+  /**
+   * Unique reference for this user. Primarily used as an ownership key in a cell metadata (comments).
+   */
+  @Column({name: 'ref', type: String, nullable: false})
+  public ref: string;
+
+  @Column({name: 'created_at', default: () => 'CURRENT_TIMESTAMP'})
+  public createdAt: Date;
+
+  @BeforeInsert()
+  public async beforeInsert() {
+    if (!this.ref) {
+      this.ref = makeId();
+    }
+  }
 
   /**
    * Get user's email.  Returns undefined if logins has not been joined, or no login

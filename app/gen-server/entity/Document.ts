@@ -1,7 +1,8 @@
 import {ApiError} from 'app/common/ApiError';
 import {DocumentUsage} from 'app/common/DocUsage';
 import {Role} from 'app/common/roles';
-import {DocumentOptions, DocumentProperties, documentPropertyKeys, NEW_DOCUMENT_CODE} from "app/common/UserAPI";
+import {DocumentOptions, DocumentProperties, documentPropertyKeys, DocumentType,
+        NEW_DOCUMENT_CODE} from "app/common/UserAPI";
 import {nativeValues} from 'app/gen-server/lib/values';
 import {Column, Entity, JoinColumn, ManyToOne, OneToMany, PrimaryColumn} from "typeorm";
 import {AclRuleDoc} from "./AclRule";
@@ -21,7 +22,7 @@ function isValidUrlId(urlId: string) {
 @Entity({name: 'docs'})
 export class Document extends Resource {
 
-  @PrimaryColumn()
+  @PrimaryColumn({type: String})
   public id: string;
 
   @ManyToOne(type => Workspace)
@@ -32,12 +33,18 @@ export class Document extends Resource {
   public aclRules: AclRuleDoc[];
 
   // Indicates whether the doc is pinned to the org it lives in.
-  @Column({name: 'is_pinned', default: false})
+  @Column({name: 'is_pinned', type: Boolean, default: false})
   public isPinned: boolean;
 
   // Property that may be returned when the doc is fetched to indicate the access the
   // fetching user has on the doc, i.e. 'owners', 'editors', 'viewers'
   public access: Role|null;
+
+  // Property that may be returned when the doc is fetched to indicate the share it
+  // is being accessed with. The identifier used is the linkId, which is the share
+  // identifier that is the same between the home database and the document.
+  // The linkId is not a secret, and need only be unique within a document.
+  public linkId?: string|null;
 
   // Property set for forks, containing access the fetching user has on the trunk.
   public trunkAccess?: Role|null;
@@ -69,6 +76,22 @@ export class Document extends Resource {
   @Column({name: 'usage', type: nativeValues.jsonEntityType, nullable: true})
   public usage: DocumentUsage | null;
 
+  @Column({name: 'created_by', type: 'integer', nullable: true})
+  public createdBy: number|null;
+
+  @Column({name: 'trunk_id', type: 'text', nullable: true})
+  public trunkId: string|null;
+
+  @ManyToOne(_type => Document, document => document.forks)
+  @JoinColumn({name: 'trunk_id'})
+  public trunk: Document|null;
+
+  @OneToMany(_type => Document, document => document.trunk)
+  public forks: Document[];
+
+  @Column({name: 'type', type: 'text', nullable: true})
+  public type: DocumentType|null;
+
   public checkProperties(props: any): props is Partial<DocumentProperties> {
     return super.checkProperties(props, documentPropertyKeys);
   }
@@ -82,6 +105,7 @@ export class Document extends Resource {
       }
       this.urlId = props.urlId;
     }
+    if (props.type !== undefined) { this.type = props.type; }
     if (props.options !== undefined) {
       // Options are merged over the existing state - unless options
       // object is set to "null", in which case the state is wiped
@@ -98,6 +122,35 @@ export class Document extends Resource {
         }
         if (props.options.icon !== undefined) {
           this.options.icon = sanitizeIcon(props.options.icon);
+        }
+        if (props.options.externalId !== undefined) {
+          this.options.externalId = props.options.externalId;
+        }
+        if (props.options.tutorial !== undefined) {
+          // Tutorial metadata is merged over the existing state - unless
+          // metadata is set to "null", in which case the state is wiped
+          // completely.
+          if (props.options.tutorial === null) {
+            this.options.tutorial = null;
+          } else {
+            this.options.tutorial = this.options.tutorial || {};
+            if (props.options.tutorial.lastSlideIndex !== undefined) {
+              this.options.tutorial.lastSlideIndex = props.options.tutorial.lastSlideIndex;
+            }
+            if (props.options.tutorial.percentComplete !== undefined) {
+              this.options.tutorial.percentComplete = props.options.tutorial.percentComplete;
+            }
+          }
+        }
+        if (props.options.appearance !== undefined) {
+          if (props.options.appearance === null) {
+            this.options.appearance = null;
+          } else {
+            this.options.appearance = this.options.appearance || {};
+            if (props.options.appearance.icon !== undefined) {
+              this.options.appearance.icon = props.options.appearance.icon;
+            }
+          }
         }
         // Normalize so that null equates with absence.
         for (const key of Object.keys(this.options) as Array<keyof DocumentOptions>) {

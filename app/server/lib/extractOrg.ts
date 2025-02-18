@@ -1,8 +1,10 @@
 import { ApiError } from 'app/common/ApiError';
 import { mapGetOrSet, MapWithTTL } from 'app/common/AsyncCreate';
 import { extractOrgParts, getHostType, getKnownOrg } from 'app/common/gristUrls';
+import { isAffirmative } from 'app/common/gutil';
 import { Organization } from 'app/gen-server/entity/Organization';
-import { HomeDBManager } from 'app/gen-server/lib/HomeDBManager';
+import { HomeDBManager } from 'app/gen-server/lib/homedb/HomeDBManager';
+import { GristServer } from 'app/server/lib/GristServer';
 import { getOriginUrl } from 'app/server/lib/requestUtils';
 import { NextFunction, Request, RequestHandler, Response } from 'express';
 import { IncomingMessage } from 'http';
@@ -41,7 +43,7 @@ export class Hosts {
 
   // baseDomain should start with ".". It may be undefined for localhost or single-org mode.
   constructor(private _baseDomain: string|undefined, private _dbManager: HomeDBManager,
-              private _pluginUrl: string|undefined) {
+              private _gristServer: GristServer|undefined) {
   }
 
   /**
@@ -101,7 +103,7 @@ export class Hosts {
     } else {
       // Otherwise check for a custom host.
       const org = await mapGetOrSet(this._host2org, hostname, async () => {
-        const o = await this._dbManager.connection.manager.findOne(Organization, {host: hostname});
+        const o = await this._dbManager.connection.manager.findOne(Organization, {where: {host: hostname}});
         return o && o.domain || undefined;
       });
       if (!org) { throw new ApiError(`Domain not recognized: ${hostname}`, 404); }
@@ -152,7 +154,7 @@ export class Hosts {
     if (org && this._getHostType(req.headers.host!) === 'native' && !this._dbManager.isMergedOrg(org)) {
       // Check if the org has a preferred host.
       const orgHost = await mapGetOrSet(this._org2host, org, async () => {
-        const o = await this._dbManager.connection.manager.findOne(Organization, {domain: org});
+        const o = await this._dbManager.connection.manager.findOne(Organization, {where: {domain: org}});
         return o && o.host || undefined;
       });
       if (orgHost && orgHost !== req.hostname) {
@@ -165,6 +167,8 @@ export class Hosts {
   }
 
   private _getHostType(host: string) {
-    return getHostType(host, {baseDomain: this._baseDomain, pluginUrl: this._pluginUrl});
+    const pluginUrl = isAffirmative(process.env.GRIST_TRUST_PLUGINS) ?
+        undefined : this._gristServer?.getPluginUrl();
+    return getHostType(host, {baseDomain: this._baseDomain, pluginUrl});
   }
 }

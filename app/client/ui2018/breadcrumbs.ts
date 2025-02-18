@@ -5,28 +5,21 @@
  *
  * Workspace is a clickable link and document and page names are editable labels.
  */
+import {makeT} from 'app/client/lib/localization';
 import { urlState } from 'app/client/models/gristUrlState';
-import { colors, cssHideForNarrowScreen, mediaNotSmall, testId } from 'app/client/ui2018/cssVars';
+import { cssHideForNarrowScreen, mediaNotSmall, testId, theme } from 'app/client/ui2018/cssVars';
 import { editableLabel } from 'app/client/ui2018/editableLabel';
 import { icon } from 'app/client/ui2018/icons';
-import { UserOverride } from 'app/common/DocListAPI';
-import { userOverrideParams } from 'app/common/gristUrls';
+import { cssLink } from 'app/client/ui2018/links';
 import { BindableValue, dom, Observable, styled } from 'grainjs';
 import { tooltip } from 'popweasel';
 
+const t = makeT('breadcrumbs');
+
 export const cssBreadcrumbs = styled('div', `
-  color: ${colors.slate};
+  color: ${theme.lightText};
   white-space: nowrap;
   cursor: default;
-`);
-
-export const cssBreadcrumbsLink = styled('a', `
-  color: ${colors.lightGreen};
-  text-decoration: none;
-
-  &:hover {
-    text-decoration: underline;
-  }
 `);
 
 export const separator = styled('span', `
@@ -34,7 +27,7 @@ export const separator = styled('span', `
 `);
 
 const cssIcon = styled(icon, `
-  background-color: ${colors.lightGreen};
+  background-color: ${theme.accentIcon};
   margin-top: -2px;
 `);
 
@@ -43,7 +36,7 @@ const cssPublicIcon = styled(cssIcon, `
   margin-top: -4px;
 `);
 
-const cssWorkspaceName = styled(cssBreadcrumbsLink, `
+const cssWorkspaceName = styled(cssLink, `
   margin-left: 8px;
 `);
 
@@ -54,7 +47,7 @@ const cssWorkspaceNarrowScreen = styled(icon, `
   margin-bottom: 4px;
   margin-left: -7px;
   margin-right: 8px;
-  background-color: ${colors.slate};
+  background-color: ${theme.lightText};
   cursor: pointer;
   @media ${mediaNotSmall} {
     & {
@@ -65,21 +58,21 @@ const cssWorkspaceNarrowScreen = styled(icon, `
 
 const cssEditableName = styled('input', `
   &:hover, &:focus {
-    color: ${colors.dark};
+    color: ${theme.text};
   }
 `);
 
 const cssTag = styled('span', `
-  background-color: ${colors.slate};
-  color: white;
+  background-color: ${theme.breadcrumbsTagBg};
+  color: ${theme.breadcrumbsTagFg};
   border-radius: 3px;
   padding: 0 4px;
   margin-left: 4px;
 `);
 
 const cssAlertTag = styled(cssTag, `
-  background-color: ${colors.error};
-  --icon-color: white;
+  background-color: ${theme.breadcrumbsTagAlertBg};
+  --icon-color: ${theme.breadcrumbsTagFg};
   a {
     cursor: pointer;
   }
@@ -89,11 +82,6 @@ interface PartialWorkspace {
   id: number;
   name: string;
 }
-
-const fiddleExplanation = (
-  'You may make edits, but they will create a new copy and will\n' +
-    'not affect the original document.'
-);
 
 export function docBreadcrumbs(
   workspace: Observable<PartialWorkspace|null>,
@@ -106,16 +94,19 @@ export function docBreadcrumbs(
     isDocNameReadOnly?: BindableValue<boolean>,
     isPageNameReadOnly?: BindableValue<boolean>,
     isFork: Observable<boolean>,
+    isTutorialFork: Observable<boolean>,
     isBareFork: Observable<boolean>,
     isFiddle: Observable<boolean>,
     isRecoveryMode: Observable<boolean>,
-    userOverride: Observable<UserOverride|null>,
     isSnapshot?: Observable<boolean>,
     isPublic?: Observable<boolean>,
+    isTemplate?: Observable<boolean>,
+    isAnonymous?: boolean,
   }
   ): Element {
+    const shouldShowWorkspace = !(options.isTemplate && options.isAnonymous);
     return cssBreadcrumbs(
-      dom.domComputed<[boolean, PartialWorkspace|null]>(
+      !shouldShowWorkspace ? null : dom.domComputed<[boolean, PartialWorkspace|null]>(
         (use) => [use(options.isBareFork), use(workspace)],
         ([isBareFork, ws]) => {
           if (isBareFork || !ws) { return null; }
@@ -151,29 +142,20 @@ export function docBreadcrumbs(
       dom.maybe(options.isPublic, () => cssPublicIcon('PublicFilled', testId('bc-is-public'))),
       dom.domComputed((use) => {
         if (options.isSnapshot && use(options.isSnapshot)) {
-          return cssTag('snapshot', testId('snapshot-tag'));
+          return cssTag(t("snapshot"), testId('snapshot-tag'));
         }
-        if (use(options.isFork)) {
-          return cssTag('unsaved', testId('unsaved-tag'));
+        if (use(options.isFork) && !use(options.isTutorialFork)) {
+          return cssTag(t("unsaved"), testId('unsaved-tag'));
         }
         if (use(options.isRecoveryMode)) {
-          return cssAlertTag('recovery mode',
+          return cssAlertTag(t("recovery mode"),
                              dom('a', dom.on('click', () => options.cancelRecoveryMode()),
                                  icon('CrossSmall')),
                              testId('recovery-mode-tag'));
         }
-        const userOverride = use(options.userOverride);
-        if (userOverride) {
-          return cssAlertTag(userOverride.user?.email || 'override',
-            dom('a',
-              urlState().setHref(userOverrideParams(null)),
-              icon('CrossSmall')
-            ),
-            testId('user-override-tag')
-          );
-        }
         if (use(options.isFiddle)) {
-          return cssTag('fiddle', tooltip({title: fiddleExplanation}), testId('fiddle-tag'));
+          return cssTag(t("fiddle"), tooltip({title: t(`You may make edits, but they will create a new copy and will
+not affect the original document.`)}), testId('fiddle-tag'));
         }
       }),
       separator(' / ',

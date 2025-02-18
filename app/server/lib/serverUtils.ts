@@ -1,14 +1,18 @@
-import bluebird from 'bluebird';
-import { ChildProcess } from 'child_process';
-import * as net from 'net';
-import * as path from 'path';
-import { ConnectionOptions } from 'typeorm';
-import uuidv4 from 'uuid/v4';
-
 import {EngineCode} from 'app/common/DocumentSettings';
+import {OptDocSession} from 'app/server/lib/DocSession';
 import log from 'app/server/lib/log';
-import { OpenMode, SQLiteDB } from 'app/server/lib/SQLiteDB';
-import { getDocSessionAccessOrNull, getDocSessionUser, OptDocSession } from './DocSession';
+import {getLogMeta} from 'app/server/lib/sessionUtils';
+import {OpenMode, SQLiteDB} from 'app/server/lib/SQLiteDB';
+import bluebird from 'bluebird';
+import {ChildProcess} from 'child_process';
+import * as net from 'net';
+import {AbortSignal} from 'node-abort-controller';
+import * as path from 'path';
+import {ConnectionOptions} from 'typeorm';
+import {v4 as uuidv4} from 'uuid';
+
+// This method previously lived in this file. Re-export to avoid changing imports all over.
+export {timeoutReached} from 'app/common/gutil';
 
 /**
  * Promisify a node-style callback function. E.g.
@@ -98,20 +102,6 @@ export function exitPromise(child: ChildProcess): Promise<number|string> {
 }
 
 /**
- * Resolves to true if promise is still pending after msec milliseconds have passed. Otherwise
- * returns false, including when promise is rejected.
- */
-export function timeoutReached<T>(msec: number, promise: Promise<T>): Promise<boolean> {
-  const timedOut = {};
-  // Be careful to clean up the timer after ourselves, so it doesn't remain in the event loop.
-  let timer: NodeJS.Timer;
-  const delayPromise = new Promise<any>((resolve) => (timer = setTimeout(() => resolve(timedOut), msec)));
-  return Promise.race([promise, delayPromise])
-  .then((res) => { clearTimeout(timer); return res === timedOut; })
-  .catch(() => false);
-}
-
-/**
  * Get database url in DATABASE_URL format popularized by heroku, suitable for
  * use by psql, sqlalchemy, etc.
  */
@@ -135,27 +125,20 @@ export function getDatabaseUrl(options: ConnectionOptions, includeCredentials: b
  */
 export async function checkAllegedGristDoc(docSession: OptDocSession, fname: string) {
   const db = await SQLiteDB.openDBRaw(fname, OpenMode.OPEN_READONLY);
-  const integrityCheckResults = await db.all('PRAGMA integrity_check');
-  if (integrityCheckResults.length !== 1 || integrityCheckResults[0].integrity_check !== 'ok') {
-    const uuid = uuidv4();
-    log.info('Integrity check failure on import', {uuid, integrityCheckResults,
-                                                   ...getLogMetaFromDocSession(docSession)});
-    throw new Error(`Document failed integrity checks - is it corrupted? Event ID: ${uuid}`);
+  try {
+    const integrityCheckResults = await db.all('PRAGMA integrity_check');
+    if (integrityCheckResults.length !== 1 || integrityCheckResults[0].integrity_check !== 'ok') {
+      const uuid = uuidv4();
+      log.info('Integrity check failure on import', {
+        uuid,
+        integrityCheckResults,
+        ...getLogMeta(docSession),
+      });
+      throw new Error(`Document failed integrity checks - is it corrupted? Event ID: ${uuid}`);
+    }
+  } finally {
+    await db.close();
   }
-}
-
-/**
- * Extract access, userId, email, and client (if applicable) from session, for logging purposes.
- */
-export function getLogMetaFromDocSession(docSession: OptDocSession) {
-  const client = docSession.client;
-  const access = getDocSessionAccessOrNull(docSession);
-  const user = getDocSessionUser(docSession);
-  return {
-    access,
-    ...(user ? {userId: user.id, email: user.email} : {}),
-    ...(client ? client.getLogMeta() : {}),   // Client if present will repeat and add to user info.
-  };
 }
 
 /**
@@ -167,4 +150,42 @@ export function getSupportedEngineChoices(): EngineCode[]|undefined {
     return ['python2', 'python3'];
   }
   return undefined;
+}
+
+/**
+ * Returns a promise that resolves in the given number of milliseconds or rejects
+ * when the given signal is raised.
+ */
+export async function delayAbort(msec: number, signal?: AbortSignal): Promise<void> {
+  let cleanup: () => void = () => {};
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => resolve(), msec);
+      signal?.addEventListener('abort', reject);
+      cleanup = () => {
+        // Be careful to clean up both the timer and the listener to avoid leaks.
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', reject);
+      };
+    });
+  } finally {
+    cleanup();
+  }
+}
+
+/**
+ * For a Redis URI, we expect no path component, or a path component
+ * that is an integer database number. We'd like to scope pub/sub to
+ * individual databases. Redis doesn't do that, so we construct a
+ * key prefix to have the same effect.
+ *   https://redis.io/docs/manual/pubsub/#database--scoping
+ */
+export function getPubSubPrefix(): string {
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) { return 'db-x'; }
+  const dbNumber = new URL(redisUrl).pathname.replace(/^\//, '');
+  if (dbNumber.match(/[^0-9]/)) {
+    throw new Error('REDIS_URL has an unexpected structure');
+  }
+  return `db-${dbNumber}`;
 }

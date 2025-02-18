@@ -1,12 +1,15 @@
 import {get as getBrowserGlobals} from 'app/client/lib/browserGlobals';
 import {guessTimezone} from 'app/client/lib/guessTimezone';
+import {getSessionStorage} from 'app/client/lib/storage';
+import {newUserAPIImpl} from 'app/client/models/AppModel';
 import {getWorker} from 'app/client/models/gristConfigCache';
 import {CommResponseBase} from 'app/common/CommTypes';
 import * as gutil from 'app/common/gutil';
 import {addOrgToPath, docUrl, getGristConfig} from 'app/common/urlUtils';
-import {UserAPI, UserAPIImpl} from 'app/common/UserAPI';
+import {UserAPI} from 'app/common/UserAPI';
 import {Events as BackboneEvents} from 'backbone';
 import {Disposable} from 'grainjs';
+import {GristClientSocket} from './GristClientSocket';
 
 const G = getBrowserGlobals('window');
 const reconnectInterval = [1000, 1000, 2000, 5000, 10000];
@@ -24,7 +27,7 @@ async function getDocWorkerUrl(assignmentId: string|null): Promise<string|null> 
   // never changes.
   if (assignmentId === null) { return docUrl(null); }
 
-  const api: UserAPI = new UserAPIImpl(getGristConfig().homeUrl!);
+  const api: UserAPI = newUserAPIImpl();
   return getWorker(api, assignmentId);
 }
 
@@ -35,7 +38,7 @@ async function getDocWorkerUrl(assignmentId: string|null): Promise<string|null> 
 export interface GristWSSettings {
   // A factory function for creating the WebSocket so that we can use from node
   // or browser.
-  makeWebSocket(url: string): WebSocket;
+  makeWebSocket(url: string): GristClientSocket;
 
   // A function for getting the timezone, so the code can be used outside webpack -
   // currently a timezone library is lazy loaded in a way that doesn't quite work
@@ -70,25 +73,27 @@ export interface GristWSSettings {
  * An implementation of Grist websocket connection settings for the browser.
  */
 export class GristWSSettingsBrowser implements GristWSSettings {
-  public makeWebSocket(url: string) { return new WebSocket(url); }
+  private _sessionStorage = getSessionStorage();
+
+  public makeWebSocket(url: string) { return new GristClientSocket(url); }
   public getTimezone()              { return guessTimezone(); }
   public getPageUrl()               { return G.window.location.href; }
   public async getDocWorkerUrl(assignmentId: string|null) {
     return getDocWorkerUrl(assignmentId);
   }
   public getClientId(assignmentId: string|null) {
-    return window.sessionStorage.getItem(`clientId_${assignmentId}`) || null;
+    return this._sessionStorage.getItem(`clientId_${assignmentId}`) || null;
   }
   public getUserSelector(): string {
     // TODO: find/create a more official way to get the user.
     return (window as any).gristDocPageModel?.appModel.currentUser?.email || '';
   }
   public updateClientId(assignmentId: string|null, id: string) {
-    window.sessionStorage.setItem(`clientId_${assignmentId}`, id);
+    this._sessionStorage.setItem(`clientId_${assignmentId}`, id);
   }
   public advanceCounter(): string {
-    const value = parseInt(window.sessionStorage.getItem('clientCounter')!, 10) || 0;
-    window.sessionStorage.setItem('clientCounter', String(value + 1));
+    const value = parseInt(this._sessionStorage.getItem('clientCounter')!, 10) || 0;
+    this._sessionStorage.setItem('clientCounter', String(value + 1));
     return String(value);
   }
   public log(...args: any[]): void {
@@ -106,6 +111,7 @@ export class GristWSSettingsBrowser implements GristWSSettings {
 export class GristWSConnection extends Disposable {
   public useCount: number = 0;
   public on: BackboneEvents['on'];    // set by Backbone
+  public off: BackboneEvents['off'];    // set by Backbone
 
   protected trigger: BackboneEvents['trigger']; // set by Backbone
 
@@ -120,7 +126,7 @@ export class GristWSConnection extends Disposable {
   private _reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private _reconnectAttempts: number = 0;
   private _wantReconnect: boolean = true;
-  private _ws: WebSocket|null = null;
+  private _ws: GristClientSocket|null = null;
 
   // The server sends incremental seqId numbers with each message on the connection, starting with
   // 0. We keep track of them to allow for seamless reconnects.
@@ -206,17 +212,16 @@ export class GristWSConnection extends Disposable {
   }
 
   /**
-   * @event serverMessage Triggered when a message arrives from the server. Callbacks receive
-   *    the raw message data as an additional argument.
+   * Triggered when a message arrives from the server.
    */
-  public onmessage(ev: MessageEvent) {
+  public onmessage(data: string) {
     if (!this._ws) {
       // It's possible to receive a message after we disconnect, at least in tests (where
       // WebSocket is a node library). Ignoring is easier than unsubscribing properly.
       return;
     }
     this._scheduleHeartbeat();
-    this._processReceivedMessage(ev.data, true);
+    this._processReceivedMessage(data, true);
   }
 
   public send(message: any) {
@@ -312,7 +317,7 @@ export class GristWSConnection extends Disposable {
   private _sendHeartbeat() {
     this.send(JSON.stringify({
       beat: 'alive',
-      url: G.window.location.href,
+      url: this._settings.getPageUrl(),
       docId: this._assignmentId,
     }));
   }
@@ -325,6 +330,15 @@ export class GristWSConnection extends Disposable {
       this._reconnectAttempts++;
     }
 
+    let url: string;
+    try {
+      url = this._buildWebsocketUrl(isReconnecting, timezone);
+    } catch (e) {
+      this._warn('Failed to get the URL for the worker serving the document');
+      this._scheduleReconnect(isReconnecting);
+      return;
+    }
+
     // Note that if a WebSocket can't establish a connection it will trigger onclose()
     // As per http://dev.w3.org/html5/websockets/
     // "If the establish a WebSocket connection algorithm fails,
@@ -332,7 +346,6 @@ export class GristWSConnection extends Disposable {
     // which then invokes the close the WebSocket connection algorithm,
     // which then establishes that the WebSocket connection is closed,
     // which fires the close event."
-    const url = this._buildWebsocketUrl(isReconnecting, timezone);
     this._log("GristWSConnection connecting to: " + url);
     this._ws = this._settings.makeWebSocket(url);
 
@@ -347,8 +360,8 @@ export class GristWSConnection extends Disposable {
 
     this._ws.onmessage = this.onmessage.bind(this);
 
-    this._ws.onerror = (ev: Event|ErrorEvent) => {
-      this._log('GristWSConnection: onerror', 'error' in ev ? String(ev.error) : ev);
+    this._ws.onerror = (err: Error) => {
+      this._log('GristWSConnection: onerror', String(err));
     };
 
     this._ws.onclose = () => {
@@ -362,16 +375,20 @@ export class GristWSConnection extends Disposable {
       this.trigger('connectState', false);
 
       if (!this._wantReconnect) { return; }
-      const reconnectTimeout = gutil.getReconnectTimeout(this._reconnectAttempts, reconnectInterval);
-      this._log("Trying to reconnect in", reconnectTimeout, "ms");
-      this.trigger('connectionStatus', 'Trying to reconnect...', 'WARNING');
-      this._reconnectTimeout = setTimeout(async () => {
-        this._reconnectTimeout = null;
-        // Make sure we've gotten through all lazy-loading.
-        await this._initialConnection;
-        await this.connect(true);
-      }, reconnectTimeout);
+      this._scheduleReconnect(true);
     };
+  }
+
+  private _scheduleReconnect(isReconnecting: boolean) {
+    const reconnectTimeout = gutil.getReconnectTimeout(this._reconnectAttempts, reconnectInterval);
+    this._log('Trying to reconnect in', reconnectTimeout, 'ms');
+    this.trigger('connectionStatus', 'Trying to reconnect...', 'WARNING');
+    this._reconnectTimeout = setTimeout(async () => {
+      this._reconnectTimeout = null;
+      // Make sure we've gotten through all lazy-loading.
+      await this._initialConnection;
+      await this.connect(isReconnecting);
+    }, reconnectTimeout);
   }
 
   private _buildWebsocketUrl(isReconnecting: boolean, timezone: any): string {

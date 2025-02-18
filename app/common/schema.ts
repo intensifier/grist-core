@@ -4,7 +4,7 @@ import { GristObjCode } from "app/plugin/GristData";
 
 // tslint:disable:object-literal-key-quotes
 
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 43;
 
 export const schema = {
 
@@ -23,6 +23,7 @@ export const schema = {
     summarySourceTable  : "Ref:_grist_Tables",
     onDemand            : "Bool",
     rawViewSectionRef   : "Ref:_grist_Views_section",
+    recordCardViewSectionRef: "Ref:_grist_Views_section",
   },
 
   "_grist_Tables_column": {
@@ -34,11 +35,13 @@ export const schema = {
     isFormula           : "Bool",
     formula             : "Text",
     label               : "Text",
+    description         : "Text",
     untieColIdFromLabel : "Bool",
     summarySourceCol    : "Ref:_grist_Tables_column",
     displayCol          : "Ref:_grist_Tables_column",
     visibleCol          : "Ref:_grist_Tables_column",
     rules               : "RefList:_grist_Tables_column",
+    reverseCol          : "Ref:_grist_Tables_column",
     recalcWhen          : "Int",
     recalcDeps          : "RefList:_grist_Tables_column",
   },
@@ -90,6 +93,7 @@ export const schema = {
     viewRef             : "Ref:_grist_Views",
     indentation         : "Int",
     pagePos             : "PositionNumber",
+    shareRef            : "Ref:_grist_Shares",
   },
 
   "_grist_Views": {
@@ -103,6 +107,7 @@ export const schema = {
     parentId            : "Ref:_grist_Views",
     parentKey           : "Text",
     title               : "Text",
+    description         : "Text",
     defaultWidth        : "Int",
     borderWidth         : "Int",
     theme               : "Text",
@@ -115,6 +120,8 @@ export const schema = {
     linkSrcColRef       : "Ref:_grist_Tables_column",
     linkTargetColRef    : "Ref:_grist_Tables_column",
     embedId             : "Text",
+    rules               : "RefList:_grist_Tables_column",
+    shareOptions        : "Text",
   },
 
   "_grist_Views_section_field": {
@@ -146,6 +153,7 @@ export const schema = {
     fileName            : "Text",
     fileType            : "Text",
     fileSize            : "Int",
+    fileExt             : "Text",
     imageHeight         : "Int",
     imageWidth          : "Int",
     timeDeleted         : "DateTime",
@@ -157,6 +165,11 @@ export const schema = {
     eventTypes          : "ChoiceList",
     isReadyColRef       : "Ref:_grist_Tables_column",
     actions             : "Text",
+    label               : "Text",
+    memo                : "Text",
+    enabled             : "Bool",
+    watchedColRefList   : "RefList:_grist_Tables_column",
+    options             : "Text",
   },
 
   "_grist_ACLRules": {
@@ -169,6 +182,7 @@ export const schema = {
     permissionsText     : "Text",
     rulePos             : "PositionNumber",
     userAttributes      : "Text",
+    memo                : "Text",
   },
 
   "_grist_ACLResources": {
@@ -193,6 +207,25 @@ export const schema = {
     viewSectionRef      : "Ref:_grist_Views_section",
     colRef              : "Ref:_grist_Tables_column",
     filter              : "Text",
+    pinned              : "Bool",
+  },
+
+  "_grist_Cells": {
+    tableRef            : "Ref:_grist_Tables",
+    colRef              : "Ref:_grist_Tables_column",
+    rowId               : "Int",
+    root                : "Bool",
+    parentId            : "Ref:_grist_Cells",
+    type                : "Int",
+    content             : "Text",
+    userRef             : "Text",
+  },
+
+  "_grist_Shares": {
+    linkId              : "Text",
+    options             : "Text",
+    label               : "Text",
+    description         : "Text",
   },
 
 };
@@ -214,6 +247,7 @@ export interface SchemaTypes {
     summarySourceTable: number;
     onDemand: boolean;
     rawViewSectionRef: number;
+    recordCardViewSectionRef: number;
   };
 
   "_grist_Tables_column": {
@@ -225,11 +259,13 @@ export interface SchemaTypes {
     isFormula: boolean;
     formula: string;
     label: string;
+    description: string;
     untieColIdFromLabel: boolean;
     summarySourceCol: number;
     displayCol: number;
     visibleCol: number;
     rules: [GristObjCode.List, ...number[]]|null;
+    reverseCol: number;
     recalcWhen: number;
     recalcDeps: [GristObjCode.List, ...number[]]|null;
   };
@@ -281,6 +317,7 @@ export interface SchemaTypes {
     viewRef: number;
     indentation: number;
     pagePos: number;
+    shareRef: number;
   };
 
   "_grist_Views": {
@@ -294,6 +331,7 @@ export interface SchemaTypes {
     parentId: number;
     parentKey: string;
     title: string;
+    description: string;
     defaultWidth: number;
     borderWidth: number;
     theme: string;
@@ -306,6 +344,8 @@ export interface SchemaTypes {
     linkSrcColRef: number;
     linkTargetColRef: number;
     embedId: string;
+    rules: [GristObjCode.List, ...number[]]|null;
+    shareOptions: string;
   };
 
   "_grist_Views_section_field": {
@@ -337,6 +377,7 @@ export interface SchemaTypes {
     fileName: string;
     fileType: string;
     fileSize: number;
+    fileExt: string;
     imageHeight: number;
     imageWidth: number;
     timeDeleted: number;
@@ -348,6 +389,11 @@ export interface SchemaTypes {
     eventTypes: [GristObjCode.List, ...string[]]|null;
     isReadyColRef: number;
     actions: string;
+    label: string;
+    memo: string;
+    enabled: boolean;
+    watchedColRefList: [GristObjCode.List, ...number[]]|null;
+    options: string;
   };
 
   "_grist_ACLRules": {
@@ -360,6 +406,7 @@ export interface SchemaTypes {
     permissionsText: string;
     rulePos: number;
     userAttributes: string;
+    memo: string;
   };
 
   "_grist_ACLResources": {
@@ -384,6 +431,25 @@ export interface SchemaTypes {
     viewSectionRef: number;
     colRef: number;
     filter: string;
+    pinned: boolean;
+  };
+
+  "_grist_Cells": {
+    tableRef: number;
+    colRef: number;
+    rowId: number;
+    root: boolean;
+    parentId: number;
+    type: number;
+    content: string;
+    userRef: string;
+  };
+
+  "_grist_Shares": {
+    linkId: string;
+    options: string;
+    label: string;
+    description: string;
   };
 
 }

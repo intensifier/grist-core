@@ -9,9 +9,14 @@
   left: 0;
   width: 100%;
 
-  background: white;
+  background: var(--grist-theme-page-panels-main-panel-bg, white);
   z-index: 1;
-  margin-top: -3px;
+  margin-top: -6px;
+}
+
+.layout_box_maximized .record-layout-editor {
+  padding-left: 16px;
+  padding-right: 16px;
 }
 
 .g_record_detail_inner > .layout_root {
@@ -25,6 +30,17 @@
   padding: .5rem;
 }
 
+.g_record_detail_label_container {
+  display: flex;
+  justify-content: flex-start;
+  gap: 3px;
+}
+
+.g_record_detail_label_container .info_toggle_icon {
+  width: 13px;
+  height: 13px;
+  margin-bottom: 3px;
+}
 .g_record_detail_label {
   min-height: 1rem;
   color: #666;
@@ -37,14 +53,15 @@
   min-height: 16px;
   white-space: pre;
   word-wrap: break-word;
+  color: var(--grist-theme-cell-fg, black);
 }
 
 .g_record_detail_value.record-add {
-  background-color: #f6f6ff;
+  background-color: var(--grist-theme-table-add-new-bg, #f6f6ff);
 }
 
 .g_record_detail_value.scissors {
-  outline: 2px dashed var(--grist-color-cursor);
+  outline: 2px dashed var(--grist-theme-cursor, var(--grist-color-cursor));
 }
 
 .g_record_detail_value.draft {
@@ -54,7 +71,7 @@
 .detail_row_num {
   font-size: var(--grist-x-small-font-size);
   font-weight: normal;
-  color: var(--grist-color-slate);
+  color: var(--grist-theme-text-light, var(--grist-color-slate));
   padding: 8px;
   display: flex;
   align-items: center;
@@ -80,8 +97,25 @@
   margin-right: 2px;
 }
 
+.detail-buttons {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.detail-left, .detail-right, .detail-add-btn {
+  --icon-color: var(--grist-theme-control-secondary-fg, #929299);
+  padding: 3px;
+  border-radius: 4px;
+}
+
 .detail-left.disabled, .detail-right.disabled, .detail-add-btn.disabled {
-  cursor: default !important;
+  --icon-color: var(--grist-theme-control-secondary-disabled-fg, #D9D9D9);
+}
+
+.detail-button:not(.disabled):hover {
+  cursor: pointer;
+  background-color: var(--grist-theme-hover, rgba(217,217,217,0.6));
 }
 
 .detail-add-grp {
@@ -104,7 +138,13 @@
   .detailview_record_detail.active {
     /* highlight active record in Card List by overlaying the active-section highlight */
     margin-left: -3px;
-    border-left: 3px solid var(--grist-color-light-green);
+    border-left: 3px solid var(--grist-theme-cursor, var(--grist-color-light-green));
+  }
+
+  .detailview_record_detail.selected {
+    /* highlight selected record in Card List by overlaying the inactive-cursor highlight */
+    margin-left: -3px;
+    border-left: 3px solid var(--grist-theme-cursor-inactive, var(--grist-color-inactive-cursor));
   }
 }
 
@@ -144,7 +184,7 @@
   -webkit-flex-direction: column-reverse;
 }
 
-.detail_theme_field_under > .g_record_detail_label {
+.detail_theme_field_under .g_record_detail_label {
   border-top: 1px solid #333;
 }
 
@@ -162,7 +202,7 @@
 .detail_theme_record_compact {
   /* 12px is enough margin on the right to include most of the floating scrollbar on MacOS */
   padding: 4px 16px 0px 16px;
-  background-color: var(--grist-color-medium-grey);
+  background-color: var(--grist-theme-card-compact-widget-bg, var(--grist-color-medium-grey));
 }
 
 .detail_theme_record_compact.detailview_record_single {
@@ -174,12 +214,12 @@
 }
 
 .detail_theme_record_compact > .g_record_detail_inner {
-  background-color: white;
+  background-color: var(--grist-theme-card-compact-record-bg, white);
   position: relative;
 }
 
 .detail_theme_record_compact > .g_record_detail_inner > .layout_root {
-  border: 1px solid var(--grist-color-dark-grey);
+  border: 1px solid var(--grist-theme-card-compact-border, var(--grist-color-dark-grey));
   border-right: none;
   border-bottom: none;
 }
@@ -195,17 +235,17 @@
 .detail_theme_field_compact {
   border-top: none;
   border-left: none;
-  border-right: 1px solid var(--grist-color-dark-grey);
-  border-bottom: 1px solid var(--grist-color-dark-grey);
+  border-right: 1px solid var(--grist-theme-card-compact-border, var(--grist-color-dark-grey));
+  border-bottom: 1px solid var(--grist-theme-card-compact-border, var(--grist-color-dark-grey));
   padding: 1px 1px 1px 5px;
   margin: 0;
   line-height: 1.2;
 }
 
-.detail_theme_field_compact > .g_record_detail_label {
+.detail_theme_field_compact .g_record_detail_label {
   font-weight: normal;
   font-size: var(--grist-small-font-size);
-  color: var(--grist-color-slate);
+  color: var(--grist-theme-card-compact-label, var(--grist-color-slate));
   min-height: 0px;
 
   white-space: nowrap;
@@ -224,9 +264,9 @@
   padding: 1px 1px 1px 5px;
 }
 
-.detail_theme_field_form > .g_record_detail_label {
+.detail_theme_field_form .g_record_detail_label {
   font-size: var(--grist-small-font-size);
-  color: var(--grist-color-slate);
+  color: var(--grist-theme-card-form-label, var(--grist-color-slate));
   font-weight: bold;
   min-height: 0px;
   white-space: nowrap;
@@ -235,12 +275,16 @@
   margin-right: -8px;
 }
 
+.detail_theme_field_form .g_record_detail_label_container {
+  gap: 8px;
+}
+
 /* TODO want to style better the values themselves (e.g. more padding, rounded corners, move label
  * inside value box for compact view for better cursor looks, etc), but first the cell editor
  * needs to learn to match the value box's style. Right now, the cell editor style is hard-coded.
  */
 .detail_theme_field_form > .g_record_detail_value {
-  border: 1px solid lightgrey;
+  border: 1px solid var(--grist-theme-card-form-border, lightgrey);
 }
 
 .detail_theme_record_form {
@@ -252,7 +296,7 @@
 }
 
 .detail_theme_record_form.detailview_record_detail {
-  border-bottom: 1px solid var(--grist-color-dark-grey);
+  border-bottom: 1px solid var(--grist-theme-card-list-form-border, var(--grist-color-dark-grey));
   padding-bottom: 12px;
 }
 
@@ -271,20 +315,20 @@
 }
 
 .detail_theme_record_blocks.detailview_record_detail {
-  border-bottom: 1px solid var(--grist-color-dark-grey);
+  border-bottom: 1px solid var(--grist-theme-card-list-blocks-border, var(--grist-color-dark-grey));
   padding-bottom: 8px;
 }
 
 .detail_theme_field_blocks {
   padding: 6px;
   margin: 8px;
-  background-color: var(--grist-color-medium-grey);
+  background-color: var(--grist-theme-card-blocks-bg, var(--grist-color-medium-grey));
   border-radius: 2px;
 }
 
-.detail_theme_field_blocks > .g_record_detail_label {
+.detail_theme_field_blocks .g_record_detail_label {
   font-size: var(--grist-small-font-size);
-  color: var(--grist-color-slate);
+  color: var(--grist-theme-card-blocks-label, var(--grist-color-slate));
   font-weight: normal;
   white-space: nowrap;
   overflow: hidden;

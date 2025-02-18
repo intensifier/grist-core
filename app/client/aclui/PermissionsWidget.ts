@@ -2,17 +2,20 @@
  * Implements a widget showing 3-state boxes for permissions
  * (for Allow / Deny / Pass-Through).
  */
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {colors, testId, theme} from 'app/client/ui2018/cssVars';
 import {cssIconButton, icon} from 'app/client/ui2018/icons';
 import {menu, menuIcon, menuItem} from 'app/client/ui2018/menus';
 import {PartialPermissionSet, PartialPermissionValue} from 'app/common/ACLPermissions';
-import {ALL_PERMISSION_PROPS, emptyPermissionSet} from 'app/common/ACLPermissions';
+import {ALL_PERMISSION_PROPS, emptyPermissionSet, PermissionKey} from 'app/common/ACLPermissions';
 import {capitalize} from 'app/common/gutil';
 import {dom, DomElementArg, Observable, styled} from 'grainjs';
 import isEqual = require('lodash/isEqual');
+import {makeT} from 'app/client/lib/localization';
 
-// One of the strings 'read', 'update', etc.
-export type PermissionKey = keyof PartialPermissionSet;
+// Canonical order of permission bits when rendered in a permissionsWidget.
+const PERMISSION_BIT_ORDER = 'RUCDS';
+
+const t = makeT('PermissionsWidget');
 
 /**
  * Renders a box for each of availableBits, and a dropdown with a description and some shortcuts.
@@ -23,6 +26,7 @@ export function permissionsWidget(
   options: {disabled: boolean, sanityCheck?: (p: PartialPermissionSet) => void},
   ...args: DomElementArg[]
 ) {
+  availableBits = sortBits(availableBits);
   // These are the permission sets available to set via the dropdown.
   const empty: PartialPermissionSet = emptyPermissionSet();
   const allowAll: PartialPermissionSet = makePermissionSet(availableBits, () => 'allow');
@@ -61,13 +65,13 @@ export function permissionsWidget(
           null
         ),
         // If the set matches any recognized pattern, mark that item with a tick (checkmark).
-        cssMenuItem(() => setPermissions(allowAll), tick(isEqual(pset.get(), allowAll)), 'Allow All',
+        cssMenuItem(() => setPermissions(allowAll), tick(isEqual(pset.get(), allowAll)), t("Allow All"),
           dom.cls('disabled', options.disabled)
         ),
-        cssMenuItem(() => setPermissions(denyAll), tick(isEqual(pset.get(), denyAll)), 'Deny All',
+        cssMenuItem(() => setPermissions(denyAll), tick(isEqual(pset.get(), denyAll)), t("Deny All"),
           dom.cls('disabled', options.disabled)
         ),
-        cssMenuItem(() => setPermissions(readOnly), tick(isEqual(pset.get(), readOnly)), 'Read Only',
+        cssMenuItem(() => setPermissions(readOnly), tick(isEqual(pset.get(), readOnly)), t("Read Only"),
           dom.cls('disabled', options.disabled)
         ),
         cssMenuItem(() => setPermissions(empty),
@@ -122,6 +126,20 @@ function psetDescription(permissionSet: PartialPermissionSet): string {
   return parts.join(' ');
 }
 
+/**
+ * Sort the bits in a standard way for viewing, since they could be in any order
+ * in the underlying rule store. And in fact ACLPermissions.permissionSetToText
+ * uses an order (CRUDS) that is different from how things have been historically
+ * rendered in the UI (RUCDS).
+ */
+function sortBits(bits: PermissionKey[]) {
+  return bits.sort((a, b) => {
+    const aIndex = PERMISSION_BIT_ORDER.indexOf(a.slice(0, 1).toUpperCase());
+    const bIndex = PERMISSION_BIT_ORDER.indexOf(b.slice(0, 1).toUpperCase());
+    return aIndex - bIndex;
+  });
+}
+
 const cssPermissions = styled('div', `
   display: flex;
   gap: 4px;
@@ -134,8 +152,8 @@ const cssBit = styled('div', `
   border-radius: 2px;
   font-size: 13px;
   font-weight: 500;
-  border: 1px dashed ${colors.darkGrey};
-  color: ${colors.darkGrey};
+  border: 1px dashed ${theme.accessRulesTableBodyLightFg};
+  color: ${theme.accessRulesTableBodyLightFg};
   cursor: pointer;
 
   display: flex;

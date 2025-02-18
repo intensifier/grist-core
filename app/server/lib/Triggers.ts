@@ -1,17 +1,31 @@
 import {LocalActionBundle} from 'app/common/ActionBundle';
+import {summarizeAction} from 'app/common/ActionSummarizer';
 import {ActionSummary, TableDelta} from 'app/common/ActionSummary';
+import {ApiError} from 'app/common/ApiError';
 import {MapWithTTL} from 'app/common/AsyncCreate';
-import {delay} from 'app/common/delay';
+import {WebhookMessageType} from "app/common/CommTypes";
 import {fromTableDataAction, RowRecord, TableColValues, TableDataAction} from 'app/common/DocActions';
 import {StringUnion} from 'app/common/StringUnion';
 import {MetaRowRecord} from 'app/common/TableData';
 import {CellDelta} from 'app/common/TabularDiff';
-import {summarizeAction} from 'app/server/lib/ActionSummary';
+import {
+  WebhookBatchStatus,
+  WebhookStatus,
+  WebhookSummary,
+  WebhookSummaryCollection,
+  WebhookUsage
+} from 'app/common/Triggers';
+import {decodeObject} from 'app/plugin/objtypes';
 import {ActiveDoc} from 'app/server/lib/ActiveDoc';
 import {makeExceptionalDocSession} from 'app/server/lib/DocSession';
 import log from 'app/server/lib/log';
+import {proxyAgent} from 'app/server/lib/ProxyAgent';
+import {matchesBaseDomain} from 'app/server/lib/requestUtils';
+import {delayAbort} from 'app/server/lib/serverUtils';
+import {LogSanitizer} from "app/server/utils/LogSanitizer";
 import {promisifyAll} from 'bluebird';
 import * as _ from 'lodash';
+import {AbortController, AbortSignal} from 'node-abort-controller';
 import fetch from 'node-fetch';
 import {createClient, Multi, RedisClient} from 'redis';
 
@@ -39,6 +53,7 @@ export interface WebhookAction {
 
 // Just hypothetical
 interface PythonAction {
+  id: string;
   type: "python";
   code: string;
 }
@@ -57,6 +72,7 @@ type Trigger = MetaRowRecord<"_grist_Triggers">;
 export interface WebHookSecret {
   url: string;
   unsubscribeKey: string;
+  authorization?: string;
 }
 
 // Work to do after fetching values from the document
@@ -67,9 +83,19 @@ interface Task {
   recordDeltas: RecordDeltas;
 }
 
-const MAX_QUEUE_SIZE = 1000;
+const MAX_QUEUE_SIZE =
+  process.env.GRIST_MAX_QUEUE_SIZE ? parseInt(process.env.GRIST_MAX_QUEUE_SIZE, 10) : 1000;
 
-const WEBHOOK_CACHE_TTL = 10000;
+const WEBHOOK_CACHE_TTL = 10_000;
+
+const WEBHOOK_STATS_CACHE_TTL = 1000 /*s*/ * 60 /*m*/ * 24/*h*/;
+
+// A time to wait for between retries of a webhook. Exposed for tests.
+const TRIGGER_WAIT_DELAY =
+  process.env.GRIST_TRIGGER_WAIT_DELAY ? parseInt(process.env.GRIST_TRIGGER_WAIT_DELAY, 10) : 1000;
+
+const TRIGGER_MAX_ATTEMPTS =
+  process.env.GRIST_TRIGGER_MAX_ATTEMPTS ? parseInt(process.env.GRIST_TRIGGER_MAX_ATTEMPTS, 10) : 20;
 
 // Processes triggers for records changed as described in action bundles.
 // initiating webhooks and automations.
@@ -79,8 +105,7 @@ const WEBHOOK_CACHE_TTL = 10000;
 // Triggers are configured in the document, while details of webhooks (URLs) are kept
 // in the Secrets table of the Home DB.
 export class DocTriggers {
-  // Converts a column ref to colId by looking it up in _grist_Tables_column
-  private _getColId: (rowId: number) => string|undefined;
+
 
   // Events that need to be sent to webhooks in FIFO order.
   // This is the primary place where events are stored and consumed,
@@ -106,6 +131,12 @@ export class DocTriggers {
   // Promise which resolves after we finish fetching the backup queue from redis on startup.
   private _getRedisQueuePromise: Promise<void> | undefined;
 
+  // Abort controller for the loop that sends webhooks.
+  private _loopAbort: AbortController|undefined;
+
+  private _stats: WebhookStatistics;
+  private _sanitizer = new LogSanitizer();
+
   constructor(private _activeDoc: ActiveDoc) {
     const redisUrl = process.env.REDIS_URL;
     if (redisUrl) {
@@ -113,10 +144,12 @@ export class DocTriggers {
       // to quit it afterwards and avoid keeping a client open for documents without triggers.
       this._getRedisQueuePromise = this._getRedisQueue(createClient(redisUrl));
     }
+    this._stats = new WebhookStatistics(this._docId, _activeDoc, () => this._redisClient ?? null);
   }
 
   public shutdown() {
     this._shuttingDown = true;
+    this._loopAbort?.abort();
     if (!this._sending) {
       void(this._redisClientField?.quitAsync());
     }
@@ -141,9 +174,8 @@ export class DocTriggers {
 
     const triggersTable = docData.getMetaTable("_grist_Triggers");
     const getTableId = docData.getMetaTable("_grist_Tables").getRowPropFunc("tableId");
-    this._getColId = docData.getMetaTable("_grist_Tables_column").getRowPropFunc("colId");
 
-    const triggersByTableRef = _.groupBy(triggersTable.getRecords(), "tableRef");
+    const triggersByTableRef = _.groupBy(triggersTable.getRecords().filter(t => t.enabled), "tableRef");
     const triggersByTableId: Array<[string, Trigger[]]> = [];
 
     // First we need a list of columns which must be included in full in the action summary
@@ -178,7 +210,8 @@ export class DocTriggers {
 
         // Fetch the modified records in full so they can be sent in webhooks
         // They will also be used to check if the record is ready
-        const tableDataAction = this._activeDoc.fetchQuery(docSession, {tableId, filters});
+        const tableDataAction = this._activeDoc.fetchQuery(docSession, {tableId, filters}, true)
+          .then(tableFetchResult => tableFetchResult.tableData);
         tasks.push({tableDelta, triggers, tableDataAction, recordDeltas});
       }
     }
@@ -209,10 +242,179 @@ export class DocTriggers {
 
     // Prevent further document activity while the queue is too full.
     while (this._drainingQueue && !this._shuttingDown) {
-      await delay(1000);
+      const sendNotificationPromise =  this._activeDoc.sendWebhookNotification(WebhookMessageType.Overflow);
+      const delayPromise = delayAbort(5000, this._loopAbort?.signal).catch(() => {});
+      await Promise.all([sendNotificationPromise, delayPromise]);
     }
 
     return summary;
+  }
+
+  /**
+   * Creates summary for all webhooks in the document.
+   */
+  public async summary(): Promise<WebhookSummaryCollection> {
+    // Prepare some data we will use.
+    const docData = this._activeDoc.docData!;
+    const triggersTable = docData.getMetaTable("_grist_Triggers");
+    const getTableId = docData.getMetaTable("_grist_Tables").getRowPropFunc("tableId");
+    const getColId = docData.getMetaTable("_grist_Tables_column").getRowPropFunc("colId");
+    const getUrl = async (id: string) => (await this._getWebHook(id))?.url ?? '';
+    const getAuthorization = async (id: string) => (await this._getWebHook(id))?.authorization ?? '';
+    const getUnsubscribeKey = async (id: string) => (await this._getWebHook(id))?.unsubscribeKey ?? '';
+    const resultTable: WebhookSummary[] = [];
+
+    // Go through all triggers int the document that we have.
+    for (const t of triggersTable.getRecords()) {
+      // Each trigger has associated table and a bunch of trigger actions (currently only 1 that is webhook).
+      const actions = JSON.parse(t.actions) as TriggerAction[];
+      // Get only webhooks for this trigger.
+      const webhookActions = actions.filter(act => act.type === "webhook") as WebhookAction[];
+      for (const act of webhookActions) {
+        // Url, probably should be hidden for non-owners (but currently this API is owners only).
+        const url = await getUrl(act.id);
+        const authorization = await getAuthorization(act.id);
+        // Same story, should be hidden.
+        const unsubscribeKey = await getUnsubscribeKey(act.id);
+        if (!url || !unsubscribeKey) {
+          // Webhook might have been deleted in the mean time.
+          continue;
+        }
+        const decodedWatchedColRefList = decodeObject(t.watchedColRefList) as number[] || [];
+        // Report some basic info and usage stats.
+        const entry: WebhookSummary = {
+          // Id of the webhook
+          id: act.id,
+          fields: {
+            // Url, probably should be hidden for non-owners (but currently this API is owners only).
+            url,
+            authorization,
+            unsubscribeKey,
+            // Other fields used to register this webhook.
+            eventTypes: decodeObject(t.eventTypes) as string[],
+            isReadyColumn: getColId(t.isReadyColRef) ?? null,
+            watchedColIds: decodedWatchedColRefList.map((columnRef) => getColId(columnRef)),
+            tableId: getTableId(t.tableRef) ?? null,
+            // For future use - for now every webhook is enabled.
+            enabled: t.enabled,
+            name: t.label,
+            memo: t.memo,
+          },
+          // Create some statics and status info.
+          usage: await this._stats.getUsage(act.id, this._webHookEventQueue),
+        };
+        resultTable.push(entry);
+      }
+    }
+    return {webhooks: resultTable};
+  }
+
+  public getWebhookTriggerRecord(webhookId: string) {
+    const docData = this._activeDoc.docData!;
+    const triggersTable = docData.getMetaTable("_grist_Triggers");
+    const trigger = triggersTable.getRecords().find(t => {
+      const actions: TriggerAction[] = JSON.parse((t.actions || '[]') as string);
+      return actions.some(action => action.id === webhookId && action?.type === "webhook");
+    });
+    if (!trigger) {
+      throw new ApiError(`Webhook not found "${webhookId || ''}"`, 404);
+    }
+    return trigger;
+  }
+
+  public webhookDeleted(id: string) {
+    // We can't do much about that as the loop might be in progress and it is not safe to modify the queue.
+    // But we can clear the webHook cache, so that the next time we check the webhook url it will be gone.
+    this.clearWebhookCache(id);
+  }
+
+  public clearWebhookCache(id: string) {
+    this._webhookCache.delete(id);
+  }
+
+  public async clearWebhookQueue() {
+    this._log("Webhook being queue cleared");
+    // Make sure we are after start and in sync with redis.
+    if (this._getRedisQueuePromise) {
+      await this._getRedisQueuePromise;
+    }
+    // Clear in-memory queue.
+    const removed = this._webHookEventQueue.splice(0, this._webHookEventQueue.length).length;
+    // Notify the loop that it should restart.
+    this._loopAbort?.abort();
+    // If we have backup in redis, clear it also.
+    // NOTE: this is subject to a race condition, currently it is not possible, but any future modification probably
+    // will require some kind of locking over the queue (or a rewrite)
+    if (removed && this._redisClient) {
+      await this._redisClient.multi().del(this._redisQueueKey).execAsync();
+    }
+    await this._stats.clear();
+    this._log("Webhook queue cleared", {numRemoved: removed});
+  }
+
+  public async clearSingleWebhookQueue(webhookId: string) {
+    this._log("Single webhook queue being cleared", {webhookId});
+    // Make sure we are after start and in sync with redis.
+    if (this._getRedisQueuePromise) {
+      await this._getRedisQueuePromise;
+    }
+    // Clear in-memory queue for given webhook key.
+    const lengthBefore = this._webHookEventQueue.length;
+    this._webHookEventQueue = this._webHookEventQueue.filter(e => e.id !== webhookId);
+    const removed = lengthBefore - this._webHookEventQueue.length;
+
+    // Notify the loop that it should restart.
+    this._loopAbort?.abort();
+    // If we have backup in redis, clear it also.
+    // NOTE: this is subject to a race condition, currently it is not possible, but any future modification probably
+    // will require some kind of locking over the queue (or a rewrite)
+    if (removed && this._redisClient) {
+      const multi = this._redisClient.multi();
+      multi.del(this._redisQueueKey);
+
+      // Re-add all the remaining events to the queue.
+      if (this._webHookEventQueue.length) {
+        const strings = this._webHookEventQueue.map(e => JSON.stringify(e));
+        multi.rpush(this._redisQueueKey, ...strings);
+      }
+      await multi.execAsync();
+    }
+    await this._stats.clear();
+    this._log("Single webhook queue cleared", {numRemoved: removed, webhookId});
+  }
+
+  // Converts a table to tableId by looking it up in _grist_Tables.
+  private _getTableId(rowId: number) {
+    const docData = this._activeDoc.docData;
+    if (!docData) {
+      throw new Error("ActiveDoc not ready");
+    }
+    return docData.getMetaTable("_grist_Tables").getValue(rowId, "tableId");
+  }
+
+  // Return false if colRef does not belong to tableRef
+  private _validateColId(colRef: number, tableRef: number) {
+    const docData = this._activeDoc.docData;
+    if (!docData) {
+      throw new Error("ActiveDoc not ready");
+    }
+    return docData.getMetaTable("_grist_Tables_column").getValue(colRef, "parentId") === tableRef;
+  }
+
+  // Converts a column ref to colId by looking it up in _grist_Tables_column. If tableRef is
+  // provided, check whether col belongs to table and throws if not.
+  private _getColId(rowId: number, tableRef?: number) {
+    const docData = this._activeDoc.docData;
+    if (!docData) {
+      throw new Error("ActiveDoc not ready");
+    }
+    if (!rowId) { return ''; }
+    const colId = docData.getMetaTable("_grist_Tables_column").getValue(rowId, "colId");
+    if (tableRef !== undefined &&
+      docData.getMetaTable("_grist_Tables_column").getValue(rowId, "parentId") !== tableRef) {
+      throw new ApiError(`Column ${colId} does not belong to table ${this._getTableId(tableRef)}`, 400);
+    }
+    return colId;
   }
 
   private get _docId() {
@@ -241,7 +443,15 @@ export class DocTriggers {
 
   private async _pushToRedisQueue(events: WebHookEvent[]) {
     const strings = events.map(e => JSON.stringify(e));
-    await this._redisClient!.rpushAsync(this._redisQueueKey, ...strings);
+    try {
+      await this._redisClient?.rpushAsync(this._redisQueueKey, ...strings);
+    }
+    catch(e){
+      // It's very hard to test this with integration tests, because it requires a redis failure.
+      // And it's not easy to simulate redis failure.
+      // So on this point we have only unit test in core/test/server/utils/LogSanitizer.ts
+      throw this._sanitizer.sanitize(e);
+    }
   }
 
   private async _getRedisQueue(redisClient: RedisClient) {
@@ -291,6 +501,37 @@ export class DocTriggers {
       if (!webhookActions.length) {
         continue;
       }
+
+      if (trigger.isReadyColRef) {
+        if (!this._validateColId(trigger.isReadyColRef, trigger.tableRef)) {
+          // ready column does not belong to table, let's ignore trigger and log stats
+          for (const action of webhookActions) {
+            const colId = this._getColId(trigger.isReadyColRef); // no validation
+            const tableId = this._getTableId(trigger.tableRef);
+            const error = `isReadyColumn is not valid: colId ${colId} does not belong to ${tableId}`;
+            this._stats.logInvalid(action.id, error).catch(e => log.error("Webhook stats failed to log", e));
+          }
+          continue;
+        }
+      }
+
+      if (trigger.watchedColRefList) {
+        for (const colRef of trigger.watchedColRefList.slice(1)) {
+          if (!this._validateColId(colRef as number, trigger.tableRef)) {
+            // column does not belong to table, let's ignore trigger and log stats
+            for (const action of webhookActions) {
+              const colId = this._getColId(colRef as number); // no validation
+              const tableId = this._getTableId(trigger.tableRef);
+              const error = `column is not valid: colId ${colId} does not belong to ${tableId}`;
+              this._stats.logInvalid(action.id, error).catch(e => log.error("Webhook stats failed to log", e));
+            }
+            continue;
+          }
+        }
+      }
+
+      // TODO: would be worth checking that the trigger's fields are valid (ie: eventTypes, url,
+      // ...) as there's no guarantee that they are.
 
       const rowIndexesToSend: number[] = _.range(bulkColValues.id.length).filter(rowIndex => {
           const rowId = bulkColValues.id[rowIndex];
@@ -365,9 +606,21 @@ export class DocTriggers {
       }
     }
 
+    const colIdsToCheck: Array<string> = [];
+    if (trigger.watchedColRefList) {
+      for (const colRef of trigger.watchedColRefList.slice(1)) {
+        colIdsToCheck.push(this._getColId(colRef as number)!);
+      }
+    }
+
     let eventType: EventType;
     if (readyBefore) {
-      eventType = "update";
+      // check if any of the columns to check were changed to consider this an update
+      if (colIdsToCheck.length === 0 || colIdsToCheck.some(colId => tableDelta.columnDeltas[colId]?.[rowId])) {
+        eventType = "update";
+      } else {
+        return false;
+      }
       // If we allow subscribing to deletion in the future
       // if (recordDelta.existedAfter) {
       //   eventType = "update";
@@ -381,7 +634,7 @@ export class DocTriggers {
     return trigger.eventTypes!.includes(eventType);
   }
 
-  private async _getWebHookUrl(id: string): Promise<string | undefined> {
+  private async _getWebHook(id: string): Promise<WebHookSecret | undefined> {
     let webhook = this._webhookCache.get(id);
     if (!webhook) {
       const secret = await this._activeDoc.getHomeDbManager()?.getSecret(id, this._docId);
@@ -392,8 +645,13 @@ export class DocTriggers {
       webhook = JSON.parse(secret);
       this._webhookCache.set(id, webhook!);
     }
-    const url = webhook!.url;
+    return webhook!;
+  }
+
+  private async _getWebHookUrl(id: string): Promise<string | undefined> {
+    const url = (await this._getWebHook(id))?.url ?? '';
     if (!isUrlAllowed(url)) {
+      // TODO: this is not a good place for a validation.
       this._log(`Webhook not sent to forbidden URL`, {level: 'warn', url});
       return;
     }
@@ -420,23 +678,39 @@ export class DocTriggers {
 
     // TODO delay/prevent shutting down while queue isn't empty?
     while (!this._shuttingDown) {
+      this._loopAbort = new AbortController();
       if (!this._webHookEventQueue.length) {
-        await delay(1000);
+        await delayAbort(TRIGGER_WAIT_DELAY, this._loopAbort.signal).catch(() => {});
         continue;
       }
       const id = this._webHookEventQueue[0].id;
       const batch = _.takeWhile(this._webHookEventQueue.slice(0, 100), {id});
       const body = JSON.stringify(batch.map(e => e.payload));
       const url = await this._getWebHookUrl(id);
-      let meta: Record<string, any>|undefined;
-
+      const authorization = (await this._getWebHook(id))?.authorization || "";
+      if (this._loopAbort.signal.aborted) {
+        continue;
+      }
+      let meta: {webhookId: string; host: string, quantity: number} | undefined;
       let success: boolean;
       if (!url) {
         success = true;
       } else {
-        meta = {numEvents: batch.length, webhookId: id, host: new URL(url).host};
+        await this._stats.logStatus(id, 'sending');
+        meta = {webhookId: id, host: new URL(url).host, quantity: batch.length};
         this._log("Sending batch of webhook events", meta);
-        success = await this._sendWebhookWithRetries(url, body);
+        this._activeDoc.logTelemetryEvent(null, 'sendingWebhooks', {
+          limited: {numEvents: meta.quantity},
+        });
+        success = await this._sendWebhookWithRetries(
+          id, url, authorization, body, batch.length, this._loopAbort.signal);
+        if (this._loopAbort.signal.aborted) {
+          continue;
+        }
+      }
+
+      if (this._loopAbort.signal.aborted) {
+        continue;
       }
 
       this._webHookEventQueue.splice(0, batch.length);
@@ -457,9 +731,37 @@ export class DocTriggers {
             const strings = batch.map(e => JSON.stringify(e));
             multi.rpush(this._redisQueueKey, ...strings);
           }
+          // We are postponed, so mark that.
+          await this._stats.logStatus(id, 'postponed');
+        } else {
+          // We are draining the queue and we skipped some events, so mark that.
+          await this._stats.logStatus(id, 'error');
+          await this._stats.logBatch(id, 'rejected');
         }
-      } else if (meta) {
-        this._log("Successfully sent batch of webhook events", meta);
+      } else {
+        await this._stats.logStatus(id, 'idle');
+        if (meta) {
+          this._log("Successfully sent batch of webhook events", meta);
+          const {webhookId, host, quantity} = meta;
+          this._activeDoc.logAuditEvent(null, {
+            action: "document.deliver_webhook_events",
+            actor: {
+              type: "system",
+            },
+            details: {
+              document: {
+                id: this._docId,
+              },
+              webhook: {
+                id: webhookId,
+                events: {
+                  delivered_to: host,
+                  quantity,
+                },
+              },
+            },
+          });
+        }
       }
 
       await multi?.execAsync();
@@ -489,10 +791,11 @@ export class DocTriggers {
     if (this._shuttingDown) {
       return 0;
     }
-    return this._drainingQueue ? 5 : 20;
+    return this._drainingQueue ? Math.min(5, TRIGGER_MAX_ATTEMPTS) : TRIGGER_MAX_ATTEMPTS;
   }
 
-  private async _sendWebhookWithRetries(url: string, body: string) {
+  private async _sendWebhookWithRetries(
+    id: string, url: string, authorization: string, body: string, size: number, signal: AbortSignal) {
     const maxWait = 64;
     let wait = 1;
     for (let attempt = 0; attempt < this._maxWebhookAttempts; attempt++) {
@@ -500,19 +803,42 @@ export class DocTriggers {
         return false;
       }
       try {
+        if (attempt > 0) {
+          await this._stats.logStatus(id, 'retrying');
+        }
         const response = await fetch(url, {
           method: 'POST',
           body,
           headers: {
             'Content-Type': 'application/json',
+            ...(authorization ? {'Authorization': authorization} : {}),
           },
+          signal,
+          agent: proxyAgent(new URL(url)),
         });
         if (response.status === 200) {
+          await this._stats.logBatch(id, 'success', { size, httpStatus: 200, error: null, attempts: attempt + 1 });
           return true;
         }
+        await this._stats.logBatch(id, 'failure', {
+          httpStatus: response.status,
+          error: await response.text(),
+          attempts: attempt + 1,
+          size,
+        });
         this._log(`Webhook responded with non-200 status`, {level: 'warn', status: response.status, attempt});
       } catch (e) {
+        await this._stats.logBatch(id, 'failure', {
+          httpStatus: null,
+          error: (e.message || 'Unrecognized error during fetch'),
+          attempts: attempt + 1,
+          size,
+        });
         this._log(`Webhook sending error: ${e}`, {level: 'warn', attempt});
+      }
+
+      if (signal.aborted) {
+        return false;
       }
 
       // Don't wait any more if this is the last attempt.
@@ -525,7 +851,12 @@ export class DocTriggers {
         if (this._shuttingDown) {
           return false;
         }
-        await delay(1000);
+        try {
+          await delayAbort(TRIGGER_WAIT_DELAY, signal);
+        } catch (e) {
+          // If signal was aborted, don't log anything as we probably was cleared.
+          return false;
+        }
       }
       if (wait < maxWait) {
         wait *= 2;
@@ -543,6 +874,17 @@ export function isUrlAllowed(urlString: string) {
     return false;
   }
 
+  // Support at most https and http.
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    return false;
+  }
+
+  // Support a wildcard that allows all domains.
+  // Allow either https or http if it is set.
+  if (process.env.ALLOWED_WEBHOOK_DOMAINS === '*') {
+    return true;
+  }
+
   // http (no s) is only allowed for localhost for testing.
   // localhost still needs to be explicitly permitted, and it shouldn't be outside dev
   if (url.protocol !== "https:" && url.hostname !== "localhost") {
@@ -550,6 +892,215 @@ export function isUrlAllowed(urlString: string) {
   }
 
   return (process.env.ALLOWED_WEBHOOK_DOMAINS || "").split(",").some(domain =>
-    domain && url.host.endsWith(domain)
+    domain && matchesBaseDomain(url.host, domain)
   );
 }
+
+
+/**
+ * Implementation detail, helper to provide a persisted storage to a derived class.
+ */
+class PersistedStore<Keys> {
+  /** In memory fallback if redis is not available */
+  private _statsCache = new MapWithTTL<string, string>(WEBHOOK_STATS_CACHE_TTL);
+  private _redisKey: string;
+
+  constructor(
+    docId: string,
+    private _activeDoc: ActiveDoc,
+    private _redisClientDep: () => RedisClient | null
+    ) {
+    this._redisKey = `webhooks:${docId}:statistics`;
+  }
+
+  public async clear() {
+    this._statsCache.clear();
+    if (this._redisClient) {
+      await this._redisClient.delAsync(this._redisKey).catch(() => {});
+    }
+  }
+
+  protected async markChange() {
+    await this._activeDoc.sendWebhookNotification();
+  }
+
+  protected async set(id: string, keyValues: [Keys, string][]) {
+    if (this._redisClient) {
+      const multi = this._redisClient.multi();
+      for (const [key, value] of keyValues) {
+        multi.hset(this._redisKey, `${id}:${key}`, value);
+        multi.expire(this._redisKey, WEBHOOK_STATS_CACHE_TTL);
+      }
+      await multi.execAsync();
+    } else {
+      for (const [key, value] of keyValues) {
+        this._statsCache.set(`${id}:${key}`, value);
+      }
+    }
+  }
+
+  protected async get(id: string, keys: Keys[]): Promise<[Keys, string][]> {
+    if (this._redisClient) {
+      const values = (await this._redisClient.hgetallAsync(this._redisKey)) || {};
+      return keys.map(key => [key, values[`${id}:${key}`] || '']);
+    } else {
+      return keys.map(key => [key, this._statsCache.get(`${id}:${key}`) || '']);
+    }
+  }
+
+  private get _redisClient() {
+    return this._redisClientDep();
+  }
+}
+
+/**
+ * Helper class that monitors and saves (either in memory or in Redis) usage statics and current
+ * status of webhooks.
+ */
+class WebhookStatistics extends PersistedStore<StatsKey> {
+  /**
+   * Retrieves and calculates all the statistics for a given webhook.
+   * @param id Webhook ID
+   * @param queue Current webhook task queue
+   */
+  public async getUsage(id: string, queue: WebHookEvent[]): Promise<WebhookUsage|null> {
+    // Get all the keys from the store for this webhook, and create a dictionary.
+    const values: Record<StatsKey, string> = _.fromPairs(await this.get(id, [
+      `batchStatus`,
+      `httpStatus`,
+      `errorMessage`,
+      `size`,
+      `status`,
+      `updatedTime`,
+      `lastFailureTime`,
+      `lastSuccessTime`,
+      `lastErrorMessage`,
+      `lastHttpStatus`,
+      `attempts`,
+    ])) as Record<StatsKey, string>;
+
+    // If everything is empty, we don't have any stats yet.
+    if (Array.from(Object.values(values)).every(v => !v)) {
+      return {
+        status: 'idle',
+        numWaiting: queue.filter(e => e.id === id).length,
+        lastEventBatch: null,
+      };
+    }
+
+    const usage: WebhookUsage = {
+      // Overall status of the webhook.
+      status: values.status as WebhookStatus || 'idle',
+      numWaiting: queue.filter(x => x.id === id).length,
+      updatedTime: parseInt(values.updatedTime || "0", 10),
+      // Last values from batches.
+      lastEventBatch: null,
+      lastSuccessTime: parseInt(values.lastSuccessTime, 10),
+      lastFailureTime: parseInt(values.lastFailureTime, 10),
+      lastErrorMessage: values.lastErrorMessage || null,
+      lastHttpStatus: values.lastHttpStatus ? parseInt(values.lastHttpStatus, 10) : null,
+    };
+
+    // If we have a batchStatus (so we actually run it at least once - or it wasn't cleared).
+    if (values.batchStatus) {
+      usage.lastEventBatch = {
+        status: values.batchStatus as WebhookBatchStatus,
+        httpStatus: values.httpStatus ? parseInt(values.httpStatus || "0", 10) : null,
+        errorMessage: values.errorMessage || null,
+        size: parseInt(values.size || "0", 10),
+        attempts: parseInt(values.attempts|| "0", 10),
+      };
+    }
+
+    return usage;
+  }
+
+  /**
+   * Logs a status of a webhook. Now is passed as a parameter so that updates that happen in almost the same
+   * millisecond were seen as the same update.
+   */
+  public async logStatus(id: string, status: WebhookStatus, now?: number|null) {
+    const stats: [StatsKey, string][] = [
+      ['status', status],
+      ['updatedTime', (now ?? Date.now()).toString()],
+    ];
+    if (status === 'sending') {
+      // clear any error message that could have been left from an earlier bad state (ie: invalid
+      // fields)
+      stats.push(['errorMessage', '']);
+    }
+    await this.set(id, stats);
+    await this.markChange();
+  }
+
+  public async logInvalid(id: string, errorMessage: string) {
+    await this.logStatus(id, 'invalid');
+    await this.set(id, [
+      ['errorMessage', errorMessage]
+    ]);
+    await this.markChange();
+  }
+
+  /**
+   * Logs a status of the active batch.
+   */
+  public async logBatch(
+    id: string,
+    status: WebhookBatchStatus,
+    stats?: {
+      httpStatus?: number|null,
+      error?: string|null,
+      size?: number|null,
+      attempts?: number|null,
+    }
+  ) {
+    const now = Date.now();
+
+    // Update batchStats.
+    const batchStats: [StatsKey, string][] = [
+      [`batchStatus`, status],
+      [`updatedTime`, now.toString()],
+    ];
+    if (stats?.httpStatus !== undefined) {
+      batchStats.push([`httpStatus`, (stats.httpStatus || '').toString()]);
+    }
+    if (stats?.attempts !== undefined) {
+      batchStats.push([`attempts`, (stats.attempts || '0').toString()]);
+    }
+    if (stats?.error !== undefined) {
+      batchStats.push([`errorMessage`, stats?.error || '']);
+    }
+    if (stats?.size !== undefined) {
+      batchStats.push([`size`, (stats.size || '').toString()]);
+    }
+
+    const batchSummary: [StatsKey, string][] = [];
+    // Update webhook stats.
+    if (status === 'success') {
+      batchSummary.push([`lastSuccessTime`, now.toString()]);
+    } else if (status === 'failure') {
+      batchSummary.push([`lastFailureTime`, now.toString()]);
+    }
+    if (stats?.error) {
+      batchSummary.push([`lastErrorMessage`, stats.error]);
+    }
+    if (stats?.httpStatus) {
+      batchSummary.push([`lastHttpStatus`, (stats.httpStatus || '').toString()]);
+    }
+    await this.set(id, batchStats.concat(batchSummary));
+    await this.markChange();
+  }
+}
+
+type StatsKey =
+  'batchStatus' |
+  'httpStatus' |
+  'errorMessage' |
+  'attempts' |
+  'size'|
+  'updatedTime' |
+  'lastFailureTime' |
+  'lastSuccessTime' |
+  'lastErrorMessage' |
+  'lastHttpStatus' |
+  'status';

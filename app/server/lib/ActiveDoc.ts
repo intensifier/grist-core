@@ -4,6 +4,7 @@
  * change events.
  */
 
+import {ACLRuleCollection} from 'app/common/ACLRuleCollection';
 import {
   getEnvContent,
   LocalActionBundle,
@@ -12,41 +13,49 @@ import {
   UserActionBundle
 } from 'app/common/ActionBundle';
 import {ActionGroup, MinimalActionGroup} from 'app/common/ActionGroup';
-import {ActionSummary} from "app/common/ActionSummary";
+import {ActionSummary} from 'app/common/ActionSummary';
 import {
+  AclResources,
   AclTableDescription,
+  ApplyUAExtendedOptions,
   ApplyUAOptions,
   ApplyUAResult,
   DataSourceTransformed,
   ForkResult,
+  FormulaTimingInfo,
   ImportOptions,
   ImportResult,
+  ISuggestionWithValue,
   MergeOptions,
   PermissionDataWithExtraUsers,
   QueryResult,
   ServerQuery,
+  TableFetchResult,
   TransformRule
 } from 'app/common/ActiveDocAPI';
 import {ApiError} from 'app/common/ApiError';
 import {mapGetOrSet, MapWithTTL} from 'app/common/AsyncCreate';
+import {AttachmentColumns, gatherAttachmentIds, getAttachmentColumns} from 'app/common/AttachmentColumns';
+import {WebhookMessageType} from 'app/common/CommTypes';
 import {
+  BulkAddRecord,
   BulkRemoveRecord,
   BulkUpdateRecord,
   CellValue,
   DocAction,
   getTableId,
+  isSchemaAction,
   TableDataAction,
-  TableRecordValue,
   toTableDataAction,
   UserAction
 } from 'app/common/DocActions';
 import {DocData} from 'app/common/DocData';
-import {getDataLimitRatio, getDataLimitStatus, getSeverity, LimitExceededError} from 'app/common/DocLimits';
+import {getDataLimitInfo, getDataLimitRatio, getSeverity, LimitExceededError} from 'app/common/DocLimits';
 import {DocSnapshots} from 'app/common/DocSnapshot';
 import {DocumentSettings} from 'app/common/DocumentSettings';
 import {
   APPROACHING_LIMIT_RATIO,
-  DataLimitStatus,
+  DataLimitInfo,
   DocumentUsage,
   DocUsageSummary,
   FilteredDocUsageSummary,
@@ -54,42 +63,70 @@ import {
   RowCounts,
 } from 'app/common/DocUsage';
 import {normalizeEmail} from 'app/common/emails';
-import {ErrorWithCode} from 'app/common/ErrorWithCode';
 import {Product} from 'app/common/Features';
-import {FormulaProperties, getFormulaProperties} from 'app/common/GranularAccessClause';
-import {parseUrlId} from 'app/common/gristUrls';
-import {byteString, countIf, retryOnce, safeJsonParse} from 'app/common/gutil';
+import {isHiddenCol} from 'app/common/gristTypes';
+import {commonUrls, parseUrlId} from 'app/common/gristUrls';
+import {byteString, countIf, retryOnce, safeJsonParse, timeoutReached} from 'app/common/gutil';
 import {InactivityTimer} from 'app/common/InactivityTimer';
+import {Interval} from 'app/common/Interval';
+import {normalizedDateTimeString} from 'app/common/normalizedDateTimeString';
+import {
+  compilePredicateFormula,
+  getPredicateFormulaProperties,
+  PredicateFormulaProperties,
+} from 'app/common/PredicateFormula';
 import * as roles from 'app/common/roles';
 import {schema, SCHEMA_VERSION} from 'app/common/schema';
 import {MetaRowRecord, SingleCell} from 'app/common/TableData';
+import {TelemetryEvent, TelemetryMetadataByLevel} from 'app/common/Telemetry';
 import {FetchUrlOptions, UploadResult} from 'app/common/uploads';
-import {DocReplacementOptions, DocState, DocStateComparison} from 'app/common/UserAPI';
+import {Document as APIDocument, AttachmentTransferStatus,
+        DocReplacementOptions, DocState, DocStateComparison, NEW_DOCUMENT_CODE} from 'app/common/UserAPI';
 import {convertFromColumn} from 'app/common/ValueConverter';
-import {guessColInfoWithDocData} from 'app/common/ValueGuesser';
+import {guessColInfo} from 'app/common/ValueGuesser';
 import {parseUserAction} from 'app/common/ValueParser';
-import {ParseOptions} from 'app/plugin/FileParserAPI';
-import {AccessTokenOptions, AccessTokenResult, GristDocAPI} from 'app/plugin/GristAPI';
-import {compileAclFormula} from 'app/server/lib/ACLFormula';
-import {Authorizer} from 'app/server/lib/Authorizer';
-import {checksumFile} from 'app/server/lib/checksumFile';
+import {Document} from 'app/gen-server/entity/Document';
+import {Share} from 'app/gen-server/entity/Share';
+import {RecordWithStringId} from 'app/plugin/DocApiTypes';
+import {ParseFileResult, ParseOptions} from 'app/plugin/FileParserAPI';
+import {AccessTokenOptions, AccessTokenResult, GristDocAPI, UIRowId} from 'app/plugin/GristAPI';
+import {AssistanceSchemaPromptV1Context} from 'app/server/lib/Assistance';
+import {AssistanceContext} from 'app/common/AssistancePrompts';
+import {AuditEventAction} from 'app/server/lib/AuditEvent';
+import {Authorizer, RequestWithLogin} from 'app/server/lib/Authorizer';
 import {Client} from 'app/server/lib/Client';
+import {getMetaTables} from 'app/server/lib/DocApi';
 import {DEFAULT_CACHE_TTL, DocManager} from 'app/server/lib/DocManager';
+import {GristServer} from 'app/server/lib/GristServer';
+import {AuditEventProperties} from 'app/server/lib/IAuditLogger';
 import {ICreateActiveDocOptions} from 'app/server/lib/ICreate';
 import {makeForkIds} from 'app/server/lib/idUtils';
 import {GRIST_DOC_SQL, GRIST_DOC_WITH_TABLE1_SQL} from 'app/server/lib/initialDocSql';
 import {ISandbox} from 'app/server/lib/ISandbox';
 import log from 'app/server/lib/log';
-import {LogMethods} from "app/server/lib/LogMethods";
+import {LogMethods} from 'app/server/lib/LogMethods';
+import {ISandboxOptions} from 'app/server/lib/NSandbox';
+import {NullSandbox, UnavailableSandboxMethodError} from 'app/server/lib/NullSandbox';
 import {DocRequests} from 'app/server/lib/Requests';
+import {
+  getAltSessionId,
+  getDocSessionAccess,
+  getDocSessionAccessOrNull,
+  getDocSessionUsage,
+  getFullUser,
+  getLogMeta,
+  getUserId,
+  RequestOrSession,
+} from 'app/server/lib/sessionUtils';
 import {shortDesc} from 'app/server/lib/shortDesc';
 import {TableMetadataLoader} from 'app/server/lib/TableMetadataLoader';
-import {DocTriggers} from "app/server/lib/Triggers";
+import {DocTriggers} from 'app/server/lib/Triggers';
 import {fetchURL, FileUploadInfo, globalUploadSet, UploadInfo} from 'app/server/lib/uploads';
 import assert from 'assert';
 import {Mutex} from 'async-mutex';
 import * as bluebird from 'bluebird';
 import {EventEmitter} from 'events';
+import {readFile} from 'fs-extra';
 import {IMessage, MsgType} from 'grain-rpc';
 import imageSize from 'image-size';
 import * as moment from 'moment-timezone';
@@ -99,36 +136,31 @@ import tmp from 'tmp';
 
 import {ActionHistory} from './ActionHistory';
 import {ActionHistoryImpl} from './ActionHistoryImpl';
-import {ActiveDocImport} from './ActiveDocImport';
+import {ActiveDocImport, FileImportOptions} from './ActiveDocImport';
+import {AttachmentFileManager} from './AttachmentFileManager';
+import {IAttachmentStoreProvider} from './AttachmentStoreProvider';
 import {DocClients} from './DocClients';
 import {DocPluginManager} from './DocPluginManager';
-import {
-  DocSession,
-  getDocSessionAccess,
-  getDocSessionUser,
-  getDocSessionUserId,
-  makeExceptionalDocSession,
-  OptDocSession
-} from './DocSession';
-import {createAttachmentsIndex, DocStorage} from './DocStorage';
-import {expandQuery} from './ExpandedQuery';
+import {DocSession, makeExceptionalDocSession, OptDocSession} from './DocSession';
+import {createAttachmentsIndex, DocStorage, REMOVE_UNUSED_ATTACHMENTS_DELAY} from './DocStorage';
+import {expandQuery, getFormulaErrorForExpandQuery} from './ExpandedQuery';
 import {GranularAccess, GranularAccessForBundle} from './GranularAccess';
 import {OnDemandActions} from './OnDemandActions';
-import {getLogMetaFromDocSession, timeoutReached} from './serverUtils';
+import {getPubSubPrefix} from './serverUtils';
 import {findOrAddAllEnvelope, Sharing} from './Sharing';
 import cloneDeep = require('lodash/cloneDeep');
 import flatten = require('lodash/flatten');
-import remove = require('lodash/remove');
+import merge = require('lodash/merge');
+import pick = require('lodash/pick');
 import sum = require('lodash/sum');
 import without = require('lodash/without');
-import zipObject = require('lodash/zipObject');
 
 bluebird.promisifyAll(tmp);
 
 const MAX_RECENT_ACTIONS = 100;
 
 const DEFAULT_TIMEZONE = (process.versions as any).electron ? moment.tz.guess() : "UTC";
-const DEFAULT_LOCALE = "en-US";
+const DEFAULT_LOCALE = process.env.GRIST_DEFAULT_LOCALE || "en-US";
 
 // Number of seconds an ActiveDoc is retained without any clients.
 // In dev environment, it is convenient to keep this low for quick tests.
@@ -138,17 +170,33 @@ const ACTIVEDOC_TIMEOUT = (process.env.NODE_ENV === 'production') ? 30 : 5;
 // We'll wait this long between re-measuring sandbox memory.
 const MEMORY_MEASUREMENT_INTERVAL_MS = 60 * 1000;
 
-// Cleanup expired attachments every hour (also happens when shutting down)
-const REMOVE_UNUSED_ATTACHMENTS_INTERVAL_MS = 60 * 60 * 1000;
-
 // Apply the UpdateCurrentTime user action every hour
-const UPDATE_CURRENT_TIME_INTERVAL_MS = 60 * 60 * 1000;
+const UPDATE_CURRENT_TIME_DELAY = {delayMs: 60 * 60 * 1000, varianceMs: 30 * 1000};
 
 // Measure and broadcast data size every 5 minutes
-const UPDATE_DATA_SIZE_INTERVAL_MS = 5 * 60 * 1000;
+const UPDATE_DATA_SIZE_DELAY = {delayMs: 5 * 60 * 1000, varianceMs: 30 * 1000};
+
+// Log document metrics every hour
+const LOG_DOCUMENT_METRICS_DELAY = {delayMs: 60 * 60 * 1000, varianceMs: 30 * 1000};
+
+// For items of work that need to happen at shutdown, timeout before aborting the wait for them.
+const SHUTDOWN_ITEM_TIMEOUT_MS = 5000;
+
+// We keep a doc open while a user action is pending, but not longer than this. If it's pending
+// this long, the ACTIVEDOC_TIMEOUT will still kick in afterwards, and in the absence of other
+// activity, the doc would still get shut down, with the action's effect lost. This is to prevent
+// indefinitely running processes in case of an infinite loop in a formula.
+const KEEP_DOC_OPEN_TIMEOUT_MS = 5 * 60 * 1000;
 
 // A hook for dependency injection.
-export const Deps = {ACTIVEDOC_TIMEOUT};
+export const Deps = {
+  ACTIVEDOC_TIMEOUT,
+  ACTIVEDOC_TIMEOUT_ACTION: 'shutdown' as 'shutdown'|'ignore',
+
+  UPDATE_CURRENT_TIME_DELAY,
+  SHUTDOWN_ITEM_TIMEOUT_MS,
+  KEEP_DOC_OPEN_TIMEOUT_MS,
+};
 
 interface UpdateUsageOptions {
   // Whether usage should be synced to the home database. Defaults to true.
@@ -165,33 +213,39 @@ interface UpdateUsageOptions {
 export class ActiveDoc extends EventEmitter {
   /**
    * Decorator for ActiveDoc methods that prevents shutdown while the method is running, i.e.
-   * until the returned promise is resolved.
+   * until the returned promise is resolved, or KEEP_DOC_OPEN_TIMEOUT_MS passes.
    */
   public static keepDocOpen(target: ActiveDoc, propertyKey: string, descriptor: PropertyDescriptor) {
     const origFunc = descriptor.value;
     descriptor.value = function(this: ActiveDoc) {
-      return this._inactivityTimer.disableUntilFinish(origFunc.apply(this, arguments));
+      const result = origFunc.apply(this, arguments);
+      this._inactivityTimer.disableUntilFinish(timeoutReached(Deps.KEEP_DOC_OPEN_TIMEOUT_MS, result))
+        .catch(() => {});
+      return result;
     };
   }
 
+  public readonly doc: Document|undefined = this._options?.doc;
   public readonly docStorage: DocStorage;
   public readonly docPluginManager: DocPluginManager|null;
   public readonly docClients: DocClients;               // Only exposed for Sharing.ts
   public docData: DocData|null = null;
+  // Used by DocApi to only allow one webhook-related endpoint to run at a time.
+  public readonly triggersLock: Mutex = new Mutex();
+  public isTimingOn = false;
 
   protected _actionHistory: ActionHistory;
-  protected _docManager: DocManager;
-  protected _docName: string;
   protected _sharing: Sharing;
   // This lock is used to avoid reading sandbox state while it is being modified but before
   // the result has been confirmed to pass granular access rules (which may depend on the
   // result).
   protected _modificationLock: Mutex = new Mutex();
 
-  private _log = new LogMethods('ActiveDoc ', (s: OptDocSession) => this.getLogMeta(s));
+  private readonly _server: GristServer = this._docManager.gristServer;
+  private _log = new LogMethods('ActiveDoc ', (s: OptDocSession | null) => this.getLogMeta(s));
   private _triggers: DocTriggers;
   private _requests: DocRequests;
-  private _dataEngine: Promise<ISandbox>|undefined;
+  private _dataEngine: Promise<ISandbox>|null = null;
   private _activeDocImport: ActiveDocImport;
   private _onDemandActions: OnDemandActions;
   private _granularAccess: GranularAccess;
@@ -208,54 +262,97 @@ export class ActiveDoc extends EventEmitter {
   private _docUsage: DocumentUsage|null = null;
   private _product?: Product;
   private _gracePeriodStart: Date|null = null;
-  private _isForkOrSnapshot: boolean = false;
+  private _isSnapshot: boolean;
+  private _isForkOrSnapshot: boolean;
   private _onlyAllowMetaDataActionsOnDb: boolean = false;
+  // Cache of which columns are attachment columns.
+  private _attachmentColumns?: AttachmentColumns;
+  private _attachmentFileManager: AttachmentFileManager;
 
   // Client watching for 'product changed' event published by Billing to update usage
   private _redisSubscriber?: RedisClient;
 
   // Timer for shutting down the ActiveDoc a bit after all clients are gone.
-  private _inactivityTimer = new InactivityTimer(() => this.shutdown(), Deps.ACTIVEDOC_TIMEOUT * 1000);
+  private _inactivityTimer = new InactivityTimer(() => {
+    this._log.debug(null, 'inactivity timeout');
+    return this._onInactive();
+  }, Deps.ACTIVEDOC_TIMEOUT * 1000);
   private _recoveryMode: boolean = false;
   private _shuttingDown: boolean = false;
+  private _afterShutdownCallback?: () => Promise<void>;
+  private _doShutdown?: Promise<void>;
+  private _intervals: Interval[] = [];
 
-  // Intervals to clear on shutdown
-  private _intervals = [
-    // Cleanup expired attachments every hour (also happens when shutting down)
-    setInterval(
-      () => this.removeUnusedAttachments(true),
-      REMOVE_UNUSED_ATTACHMENTS_INTERVAL_MS,
-    ),
-    setInterval(
-      () => this._applyUserActions(makeExceptionalDocSession('system'), [["UpdateCurrentTime"]]),
-      UPDATE_CURRENT_TIME_INTERVAL_MS,
-    ),
-    // Measure and broadcast data size every 5 minutes
-    setInterval(
-      () => this._checkDataSizeLimitRatio(makeExceptionalDocSession('system')),
-      UPDATE_DATA_SIZE_INTERVAL_MS,
-    ),
-  ];
-
-  constructor(docManager: DocManager, docName: string, private _options?: ICreateActiveDocOptions) {
+  constructor(
+    private readonly _docManager: DocManager,
+    private _docName: string,
+    private _attachmentStoreProvider?: IAttachmentStoreProvider,
+    private _options?: ICreateActiveDocOptions
+  ) {
     super();
-    const {forkId, snapshotId} = parseUrlId(docName);
+    const { forkId, snapshotId } = parseUrlId(_docName);
+    this._isSnapshot = Boolean(snapshotId);
     this._isForkOrSnapshot = Boolean(forkId || snapshotId);
+    if (!this._isSnapshot) {
+      /**
+       * In cases where large numbers of documents are restarted simultaneously
+       * (like during deployments), there's a tendency for scheduled intervals to
+       * execute at roughly the same moment in time, which causes spikes in load.
+       *
+       * To mitigate this, we use randomized intervals that re-compute their delay
+       * in-between calls, with a variance of 30 seconds.
+       */
+      this._intervals.push(
+        // Cleanup expired attachments every hour (also happens when shutting down).
+        new Interval(
+          () => this.removeUnusedAttachments(true),
+          REMOVE_UNUSED_ATTACHMENTS_DELAY,
+          {onError: (e) => this._log.error(null, 'failed to remove expired attachments', e)},
+        ),
+        // Update the time in formulas every hour.
+        new Interval(
+          () => this._updateCurrentTime(),
+          Deps.UPDATE_CURRENT_TIME_DELAY,
+          {onError: (e) => this._log.error(null, 'failed to update current time', e)},
+        ),
+        // Measure and broadcast data size every 5 minutes.
+        new Interval(
+          () => this._checkDataSizeLimitRatio(makeExceptionalDocSession('system')),
+          UPDATE_DATA_SIZE_DELAY,
+          {onError: (e) => this._log.error(null, 'failed to update data size', e)},
+        ),
+        // Log document metrics every hour.
+        new Interval(
+          () => this._logDocMetrics(makeExceptionalDocSession('system'), 'interval'),
+          LOG_DOCUMENT_METRICS_DELAY,
+          {onError: (e) => this._log.error(null, 'failed to log document metrics', e)},
+        ),
+      );
+    }
     if (_options?.safeMode) { this._recoveryMode = true; }
     if (_options?.doc) {
-      const {gracePeriodStart, workspace, usage} = _options.doc;
+      const { gracePeriodStart, workspace, usage } = _options.doc;
       const billingAccount = workspace.org.billingAccount;
       this._product = billingAccount?.product;
       this._gracePeriodStart = gracePeriodStart;
 
       if (process.env.REDIS_URL && billingAccount) {
-        const channel = `billingAccount-${billingAccount.id}-product-changed`;
+        const prefix = getPubSubPrefix();
+        const channel = `${prefix}-billingAccount-${billingAccount.id}-product-changed`;
         this._redisSubscriber = createClient(process.env.REDIS_URL);
         this._redisSubscriber.subscribe(channel);
         this._redisSubscriber.on("message", async () => {
           // A product change has just happened in Billing.
           // Reload the doc (causing connected clients to reload) to ensure everyone sees the effect of the change.
+          this._log.debug(null, 'reload after product change');
           await this.reloadDoc();
+        });
+        this._redisSubscriber.on("error", async (error) => {
+          this._log.error(
+            null,
+            `encountered error while subscribed to channel ${channel}`,
+            error
+          );
         });
       }
 
@@ -275,22 +372,43 @@ export class ActiveDoc extends EventEmitter {
         this._docUsage = usage;
       }
     }
-    this._docManager = docManager;
-    this._docName = docName;
-    this.docStorage = new DocStorage(docManager.storageManager, docName);
+    this.docStorage = new DocStorage(_docManager.storageManager, _docName);
     this.docClients = new DocClients(this);
     this._triggers = new DocTriggers(this);
     this._requests = new DocRequests(this);
     this._actionHistory = new ActionHistoryImpl(this.docStorage);
-    this.docPluginManager = docManager.pluginManager ?
-      new DocPluginManager(docManager.pluginManager.getPlugins(),
-                           docManager.pluginManager.appRoot!, this, this._docManager.gristServer) : null;
+    this.docPluginManager = _docManager.pluginManager
+      ? new DocPluginManager(
+          _docManager.pluginManager.getPlugins(),
+          _docManager.pluginManager.appRoot!,
+          this,
+          this._server
+        )
+      : null;
     this._tableMetadataLoader = new TableMetadataLoader({
       decodeBuffer: this.docStorage.decodeMarshalledData.bind(this.docStorage),
       fetchTable: this.docStorage.fetchTable.bind(this.docStorage),
       loadMetaTables: this._rawPyCall.bind(this, 'load_meta_tables'),
       loadTable: this._rawPyCall.bind(this, 'load_table'),
     });
+
+    // This will throw errors if _options?.doc or _attachmentStoreProvider aren't provided,
+    // and ActiveDoc tries to use an external attachment store.
+    this._attachmentFileManager = new AttachmentFileManager(
+      this.docStorage,
+      _attachmentStoreProvider,
+      _options?.doc,
+    );
+
+    // Every time manager starts the transfer we need to notify clients about it.
+    const notifier = this.sendAttachmentTransferStatusNotification.bind(this);
+
+    // Manager emits to events, at the start and at the end, but we don't care here, we
+    // just want to notify about the current status. We also don't need to unregister
+    // as the manager will be shutdown with us.
+    this._attachmentFileManager
+      .on(AttachmentFileManager.events.TRANSFER_STARTED, notifier)
+      .on(AttachmentFileManager.events.TRANSFER_COMPLETED, notifier);
 
     // Our DataEngine is a separate sandboxed process (one sandbox per open document,
     // corresponding to one process for pynbox, more for gvisor).
@@ -318,6 +436,7 @@ export class ActiveDoc extends EventEmitter {
 
   public get isShuttingDown(): boolean { return this._shuttingDown; }
 
+  public get triggers(): DocTriggers { return this._triggers; }
 
   public get rowLimitRatio(): number {
     return getUsageRatio(
@@ -337,8 +456,8 @@ export class ActiveDoc extends EventEmitter {
     return getDataLimitRatio(this._docUsage, this._product?.features);
   }
 
-  public get dataLimitStatus(): DataLimitStatus {
-    return getDataLimitStatus({
+  public get dataLimitInfo(): DataLimitInfo {
+    return getDataLimitInfo({
       docUsage: this._docUsage,
       productFeatures: this._product?.features,
       gracePeriodStart: this._gracePeriodStart,
@@ -347,7 +466,7 @@ export class ActiveDoc extends EventEmitter {
 
   public getDocUsageSummary(): DocUsageSummary {
     return {
-      dataLimitStatus: this.dataLimitStatus,
+      dataLimitInfo: this.dataLimitInfo,
       rowCount: this._docUsage?.rowCount ?? 'pending',
       dataSizeBytes: this._docUsage?.dataSizeBytes ?? 'pending',
       attachmentsSizeBytes: this._docUsage?.attachmentsSizeBytes ?? 'pending',
@@ -360,6 +479,10 @@ export class ActiveDoc extends EventEmitter {
     return this._granularAccess.filterDocUsageSummary(docSession, this.getDocUsageSummary());
   }
 
+  public getUser(docSession: OptDocSession) {
+    return this._granularAccess.getUser(docSession);
+  }
+
   public async getUserOverride(docSession: OptDocSession) {
     return this._granularAccess.getUserOverride(docSession);
   }
@@ -367,7 +490,7 @@ export class ActiveDoc extends EventEmitter {
   // Constructs metadata for logging, given a Client or an OptDocSession.
   public getLogMeta(docSession: OptDocSession|null, docMethod?: string): log.ILogMeta {
     return {
-      ...(docSession ? getLogMetaFromDocSession(docSession) : {}),
+      ...getLogMeta(docSession),
       docId: this._docName,
       ...(docMethod ? {docMethod} : {}),
     };
@@ -466,94 +589,11 @@ export class ActiveDoc extends EventEmitter {
   public async shutdown(options: {
     afterShutdown?: () => Promise<void>
   } = {}): Promise<void> {
-    const docSession = makeExceptionalDocSession('system');
-    this._log.debug(docSession, "shutdown starting");
-    try {
-      this.setMuted();
-      this._inactivityTimer.disable();
-      if (this.docClients.clientCount() > 0) {
-        this._log.warn(docSession, `Doc being closed with ${this.docClients.clientCount()} clients left`);
-        await this.docClients.broadcastDocMessage(null, 'docShutdown', null);
-        this.docClients.interruptAllClients();
-        this.docClients.removeAllClients();
-      }
-
-      this._triggers.shutdown();
-
-      this._redisSubscriber?.quitAsync()
-        .catch(e => this._log.warn(docSession, "Failed to quit redis subscriber", e));
-
-      // Clear the MapWithTTL to remove all timers from the event loop.
-      this._fetchCache.clear();
-
-      for (const interval of this._intervals) {
-        clearInterval(interval);
-      }
-      // We'll defer syncing usage until everything is calculated.
-      const usageOptions = {syncUsageToDatabase: false, broadcastUsageToClients: false};
-
-      // This cleanup requires docStorage, which may have failed to start up.
-      // We don't want to log pointless errors in that case.
-      if (this.docStorage.isInitialized()) {
-        // Remove expired attachments, i.e. attachments that were soft deleted a while ago. This
-        // needs to happen periodically, and doing it here means we can guarantee that it happens
-        // even if the doc is only ever opened briefly, without having to slow down startup.
-        const removeAttachmentsPromise = this.removeUnusedAttachments(true, usageOptions);
-
-        // Update data size; we'll be syncing both it and attachments size to the database soon.
-        const updateDataSizePromise = this._updateDataSize(usageOptions);
-
-        try {
-          await removeAttachmentsPromise;
-        } catch (e) {
-          this._log.error(docSession, "Failed to remove expired attachments", e);
-        }
-
-        try {
-          await updateDataSizePromise;
-        } catch (e) {
-          this._log.error(docSession, "Failed to update data size", e);
-        }
-      }
-
-      this._syncDocUsageToDatabase(true);
-
-      try {
-        await this._docManager.storageManager.closeDocument(this.docName);
-      } catch (err) {
-        log.error('Problem shutting down document: %s %s', this.docName, err.message);
-      }
-
-      try {
-        const dataEngine = this._dataEngine ? await this._getEngine() : null;
-        this._shuttingDown = true;  // Block creation of engine if not yet in existence.
-        if (dataEngine) {
-          // Give a small grace period for finishing initialization if we are being shut
-          // down while initialization is still in progress, and we don't have an easy
-          // way yet to cancel it cleanly. This is mainly for the benefit of automated
-          // tests.
-          await timeoutReached(3000, this.waitForInitialization());
-        }
-        await Promise.all([
-          this.docStorage.shutdown(),
-          this.docPluginManager?.shutdown(),
-          dataEngine?.shutdown()
-        ]);
-        // The this.waitForInitialization promise may not yet have resolved, but
-        // should do so quickly now we've killed everything it depends on.
-        try {
-          await this.waitForInitialization();
-        } catch (err) {
-          // Initialization errors do not matter at this point.
-        }
-      } catch (err) {
-        this._log.error(docSession, "failed to shutdown some resources", err);
-      }
-      await options.afterShutdown?.();
-    } finally {
-      this._docManager.removeActiveDoc(this);
+    if (options.afterShutdown) {
+      this._afterShutdownCallback = options.afterShutdown;
     }
-    this._log.debug(docSession, "shutdown complete");
+    this._doShutdown ||= this._doShutdownImpl();
+    await this._doShutdown;
   }
 
   /**
@@ -570,6 +610,7 @@ export class ActiveDoc extends EventEmitter {
     this._log.debug(docSession, "createEmptyDocWithDataEngine");
     await this._docManager.storageManager.prepareToCreateDoc(this.docName);
     await this.docStorage.createFile();
+    this._registerSQLiteDB();
     await this._rawPyCall('load_empty');
     // This init action is special. It creates schema tables, and is used to init the DB, but does
     // not go through other steps of a regular action (no ActionHistory or broadcasting).
@@ -580,7 +621,9 @@ export class ActiveDoc extends EventEmitter {
     // because the table _grist_Attachments doesn't exist at that point - it's created by InitNewDoc.
     await createAttachmentsIndex(this.docStorage);
 
-    await this._initDoc(docSession);
+    // A DocData object is needed, but for this purpose, it's OK that it has no data loaded.
+    const docData = new DocData(tableId => this.fetchTable(makeExceptionalDocSession('system'), tableId), {});
+    await this._initDoc(docSession, docData);
     await this._tableMetadataLoader.clean();
     // Makes sure docPluginManager is ready in case new doc is used to import new data
     await this.docPluginManager?.ready;
@@ -635,13 +678,16 @@ export class ActiveDoc extends EventEmitter {
           },
         });
       }
-      const [tableNames, onDemandNames] = await this._loadOpenDoc(docSession);
-      const desiredTableNames = tableNames.filter(name => name.startsWith('_grist_'));
-      this._startLoadingTables(docSession, desiredTableNames);
-      const pendingTableNames = tableNames.filter(name => !name.startsWith('_grist_'));
-      await this._initDoc(docSession);
-      this._initializationPromise = this._finishInitialization(docSession, pendingTableNames,
-                                                               onDemandNames, startTime).catch(async (err) => {
+      this._registerSQLiteDB();
+
+      await this._loadOpenDoc(docSession);
+      const metaTableData = await this._tableMetadataLoader.fetchTablesAsActions();
+      const docData = new DocData(tableId => this.fetchTable(makeExceptionalDocSession('system'), tableId),
+        metaTableData);
+
+      await this._initDoc(docSession, docData);
+
+      this._initializationPromise = this._finishInitialization(docSession, docData, startTime).catch(async (err) => {
         await this.docClients.broadcastDocMessage(null, 'docError', {
           when: 'initialization',
           message: String(err),
@@ -662,7 +708,15 @@ export class ActiveDoc extends EventEmitter {
    * shut it down, and unlist it via the DocManager.  A fresh ActiveDoc can be acquired via the
    * DocManager.
    */
-  public async replace(source: DocReplacementOptions) {
+  public async replace(docSession: OptDocSession, source: DocReplacementOptions) {
+    if (parseUrlId(this._docName).snapshotId) {
+      throw new ApiError('Snapshots cannot be replaced.', 400);
+    }
+    if (!await this._granularAccess.isOwner(docSession)) {
+      throw new ApiError('Only owners can replace a document.', 403);
+    }
+    this._log.debug(docSession, 'ActiveDoc.replace starting shutdown');
+
     // During replacement, it is important for all hands to be off the document. So we
     // ask the shutdown method to do the replacement when the ActiveDoc is shutdown but
     // before a new one could be opened.
@@ -674,9 +728,8 @@ export class ActiveDoc extends EventEmitter {
   /**
    * Finish initializing ActiveDoc, by initializing ActionHistory, Sharing, and docData.
    */
-  public async _initDoc(docSession: OptDocSession): Promise<void> {
-    const metaTableData = await this._tableMetadataLoader.fetchTablesAsActions();
-    this.docData = new DocData(tableId => this.fetchTable(makeExceptionalDocSession('system'), tableId), metaTableData);
+  public async _initDoc(docSession: OptDocSession, docData: DocData): Promise<void> {
+    this.docData = docData;
     this._onDemandActions = new OnDemandActions(this.docStorage, this.docData,
                                                 this._recoveryMode);
 
@@ -791,11 +844,22 @@ export class ActiveDoc extends EventEmitter {
   }
 
   /**
+   * Import data resulting from parsing a file into a new table.
+   * In normal circumstances this is only used internally.
+   * It's exposed publicly for use by grist-static which doesn't use the plugin system.
+   */
+  public async importParsedFileAsNewTable(
+    docSession: OptDocSession, optionsAndData: ParseFileResult, importOptions: FileImportOptions
+  ): Promise<ImportResult> {
+    return this._activeDocImport.importParsedFileAsNewTable(docSession, optionsAndData, importOptions);
+  }
+
+  /**
    * This function saves attachments from a given upload and creates an entry for them in the database.
    * It returns the list of rowIds for the rows created in the _grist_Attachments table.
    */
   public async addAttachments(docSession: OptDocSession, uploadId: number): Promise<number[]> {
-    const userId = getDocSessionUserId(docSession);
+    const userId = getUserId(docSession);
     const upload: UploadInfo = globalUploadSet.getUploadInfo(uploadId, this.makeAccessId(userId));
     try {
       // We'll assert that the upload won't cause limits to be exceeded, retrying once after
@@ -817,12 +881,19 @@ export class ActiveDoc extends EventEmitter {
           }
         }
       );
-      const userActions: UserAction[] = await Promise.all(
-        upload.files.map(file => this._prepAttachment(docSession, file)));
-      const result = await this.applyUserActions(docSession, userActions);
+      const userActions: UserAction[] = [];
+      // Process uploads sequentially to reduce risk of race conditions.
+      // Minimal performance impact due to the main async operation being serialized SQL queries.
+      for (const file of upload.files) {
+        userActions.push(await this._prepAttachment(docSession, file));
+      }
+      const result = await this._applyUserActionsWithExtendedOptions(docSession, userActions, {
+        attachment: true,
+      });
       this._updateAttachmentsSize().catch(e => {
         this._log.warn(docSession, 'failed to update attachments size', e);
       });
+      await this._granularAccess.noteUploads(docSession, result.retValues);
       return result.retValues;
     } finally {
       await globalUploadSet.cleanup(uploadId);
@@ -847,52 +918,100 @@ export class ActiveDoc extends EventEmitter {
 
   /**
    * Given a _gristAttachments record, returns a promise for the attachment data.
+   * Can optionally take a cell in which the attachment is expected to be
+   * referenced, and/or a `maybeNew` flag which, when set, specifies that the
+   * attachment may be a recent upload that is not yet referenced in the document.
    * @returns {Promise<Buffer>} Promise for the data of this attachment; rejected on error.
    */
   public async getAttachmentData(docSession: OptDocSession, attRecord: MetaRowRecord<"_grist_Attachments">,
-                                 cell?: SingleCell): Promise<Buffer> {
+                                 options?: {
+                                   cell?: SingleCell,
+                                   maybeNew?: boolean,
+                                 }): Promise<Buffer> {
     const attId = attRecord.id;
     const fileIdent = attRecord.fileIdent;
+    const cell = options?.cell;
+    const maybeNew = options?.maybeNew;
     if (
       await this._granularAccess.canReadEverything(docSession) ||
       await this.canDownload(docSession)
     ) {
       // Do not need to sweat over access to attachments if user can
       // read everything or download everything.
-    } else if (cell) {
-      // Only provide the download if the user has access to the cell
-      // they specified, and that cell is in an attachment column,
-      // and the cell contains the specified attachment.
-      await this._granularAccess.assertAttachmentAccess(docSession, cell, attId);
     } else {
-      // Find cells that refer to the given attachment.
-      const cells = await this.docStorage.findAttachmentReferences(attId);
-      // Run through them to see if the user has access to any of them.
-      // If so, we'll allow the download. We'd expect in a typical document
-      // this this will be a small list of cells, typically 1 or less, but
-      // of course extreme cases are possible.
-      let goodCell: SingleCell|undefined;
-      for (const possibleCell of cells) {
-        try {
-          await this._granularAccess.assertAttachmentAccess(docSession, possibleCell, attId);
-          goodCell = possibleCell;
-          break;
-        } catch (e) {
-          if (e instanceof ErrorWithCode && e.code === 'ACL_DENY') {
-            continue;
-          }
-          throw e;
+      if (maybeNew && await this._granularAccess.isAttachmentUploadedByUser(docSession, attId)) {
+        // Fine, this is an attachment the user uploaded (recently).
+      } else if (cell) {
+        // Only provide the download if the user has access to the cell
+        // they specified, and that cell is in an attachment column,
+        // and the cell contains the specified attachment.
+        await this._granularAccess.assertAttachmentAccess(docSession, cell, attId);
+      } else {
+        if (!await this._granularAccess.findAttachmentCellForUser(docSession, attId)) {
+          // We found no reason to allow this user to access the attachment.
+          throw new ApiError('Cannot access attachment', 403);
         }
       }
-      if (!goodCell) {
-        // We found no reason to allow this user to access the attachment.
-        throw new ApiError('Cannot access attachment', 403);
-      }
     }
-    const data = await this.docStorage.getFileData(fileIdent);
+    const data = await this._attachmentFileManager.getFileData(fileIdent);
     if (!data) { throw new ApiError("Invalid attachment identifier", 404); }
     this._log.info(docSession, "getAttachment: %s -> %s bytes", fileIdent, data.length);
     return data;
+  }
+
+  @ActiveDoc.keepDocOpen
+  public async startTransferringAllAttachmentsToDefaultStore() {
+    const attachmentStoreId = this._getDocumentSettings().attachmentStoreId;
+    // If no attachment store is set on the doc, it should transfer everything to internal storage
+    await this._attachmentFileManager.startTransferringAllFilesToOtherStore(attachmentStoreId);
+  }
+
+  /**
+   * Returns a summary of pending attachment transfers between attachment stores.
+   */
+  public async attachmentTransferStatus() {
+    return {
+      status: this._attachmentFileManager.transferStatus(),
+      locationSummary: await this._attachmentFileManager.locationSummary(),
+    };
+  }
+
+  /**
+   * Returns a summary of where attachments on this doc are stored.
+   */
+  public async attachmentLocationSummary() {
+    return await this._attachmentFileManager.locationSummary();
+  }
+
+  /*
+   * Wait for all attachment transfers to be finished, keeping the doc open
+   * for as long as possible.
+   */
+  @ActiveDoc.keepDocOpen
+  public async allAttachmentTransfersCompleted() {
+    await this._attachmentFileManager.allTransfersCompleted();
+  }
+
+
+  public async setAttachmentStore(docSession: OptDocSession, id: string | undefined): Promise<void> {
+    const docSettings = this._getDocumentSettings();
+    docSettings.attachmentStoreId = id;
+    await this._updateDocumentSettings(docSession, docSettings);
+    await this.sendAttachmentTransferStatusNotification(await this.attachmentTransferStatus());
+  }
+
+  /**
+   * Sets the document attachment store using the store's label.
+   * This avoids needing to know the exact store ID, which can be challenging to calculate in all
+   * the places we might want to set the store.
+   */
+  public async setAttachmentStoreFromLabel(docSession: OptDocSession, label: string | undefined): Promise<void> {
+    const id = label === undefined ? undefined : this._attachmentStoreProvider?.getStoreIdFromLabel(label);
+    await this.setAttachmentStore(docSession, id);
+  }
+
+  public async getAttachmentStore(): Promise<string | undefined> {
+    return this._getDocumentSettings().attachmentStoreId;
   }
 
   /**
@@ -923,6 +1042,11 @@ export class ActiveDoc extends EventEmitter {
     return this._granularAccess.canCopyEverything(docSession);
   }
 
+  // Check if user has rights to read everything in this doc.
+  public async canCopyEverything(docSession: OptDocSession) {
+    return this._granularAccess.canCopyEverything(docSession);
+  }
+
   // Check if it is appropriate for the user to be treated as an owner of
   // the document for granular access purposes when in "prefork" mode
   // (meaning a document has been opened with the intent to fork it, but
@@ -947,7 +1071,7 @@ export class ActiveDoc extends EventEmitter {
    *      form of the form ["TableData", table_id, row_ids, column_values].
    */
   public async fetchTable(docSession: OptDocSession, tableId: string,
-                          waitForFormulas: boolean = false): Promise<TableDataAction> {
+                          waitForFormulas: boolean = false): Promise<TableFetchResult> {
     return this.fetchQuery(docSession, {tableId, filters: {}}, waitForFormulas);
   }
 
@@ -959,7 +1083,11 @@ export class ActiveDoc extends EventEmitter {
    * special "pending" values may be returned.
    */
   public async fetchQuery(docSession: OptDocSession, query: ServerQuery,
-                          waitForFormulas: boolean = false): Promise<TableDataAction> {
+                          waitForFormulas: boolean = false): Promise<TableFetchResult> {
+    // Sanitize the query to ensure it only has parts we are OK accepting from the user.
+    // (In particular, it is not safe to accept an untrusted "where" part.)
+    query = pick(query, ['tableId', 'filters', 'limit']);
+
     this._inactivityTimer.ping();     // The doc is in active use; ping it to stay open longer.
 
     // If user does not have rights to access what this query is asking for, fail.
@@ -976,8 +1104,8 @@ export class ActiveDoc extends EventEmitter {
       // table.  So we pick out the table we want from fetchMetaTables (which has applied
       // filtering).
       const tables = await this.fetchMetaTables(docSession);
-      const table = tables[query.tableId];
-      if (table) { return table; }
+      const tableData = tables[query.tableId];
+      if (tableData) { return {tableData}; }
       // If table not found, continue, to give a consistent error for a table not found.
     }
 
@@ -992,7 +1120,7 @@ export class ActiveDoc extends EventEmitter {
     this._log.info(docSession, "fetchQuery %s %s", JSON.stringify(query),
       onDemand ? "(onDemand)" : "(regular)");
     let data: TableDataAction;
-    if (onDemand) {
+    if (onDemand || this._isSnapshot) {
       data = await this._fetchQueryFromDB(query, onDemand);
     } else if (wantFull) {
       await this.waitForInitialization();
@@ -1013,9 +1141,23 @@ export class ActiveDoc extends EventEmitter {
       data = cloneDeep(data!);  // Clone since underlying fetch may be cached and shared.
       await this._granularAccess.filterData(docSession, data);
     }
+
+    // Consider whether we need to add attachment metadata.
+    // TODO: it might be desirable to always send attachment data, or allow
+    // this to be an option in api calls related to fetching.
+    let attachments: BulkAddRecord | undefined;
+    const attachmentColumns = this._getCachedAttachmentColumns();
+    if (attachmentColumns?.size && await this._granularAccess.needAttachmentControl(docSession)) {
+      const attIds = gatherAttachmentIds(attachmentColumns, data!);
+      if (attIds.size > 0) {
+        attachments = this.docData!.getMetaTable('_grist_Attachments')
+          .getBulkAddRecord([...attIds]);
+      }
+    }
+
     this._log.info(docSession, "fetchQuery -> %d rows, cols: %s",
              data![2].length, Object.keys(data![3]).join(", "));
-    return data!;
+    return {tableData: data!, ...(attachments && {attachments})};
   }
 
   /**
@@ -1048,8 +1190,8 @@ export class ActiveDoc extends EventEmitter {
     // - Subscription should not be affected by renames (so don't hold on to query/tableId/colIds)
     // - Table/column deletion should make subscription inactive, and unsubscribing an inactive
     //   subscription should not produce an error.
-    const tableData: TableDataAction = await this.fetchQuery(docSession, query);
-    return {querySubId: 0, tableData};
+    const tableFetchResult = await this.fetchQuery(docSession, query);
+    return {querySubId: 0, ...tableFetchResult};
   }
 
   /**
@@ -1089,7 +1231,7 @@ export class ActiveDoc extends EventEmitter {
   public async getTableCols(
     docSession: OptDocSession,
     tableId: string,
-    includeHidden = false): Promise<TableRecordValue[]> {
+    includeHidden = false): Promise<RecordWithStringId[]> {
     const metaTables = await this.fetchMetaTables(docSession);
     const tableRef = tableIdToRef(metaTables, tableId);
     const [, , colRefs, columnData] = metaTables._grist_Tables_column;
@@ -1097,7 +1239,7 @@ export class ActiveDoc extends EventEmitter {
     // colId is pulled out of fields and used as the root id
     const fieldNames = without(Object.keys(columnData), "colId");
 
-    const columns: TableRecordValue[] = [];
+    const columns: RecordWithStringId[] = [];
     (columnData.colId as string[]).forEach((id, index) => {
       const hasNoId = !id;
       const isHidden = hasNoId || id === "manualSort" || id.startsWith("gristHelper_");
@@ -1106,7 +1248,7 @@ export class ActiveDoc extends EventEmitter {
       if (skip) {
         return;
       }
-      const column: TableRecordValue = { id, fields: { colRef: colRefs[index] } };
+      const column: RecordWithStringId = { id, fields: { colRef: colRefs[index] } };
       for (const key of fieldNames) {
         column.fields[key] = columnData[key][index];
       }
@@ -1122,7 +1264,7 @@ export class ActiveDoc extends EventEmitter {
    * @param {Integer} rowId - Row number
    * @returns {Promise} Promise for a error message
    */
-  public async getFormulaError(docSession: DocSession, tableId: string, colId: string,
+  public async getFormulaError(docSession: OptDocSession, tableId: string, colId: string,
                                rowId: number): Promise<CellValue> {
     // Throw an error if the user doesn't have access to read this cell.
     await this._granularAccess.getCellValue(docSession, {tableId, colId, rowId});
@@ -1130,6 +1272,11 @@ export class ActiveDoc extends EventEmitter {
     this._log.info(docSession, "getFormulaError(%s, %s, %s, %s)",
       docSession, tableId, colId, rowId);
     await this.waitForInitialization();
+    const onDemand = this._onDemandActions.isOnDemand(tableId);
+    if (onDemand) {
+      // It's safe to use this.docData after waitForInitialization().
+      return getFormulaErrorForExpandQuery(this.docData!, tableId, colId);
+    }
     return this._pyCall('get_formula_error', tableId, colId, rowId);
   }
 
@@ -1144,24 +1291,9 @@ export class ActiveDoc extends EventEmitter {
    *                                          actionGroup.
    */
   public async applyUserActions(docSession: OptDocSession, actions: UserAction[],
-                                options?: ApplyUAOptions): Promise<ApplyUAResult> {
-    assert(Array.isArray(actions), "`actions` parameter should be an array.");
-    // Be careful not to sneak into user action queue before Calculate action, otherwise
-    // there'll be a deadlock.
-    await this.waitForInitialization();
-
-    if (
-      this.dataLimitStatus === "deleteOnly" &&
-      !actions.every(action => [
-          'RemoveTable', 'RemoveColumn', 'RemoveRecord', 'BulkRemoveRecord',
-          'RemoveViewSection', 'RemoveView', 'ApplyUndoActions', 'RespondToRequests',
-        ].includes(action[0] as string))
-    ) {
-      throw new Error("Document is in delete-only mode");
-    }
-
-    // Granular access control implemented in _applyUserActions.
-    return await this._applyUserActions(docSession, actions, options);
+                                unsanitizedOptions?: ApplyUAOptions): Promise<ApplyUAResult> {
+    const options = sanitizeApplyUAOptions(unsanitizedOptions);
+    return this._applyUserActionsWithExtendedOptions(docSession, actions, options);
   }
 
   /**
@@ -1175,16 +1307,29 @@ export class ActiveDoc extends EventEmitter {
    * @param options: As for applyUserActions.
    * @returns Promise of retValues, see applyUserActions.
    */
-  public async applyUserActionsById(docSession: DocSession,
+  public async applyUserActionsById(docSession: OptDocSession,
                                     actionNums: number[],
                                     actionHashes: string[],
                                     undo: boolean,
-                                    options?: ApplyUAOptions): Promise<ApplyUAResult> {
+                                    unsanitizedOptions?: ApplyUAOptions): Promise<ApplyUAResult> {
+    const options = sanitizeApplyUAOptions(unsanitizedOptions);
     const actionBundles = await this._actionHistory.getActions(actionNums);
+    let fromOwnHistory: boolean = true;
+    const user = getFullUser(docSession);
+    let oldestSource: number = Date.now();
     for (const [index, bundle] of actionBundles.entries()) {
       const actionNum = actionNums[index];
       const actionHash = actionHashes[index];
       if (!bundle) { throw new Error(`Could not find actionNum ${actionNum}`); }
+      const info = bundle.info[1];
+      const bundleEmail = info.user || '';
+      const sessionEmail = user?.email || '';
+      if (normalizeEmail(sessionEmail) !== normalizeEmail(bundleEmail)) {
+        fromOwnHistory = false;
+      }
+      if (info.time && info.time < oldestSource) {
+        oldestSource = info.time;
+      }
       if (actionHash !== bundle.actionHash) {
         throw new Error(`Hash mismatch for actionNum ${actionNum}: ` +
                         `expected ${actionHash} but got ${bundle.actionHash}`);
@@ -1200,7 +1345,10 @@ export class ActiveDoc extends EventEmitter {
     // It could be that error cases and timing etc leak some info prior to this
     // point.
     // Undos are best effort now by default.
-    return this.applyUserActions(docSession, actions, {bestEffort: undo, ...(options||{})});
+    return this._applyUserActionsWithExtendedOptions(
+      docSession, actions, {bestEffort: undo,
+                            oldestSource,
+                            fromOwnHistory, ...(options||{})});
   }
 
   /**
@@ -1217,6 +1365,9 @@ export class ActiveDoc extends EventEmitter {
       await this.docStorage.updateIndexes(indexes);
       // TODO: should probably add indexes for user attribute tables.
     }
+    if (docActions.some(docAction => isSchemaAction(docAction))) {
+      this._attachmentColumns = undefined;
+    }
   }
 
   /**
@@ -1226,10 +1377,6 @@ export class ActiveDoc extends EventEmitter {
   public async testUpdateIndexes() {
     const indexes = this._onDemandActions.getDesiredIndexes();
     await this.docStorage.updateIndexes(indexes);
-  }
-
-  public async removeInstanceFromDoc(docSession: DocSession): Promise<void> {
-    await this._sharing.removeInstanceFromDoc();
   }
 
   public async renameDocTo(docSession: OptDocSession, newName: string): Promise<void> {
@@ -1256,12 +1403,53 @@ export class ActiveDoc extends EventEmitter {
     docSession.linkId = 0;
   }
 
-  public async autocomplete(docSession: DocSession, txt: string, tableId: string, columnId: string): Promise<string[]> {
+  public async autocomplete(
+    docSession: DocSession,
+    txt: string,
+    tableId: string,
+    columnId: string,
+    rowId: UIRowId | null
+  ): Promise<ISuggestionWithValue[]> {
     // Autocompletion can leak names of tables and columns.
     if (!await this._granularAccess.canScanData(docSession)) { return []; }
     await this.waitForInitialization();
     const user = await this._granularAccess.getCachedUser(docSession);
-    return this._pyCall('autocomplete', txt, tableId, columnId, user.toJSON());
+    return this._pyCall('autocomplete', txt, tableId, columnId, rowId, user.toJSON());
+  }
+
+  // Callback to generate a prompt containing schema info for assistance.
+  public async assistanceSchemaPromptV1(
+    docSession: OptDocSession,
+    context: AssistanceSchemaPromptV1Context
+  ): Promise<string> {
+    // Making a prompt leaks names of tables and columns etc.
+    if (!await this._granularAccess.canScanData(docSession)) {
+      throw new Error("Permission denied");
+    }
+
+    return await this._pyCall(
+      'get_formula_prompt',
+      context.tableId,
+      context.colId,
+      context.docString,
+      context.includeAllTables ?? true,
+      context.includeLookups ?? true
+    );
+  }
+
+  // Callback to make a data-engine formula tweak for assistance.
+  public assistanceFormulaTweak(txt: string) {
+    return this._pyCall('convert_formula_completion', txt);
+  }
+
+  // Callback to compute an existing formula and return the result along with recorded values
+  // of (possibly nested) attributes of `rec`.
+  // Used by AI assistance to fix an incorrect formula.
+  public assistanceEvaluateFormula(options: AssistanceContext) {
+    if (!options.evaluateCurrentFormula) {
+      throw new Error('evaluateCurrentFormula must be true');
+    }
+    return this._pyCall('evaluate_formula', options.tableId, options.colId, options.rowId);
   }
 
   public fetchURL(docSession: DocSession, url: string, options?: FetchUrlOptions): Promise<UploadResult> {
@@ -1298,6 +1486,8 @@ export class ActiveDoc extends EventEmitter {
    * browser clients to reopen it.
    */
   public async reloadDoc(docSession?: DocSession) {
+    this._log.debug(docSession || null, 'ActiveDoc.reloadDoc starting shutdown');
+    this._docManager.restoreTimingOn(this.docName, this.isTimingOn);
     return this.shutdown();
   }
 
@@ -1306,11 +1496,13 @@ export class ActiveDoc extends EventEmitter {
   }
 
   /**
-   * Fork the current document.  In fact, all that requires is calculating a good
-   * ID for the fork.  TODO: reconcile the two ways there are now of preparing a fork.
+   * Fork the current document.
+   *
+   * TODO: reconcile the two ways there are now of preparing a fork.
    */
   public async fork(docSession: OptDocSession): Promise<ForkResult> {
-    const user = getDocSessionUser(docSession);
+    const dbManager = this._getHomeDbManagerOrFail();
+    const user = getFullUser(docSession);
     // For now, fork only if user can read everything (or is owner).
     // TODO: allow forks with partial content.
     if (!user || !await this.canDownload(docSession)) {
@@ -1318,9 +1510,19 @@ export class ActiveDoc extends EventEmitter {
     }
     const userId = user.id;
     const isAnonymous = this._docManager.isAnonymous(userId);
+
     // Get fresh document metadata (the cached metadata doesn't include the urlId).
-    const doc = await docSession.authorizer?.getDoc();
-    if (!doc) { throw new Error('document id not known'); }
+    let doc: Document | undefined;
+    if (docSession.authorizer) {
+      doc = await docSession.authorizer.getDoc();
+    } else if (docSession.req) {
+      doc = await dbManager.getDoc(docSession.req);
+    }
+    if (!doc) { throw new Error('Document not found'); }
+
+    // Don't allow creating forks of forks (for now).
+    if (doc.trunkId) { throw new ApiError("Cannot fork a document that's already a fork", 400); }
+
     const trunkDocId = doc.id;
     const trunkUrlId = doc.urlId || doc.id;
     await this.flushDoc();  // Make sure fork won't be too out of date.
@@ -1329,12 +1531,14 @@ export class ActiveDoc extends EventEmitter {
     // To actually create the fork, we call an endpoint.  This is so the fork
     // can be associated with an arbitrary doc worker, rather than tied to the
     // same worker as the trunk.  We use a Permit for authorization.
-    const permitStore = this._docManager.gristServer.getPermitStore();
+    const permitStore = this._server.getPermitStore();
     const permitKey = await permitStore.setPermit({docId: forkIds.docId,
                                                    otherDocId: this.docName});
     try {
-      const url = await this._docManager.gristServer.getHomeUrlByDocId(
-        forkIds.docId, `/api/docs/${forkIds.docId}/create-fork`);
+      const url = await this._server.getHomeUrlByDocId(
+        forkIds.docId,
+        `/api/docs/${forkIds.docId}/create-fork`
+      );
       const resp = await fetch(url, {
         method: 'POST',
         body: JSON.stringify({ srcDocId: this.docName }),
@@ -1346,6 +1550,9 @@ export class ActiveDoc extends EventEmitter {
       if (resp.status !== 200) {
         throw new ApiError(resp.statusText, resp.status);
       }
+
+      await dbManager.forkDoc(userId, doc, forkIds.forkId);
+      this._logForkDocumentEvents(docSession, { document: doc, fork: forkIds });
     } finally {
       await permitStore.removePermit(permitKey);
     }
@@ -1354,8 +1561,8 @@ export class ActiveDoc extends EventEmitter {
   }
 
   public async getAccessToken(docSession: OptDocSession, options: AccessTokenOptions): Promise<AccessTokenResult> {
-    const tokens = this._docManager.gristServer.getAccessTokens();
-    const userId = getDocSessionUserId(docSession);
+    const tokens = this._server.getAccessTokens();
+    const userId = getUserId(docSession);
     const docId = this.docName;
     const access = getDocSessionAccess(docSession);
     // If we happen to be using a "readOnly" connection, max out at "readOnly"
@@ -1383,16 +1590,16 @@ export class ActiveDoc extends EventEmitter {
   /**
    * Check if an ACL formula is valid. If not, will throw an error with an explanation.
    */
-  public async checkAclFormula(docSession: DocSession, text: string): Promise<FormulaProperties> {
+  public async checkAclFormula(docSession: DocSession, text: string): Promise<PredicateFormulaProperties> {
     // Checks can leak names of tables and columns.
     if (await this._granularAccess.hasNuancedAccess(docSession)) { return {}; }
     await this.waitForInitialization();
     try {
-      const parsedAclFormula = await this._pyCall('parse_acl_formula', text);
-      compileAclFormula(parsedAclFormula);
+      const parsedAclFormula = await this._pyCall('parse_predicate_formula', text);
+      compilePredicateFormula(parsedAclFormula);
       // TODO We also need to check the validity of attributes, and of tables and columns
       // mentioned in resources and userAttribute rules.
-      return getFormulaProperties(parsedAclFormula);
+      return getPredicateFormulaProperties(parsedAclFormula);
     } catch (e) {
       e.message = e.message?.replace('[Sandbox] ', '');
       throw e;
@@ -1403,8 +1610,11 @@ export class ActiveDoc extends EventEmitter {
    * Returns the full set of tableIds, with basic metadata for each table. This is intended
    * for editing ACLs. It is only available to users who can edit ACLs, and lists all resources
    * regardless of rules that may block access to them.
+   *
+   * Also returns information about resources mentioned in rules that no longer
+   * exist.
    */
-  public async getAclResources(docSession: DocSession): Promise<{[tableId: string]: AclTableDescription}> {
+  public async getAclResources(docSession: DocSession): Promise<AclResources> {
     if (!this.docData || !await this._granularAccess.hasAccessRulesPermission(docSession)) {
       throw new Error('Cannot list ACL resources');
     }
@@ -1429,7 +1639,10 @@ export class ActiveDoc extends EventEmitter {
         result[tableId].groupByColLabels!.push(sourceCol.label);
       }
     }
-    return result;
+    const ruleCollection = new ACLRuleCollection();
+    await ruleCollection.update(this.docData, {log});
+    const problems = ruleCollection.findRuleProblems(this.docData);
+    return {tables: result, problems};
   }
 
   /**
@@ -1449,10 +1662,9 @@ export class ActiveDoc extends EventEmitter {
    *
    * Example users are always included.
    */
-  public async getUsersForViewAs(docSession: DocSession): Promise<PermissionDataWithExtraUsers> {
+  public async getUsersForViewAs(docSession: OptDocSession): Promise<PermissionDataWithExtraUsers> {
     // Make sure we have rights to view access rules.
-    const db = this.getHomeDbManager();
-    if (!db || !await this._granularAccess.hasAccessRulesPermission(docSession)) {
+    if (!await this._granularAccess.hasAccessRulesPermission(docSession)) {
       throw new Error('Cannot list ACL users');
     }
 
@@ -1464,15 +1676,23 @@ export class ActiveDoc extends EventEmitter {
     };
     const isShared = new Set<string>();
 
-    // Collect users the document is shared with.
-    const userId = getDocSessionUserId(docSession);
+    const userId = getUserId(docSession);
     if (!userId) { throw new Error('Cannot determine user'); }
-    const access = db.unwrapQueryResult(
-      await db.getDocAccess({userId, urlId: this.docName}, {
-        flatten: true, excludeUsersWithoutAccess: true,
-      }));
-    result.users = access.users;
-    result.users.forEach(user => isShared.add(normalizeEmail(user.email)));
+
+    const parsed = parseUrlId(this.docName);
+    // If this is not a temporary document (i.e. created by anonymous user).
+    if (parsed.trunkId !== NEW_DOCUMENT_CODE) {
+      // Collect users the document is shared with.
+      const db = this.getHomeDbManager();
+      if (db) {
+        const access = db.unwrapQueryResult(
+          await db.getDocAccess({userId, urlId: this.docName}, {
+            flatten: true, excludeUsersWithoutAccess: true,
+          }));
+        result.users = access.users;
+        result.users.forEach(user => isShared.add(normalizeEmail(user.email)));
+      }
+    }
 
     // Collect users from user attribute tables. Omit duplicates with users the document is
     // shared with.
@@ -1510,7 +1730,7 @@ export class ActiveDoc extends EventEmitter {
     docSession: OptDocSession|null,
     userActions: UserAction[]
   ): Promise<SandboxActionBundle> {
-    const [normalActions, onDemandActions] = this._onDemandActions.splitByOnDemand(userActions);
+    const [normalActions, onDemandActions] = this._onDemandActions.splitByStorage(userActions);
 
     let sandboxActionBundle: SandboxActionBundle;
     if (normalActions.length > 0) {
@@ -1567,7 +1787,7 @@ export class ActiveDoc extends EventEmitter {
     const timeDeleted = changes.map(r => r.used ? null : now);
     const action: BulkUpdateRecord = ["BulkUpdateRecord", "_grist_Attachments", rowIds, {timeDeleted}];
     // Don't use applyUserActions which may block the update action in delete-only mode
-    await this._applyUserActions(makeExceptionalDocSession('system'), [action]);
+    await this._applyUserActionsAsSystem([action]);
     return true;
   }
 
@@ -1589,7 +1809,17 @@ export class ActiveDoc extends EventEmitter {
       const action: BulkRemoveRecord = ["BulkRemoveRecord", "_grist_Attachments", rowIds];
       await this.applyUserActions(makeExceptionalDocSession('system'), [action]);
     }
-    await this.docStorage.removeUnusedAttachments();
+    try {
+      await this.docStorage.removeUnusedAttachments();
+    } catch (e) {
+      // If document doesn't have _gristsys_Files, don't worry about it;
+      // if this is an error it will have already been reported, and the
+      // document can be in this state when updating initial SQL code after
+      // a schema change.
+      if (!String(e).match(/no such table: _gristsys_Files/)) {
+        throw e;
+      }
+    }
   }
 
   // Needed for test/server/migrations.js tests
@@ -1602,8 +1832,10 @@ export class ActiveDoc extends EventEmitter {
     this._inactivityTimer.ping();
   }
 
-  public async getSnapshots(skipMetadataCache?: boolean): Promise<DocSnapshots> {
-    // Assume any viewer can access this list.
+  public async getSnapshots(docSession: OptDocSession, skipMetadataCache?: boolean): Promise<DocSnapshots> {
+    if (await this._granularAccess.hasNuancedAccess(docSession)) {
+      throw new Error('cannot confirm access to snapshots because of access rules');
+    }
     return this._docManager.storageManager.getSnapshots(this.docName, skipMetadataCache);
   }
 
@@ -1662,8 +1894,9 @@ export class ActiveDoc extends EventEmitter {
    * granular access rules.
    */
   public getGranularAccessForBundle(docSession: OptDocSession, docActions: DocAction[], undo: DocAction[],
-                                    userActions: UserAction[], isDirect: boolean[]): GranularAccessForBundle {
-    this._granularAccess.getGranularAccessForBundle(docSession, docActions, undo, userActions, isDirect);
+                                    userActions: UserAction[], isDirect: boolean[],
+                                    options: ApplyUAOptions|null): GranularAccessForBundle {
+    this._granularAccess.getGranularAccessForBundle(docSession, docActions, undo, userActions, isDirect, options);
     return this._granularAccess;
   }
 
@@ -1686,9 +1919,155 @@ export class ActiveDoc extends EventEmitter {
   }
 
   /**
-   * Loads an open document from DocStorage.  Returns a list of the tables it contains.
+   * Clears all outgoing webhook requests queued for this document.
    */
-  protected async _loadOpenDoc(docSession: OptDocSession): Promise<string[][]> {
+  public async clearWebhookQueue() {
+    await this._triggers.clearWebhookQueue();
+  }
+
+  public async clearSingleWebhookQueue(webhookId: string) {
+    await this._triggers.clearSingleWebhookQueue(webhookId);
+  }
+
+  /**
+   * Returns the list of outgoing webhook for a table in this document.
+   */
+  public async webhooksSummary() {
+    return this._triggers.summary();
+  }
+
+  /**
+   * Send a message to clients connected to the document that something
+   * webhook-related has happened (a change in configuration, a delivery,
+   * or an error). It passes information about the type of event (currently data being updated in some way
+   * or an OverflowError, i.e., too many events waiting to be sent). More data may be added when necessary.
+   */
+  public async sendWebhookNotification(type: WebhookMessageType = WebhookMessageType.Update) {
+    await this.docClients.broadcastDocMessage(null, 'docChatter', {
+      webhooks: {type},
+    });
+  }
+
+  /**
+   * Sends a message to clients connected to the document that the attachments' transfer
+   * job has started or finished. It is also sent when the attachment store is changed
+   * through the API (as it also includes information about attachments' location).
+   */
+  public async sendAttachmentTransferStatusNotification(attachmentTransfer: AttachmentTransferStatus) {
+    await this.docClients.broadcastDocMessage(null, 'docChatter', {
+      attachmentTransfer
+    });
+  }
+
+  public async sendTimingsNotification() {
+    await this.docClients.broadcastDocMessage(null, 'docChatter', {
+      timing: {
+        status: this.isTimingOn ? 'active' : 'disabled'
+      },
+    });
+  }
+
+  public logAuditEvent<Action extends AuditEventAction>(
+    requestOrSession: RequestOrSession,
+    properties: AuditEventProperties<Action>
+  ) {
+    this._server
+      .getAuditLogger()
+      .logEvent(
+        requestOrSession,
+        merge(this._getAuditEventProperties<Action>(), properties)
+      );
+  }
+
+  public logTelemetryEvent(
+    docSession: OptDocSession | null,
+    event: TelemetryEvent,
+    metadata?: TelemetryMetadataByLevel
+  ) {
+    this._docManager.gristServer.getTelemetry().logEvent(docSession, event, merge(
+      this._getTelemetryMeta(docSession),
+      metadata,
+    ));
+  }
+
+  /**
+   * Make sure the shares listed for the doc in the home db and the
+   * shares listed within the doc itself are in sync. If skipIfNoShares
+   * is set, we skip checking the home db if there are no shares listed
+   * within the doc, as a small optimization.
+   */
+  public async syncShares(docSession: OptDocSession, options: {
+    skipIfNoShares?: boolean,
+  } = {}) {
+    const metaTables = await this.fetchMetaTables(docSession);
+    const shares = metaTables['_grist_Shares'];
+    const ids = shares[2];
+    const vals = shares[3];
+    const goodShares = ids.map((id, idx) => {
+      return {
+        id,
+        linkId: String(vals['linkId'][idx]),
+        options: String(vals['options'][idx]),
+      };
+    });
+    if (goodShares.length > 0 || !options.skipIfNoShares) {
+      await this._getHomeDbManagerOrFail().syncShares(this.docName, goodShares);
+    }
+    return goodShares;
+  }
+
+  public async getShare(_docSession: OptDocSession, linkId: string): Promise<Share|null> {
+    return await this._getHomeDbManagerOrFail().getShareByLinkId(this.docName, linkId);
+  }
+
+  public async startTiming(): Promise<void> {
+    await this.waitForInitialization();
+
+    // Set the flag to indicate that timing is on.
+    this.isTimingOn = true;
+
+    try {
+      // Call the data engine to start timing.
+      await this._doStartTiming();
+    } catch (e) {
+      this.isTimingOn = false;
+      throw e;
+    }
+
+    // Mark self as in timing mode, in case we get reloaded.
+    this._docManager.restoreTimingOn(this.docName, true);
+    await this.sendTimingsNotification();
+  }
+
+  public async stopTiming(): Promise<FormulaTimingInfo[]> {
+    await this.waitForInitialization();
+
+    // First call the data engine to stop timing, and gather results.
+    const timingResults = await this._pyCall('stop_timing');
+
+    // Toggle the flag and clear the reminder.
+    this.isTimingOn = false;
+    this._docManager.restoreTimingOn(this.docName, false);
+
+    await this.sendTimingsNotification();
+
+    return timingResults;
+  }
+
+  public async getTimings(): Promise<FormulaTimingInfo[]|void>  {
+    await this.waitForInitialization();
+
+    if (this._modificationLock.isLocked()) {
+      return;
+    }
+    return await this._pyCall('get_timings');
+  }
+
+  /**
+   * Loads an open document from DocStorage. Applies migrations if needed, and starts loading
+   * metadata.
+   */
+  protected async _loadOpenDoc(docSession: OptDocSession): Promise<void> {
     // Check the schema version of document and sandbox, and migrate if the sandbox is newer.
     const schemaVersion = SCHEMA_VERSION;
 
@@ -1701,7 +2080,9 @@ export class ActiveDoc extends EventEmitter {
       await this._beforeMigration(docSession, 'schema', docSchemaVersion, schemaVersion);
       let success: boolean = false;
       try {
-        await this._migrate(docSession);
+        await this._withDataEngine(() => this._migrate(docSession), {
+          shutdownAfter: this._isSnapshot,
+        });
         success = true;
       } finally {
         await this._afterMigration(docSession, 'schema', schemaVersion, success);
@@ -1717,29 +2098,24 @@ export class ActiveDoc extends EventEmitter {
         "proceeding with fingers crossed", docSchemaVersion, schemaVersion);
     }
 
-    // Start loading the initial meta tables which determine the document schema.
-    this._tableMetadataLoader.startStreamingToEngine();
-    this._tableMetadataLoader.startFetchingTable('_grist_Tables');
-    this._tableMetadataLoader.startFetchingTable('_grist_Tables_column');
+    if (!this._isSnapshot) {
+      this._tableMetadataLoader.startStreamingToEngine();
+    }
 
-    // Get names of remaining tables.
-    const tablesParsed = await this._tableMetadataLoader.fetchBulkColValuesWithoutIds('_grist_Tables');
-    const tableNames = (tablesParsed.tableId as string[])
-      .concat(Object.keys(schema))
-      .filter(tableId => tableId !== '_grist_Tables' && tableId !== '_grist_Tables_column')
-      .sort();
+    // Start loading the meta tables.
+    for (const tableId of Object.keys(schema)) {
+      this._tableMetadataLoader.startFetchingTable(tableId);
+    }
+  }
 
-    // Figure out which tables are on-demand.
-    const onDemandMap = zipObject(tablesParsed.tableId as string[], tablesParsed.onDemand);
-    const onDemandNames = remove(tableNames, (t) => (onDemandMap[t] ||
-      (this._recoveryMode && !t.startsWith('_grist_'))));
-
-    this._log.debug(docSession, "Loading %s normal tables, skipping %s on-demand tables",
-      tableNames.length, onDemandNames.length);
-    this._log.debug(docSession, "Normal tables: %s", tableNames.join(", "));
-    this._log.debug(docSession, "On-demand tables: %s",  onDemandNames.join(", "));
-
-    return [tableNames, onDemandNames];
+  /**
+   * Applies an array of user actions initiated by Grist itself, using a DocSession with "system"
+   * access rights. These bypass access rules.
+   *
+   * They also do not count as "user activity" for the purpose of keeping the document open.
+   */
+  protected async _applyUserActionsAsSystem(actions: UserAction[]): Promise<ApplyUAResult> {
+    return this._applyUserActions(makeExceptionalDocSession('system'), actions, {});
   }
 
   /**
@@ -1759,40 +2135,171 @@ export class ActiveDoc extends EventEmitter {
    *    isModification: true if document was changed by one or more actions.
    * }
    */
-  @ActiveDoc.keepDocOpen
   protected async _applyUserActions(docSession: OptDocSession, actions: UserAction[],
-                                    options: ApplyUAOptions = {}): Promise<ApplyUAResult> {
+                                    options: ApplyUAExtendedOptions = {}): Promise<ApplyUAResult> {
 
     const client = docSession.client;
     this._log.debug(docSession, "_applyUserActions(%s, %s)%s", client, shortDesc(actions),
       options.parseStrings ? ' (will parse)' : '');
-    this._inactivityTimer.ping();     // The doc is in active use; ping it to stay open longer.
 
     if (options.parseStrings) {
       actions = actions.map(ua => parseUserAction(ua, this.docData!));
     }
 
     if (options?.bestEffort) {
-      actions = await this._granularAccess.prefilterUserActions(docSession, actions);
+      actions = await this._granularAccess.prefilterUserActions(docSession, actions, options);
     }
-    await this._granularAccess.assertCanMaybeApplyUserActions(docSession, actions);
+    await this._granularAccess.checkUserActions(docSession, actions);
 
     // Create the UserActionBundle.
     const action: UserActionBundle = {
       info: this._makeInfo(docSession, options),
+      options,
       userActions: actions,
     };
 
-    const result: ApplyUAResult = await new Promise<ApplyUAResult>(
-      (resolve, reject) =>
-        this._sharing.addUserAction({action, docSession, resolve, reject}));
+    const result: ApplyUAResult = await this._sharing.addUserAction(docSession, action);
     this._log.debug(docSession, "_applyUserActions returning %s", shortDesc(result));
 
     if (result.isModification) {
       this._fetchCache.clear();  // This could be more nuanced.
       this._docManager.markAsChanged(this, 'edit');
+      this.logAuditEvent(docSession, {
+        action: "document.modify",
+        details: {
+          action: {
+            num: result.actionNum,
+            hash: result.actionHash,
+          },
+          document: {
+            id: this.docName,
+          },
+        },
+      });
     }
     return result;
+  }
+
+  private async _doShutdownImpl(): Promise<void> {
+    const docSession = makeExceptionalDocSession('system');
+    this._log.debug(docSession, "shutdown starting");
+
+    const safeCallAndWait = async (funcDesc: string, func: () => Promise<unknown>) => {
+      try {
+        if (await timeoutReached(Deps.SHUTDOWN_ITEM_TIMEOUT_MS, func())) {
+          this._log.error(docSession, `${funcDesc} timed out`);
+        }
+      } catch (err) {
+        this._log.error(docSession, `${funcDesc} failed`, err);
+      }
+    };
+
+    try {
+
+      this.setMuted();
+      this._inactivityTimer.disable();
+      if (this.docClients.clientCount() > 0) {
+        this._log.warn(docSession, `Doc being closed with ${this.docClients.clientCount()} clients left`);
+        await this.docClients.broadcastDocMessage(null, 'docShutdown', null);
+        this.docClients.interruptAllClients();
+        this.docClients.removeAllClients();
+      }
+
+      this._triggers.shutdown();
+
+      // attachmentFileManager needs to shut down before DocStorage, to allow transfers to finish.
+      await safeCallAndWait('attachmentFileManager',
+        this._attachmentFileManager.shutdown.bind(this._attachmentFileManager));
+
+      this._redisSubscriber?.quitAsync()
+        .catch(e => this._log.warn(docSession, "Failed to quit redis subscriber", e));
+
+      // Clear the MapWithTTL to remove all timers from the event loop.
+      this._fetchCache.clear();
+
+      await Promise.all(this._intervals.map(interval =>
+        safeCallAndWait("interval.disableAndFinish", () => interval.disableAndFinish())));
+
+      // We'll defer syncing usage until everything is calculated.
+      const usageOptions = {syncUsageToDatabase: false, broadcastUsageToClients: false};
+
+      // This cleanup requires docStorage, which may have failed to start up.
+      // We don't want to log pointless errors in that case.
+      if (this.docStorage.isInitialized()) {
+        // Remove expired attachments, i.e. attachments that were soft deleted a while ago. This
+        // needs to happen periodically, and doing it here means we can guarantee that it happens
+        // even if the doc is only ever opened briefly, without having to slow down startup.
+        await safeCallAndWait("removeUnusedAttachments", () => this.removeUnusedAttachments(true, usageOptions));
+
+        if (this._dataEngine && this._fullyLoaded) {
+          // Note that this must happen before `this._shuttingDown = true` because of this line in Sharing.ts:
+          //     if (this._activeDoc.isShuttingDown && isCalculate) {
+          await safeCallAndWait("removeTransformColumns",
+            () => this.applyUserActions(docSession, [["RemoveTransformColumns"]])
+          );
+        }
+
+        // Update data size; we'll be syncing both it and attachments size to the database soon.
+        await safeCallAndWait("_updateDataSize", () => this._updateDataSize(usageOptions));
+      }
+
+      this._syncDocUsageToDatabase(true);
+      this._logDocMetrics(docSession, 'docClose');
+
+      await safeCallAndWait("storageManager.closeDocument",
+        () => this._docManager.storageManager.closeDocument(this.docName));
+
+      try {
+        const dataEngine = this._dataEngine ? await this._getEngine() : null;
+        this._shuttingDown = true;  // Block creation of engine if not yet in existence.
+        if (dataEngine) {
+          // Give a small grace period for finishing initialization if we are being shut
+          // down while initialization is still in progress, and we don't have an easy
+          // way yet to cancel it cleanly. This is mainly for the benefit of automated
+          // tests.
+          await timeoutReached(3000, this.waitForInitialization());
+        }
+        this._docManager.unregisterSQLiteDB(this.docName);
+        await Promise.all([
+          this.docStorage.shutdown(),
+          this.docPluginManager?.shutdown(),
+          this._isSnapshot ? undefined : dataEngine?.shutdown(),
+        ]);
+        // The this.waitForInitialization promise may not yet have resolved, but
+        // should do so quickly now we've killed everything it depends on.
+        await safeCallAndWait("waitForInitialization", () => this.waitForInitialization());
+      } catch (err) {
+        this._log.error(docSession, "failed to shutdown some resources", err);
+      }
+      // No timeout on this callback: if it hangs, it will make the document unusable.
+      await this._afterShutdownCallback?.();
+    } finally {
+      this._docManager.removeActiveDoc(this);
+    }
+    await safeCallAndWait("_granularAccess.close", () => this._granularAccess.close());
+    this._log.debug(docSession, "shutdown complete");
+  }
+
+  @ActiveDoc.keepDocOpen
+  private async _applyUserActionsWithExtendedOptions(docSession: OptDocSession, actions: UserAction[],
+                                                     options?: ApplyUAExtendedOptions): Promise<ApplyUAResult> {
+    assert(Array.isArray(actions), "`actions` parameter should be an array.");
+    // Be careful not to sneak into user action queue before Calculate action, otherwise
+    // there'll be a deadlock.
+    await this.waitForInitialization();
+
+    if (
+      this.dataLimitInfo.status === "deleteOnly" &&
+      !actions.every(action => [
+          'RemoveTable', 'RemoveColumn', 'RemoveRecord', 'BulkRemoveRecord',
+          'RemoveViewSection', 'RemoveView', 'ApplyUndoActions', 'RespondToRequests',
+        ].includes(action[0] as string))
+    ) {
+      throw new Error("Document is in delete-only mode");
+    }
+
+    // Granular access control implemented in _applyUserActions.
+    return await this._applyUserActions(docSession, actions, options);
   }
 
   /**
@@ -1820,7 +2327,7 @@ export class ActiveDoc extends EventEmitter {
       documentSettings.engine = (pythonVersion === '2') ? 'python2' : 'python3';
     }
     await this.docStorage.run('UPDATE _grist_DocInfo SET timezone = ?, documentSettings = ?',
-                              [timezone, JSON.stringify(documentSettings)]);
+                              timezone, JSON.stringify(documentSettings));
   }
 
   private _makeInfo(docSession: OptDocSession, options: ApplyUAOptions = {}) {
@@ -1838,6 +2345,20 @@ export class ActiveDoc extends EventEmitter {
   }
 
   /**
+   * Update the time in formulas; this is called via Interval every hour.
+   */
+  private async _updateCurrentTime() {
+    const dataEngine = await this._getEngine();
+    if (dataEngine.isProcessDown()) {
+      // Don't attempt to update time if data engine is down, as this can't help, and leads to
+      // spurious errors. Instead, report as a warning, more clearly and concisely.
+      this._log.warn(null, 'failed to update current time: data engine is down');
+      return;
+    }
+    return this._applyUserActionsAsSystem([['UpdateCurrentTime']]);
+  }
+
+  /**
    * Applies all metrics from `usage` to the current document usage state.
    *
    * Allows specifying `options` for toggling whether usage is synced to
@@ -1845,13 +2366,13 @@ export class ActiveDoc extends EventEmitter {
    */
   private async _updateDocUsage(usage: Partial<DocumentUsage>, options: UpdateUsageOptions = {}) {
     const {syncUsageToDatabase = true, broadcastUsageToClients = true} = options;
-    const oldStatus = this.dataLimitStatus;
+    const oldStatus = this.dataLimitInfo.status;
     this._docUsage = {...(this._docUsage || {}), ...usage};
     if (syncUsageToDatabase) {
       /* If status decreased, we'll update usage in the database with minimal delay, so site usage
        * banners show up-to-date statistics. If status increased or stayed the same, we'll schedule
        * a delayed update, since it's less critical for banners to update immediately. */
-      const didStatusDecrease = getSeverity(this.dataLimitStatus) < getSeverity(oldStatus);
+      const didStatusDecrease = getSeverity(this.dataLimitInfo.status) < getSeverity(oldStatus);
       this._syncDocUsageToDatabase(didStatusDecrease);
     }
     if (broadcastUsageToClients) {
@@ -1894,6 +2415,9 @@ export class ActiveDoc extends EventEmitter {
 
   private async _checkDataSizeLimitRatio(docSession: OptDocSession | null) {
     const start = Date.now();
+    if (!this.docStorage.isInitialized()) {
+      return;
+    }
     const dataSizeBytes = await this._updateDataSize();
     const timeToMeasure = Date.now() - start;
     log.rawInfo('Data size from dbstat...', {
@@ -1936,17 +2460,21 @@ export class ActiveDoc extends EventEmitter {
       dimensions.height = 0;
       dimensions.width = 0;
     }
-    const checksum = await checksumFile(fileData.absPath);
-    const fileIdent = checksum + fileData.ext;
-    const ret: boolean = await this.docStorage.findOrAttachFile(fileData.absPath, fileIdent);
-    this._log.info(docSession, "addAttachment: file %s (image %sx%s) %s", fileIdent,
-      dimensions.width, dimensions.height, ret ? "attached" : "already exists");
+    const attachmentStoreId = this._getDocumentSettings().attachmentStoreId;
+    const addFileResult = await this._attachmentFileManager
+      .addFile(attachmentStoreId, fileData.ext, await readFile(fileData.absPath));
+    this._log.info(
+      docSession, "addAttachment: store: '%s', file: '%s' (image %sx%s) %s",
+      attachmentStoreId ?? 'local document', addFileResult.fileIdent, dimensions.width, dimensions.height,
+      addFileResult.isNewFile ? "attached" : "already exists"
+    );
     return ['AddRecord', '_grist_Attachments', null, {
-      fileIdent,
+      fileIdent: addFileResult.fileIdent,
       fileName: fileData.origName,
       // We used to set fileType, but it's not easily available for native types. Since it's
       // also entirely unused, we just skip it until it becomes relevant.
       fileSize: fileData.size,
+      fileExt: fileData.ext,
       imageHeight: dimensions.height,
       imageWidth: dimensions.width,
       timeUploaded: Date.now()
@@ -2018,18 +2546,6 @@ export class ActiveDoc extends EventEmitter {
     return this;
   }
 
-  /**
-   * Start loading the specified tables from the db, without waiting for completion.
-   * The loader can be directed to stream the tables on to the engine.
-   */
-  private _startLoadingTables(docSession: OptDocSession, tableNames: string[]) {
-    this._log.debug(docSession, "starting to load %s tables: %s", tableNames.length,
-                  tableNames.join(", "));
-    for (const tableId of tableNames) {
-      this._tableMetadataLoader.startFetchingTable(tableId);
-    }
-  }
-
   // Fetches and returns the requested table, or null if it's missing. This allows documents to
   // load with missing metadata tables (should only matter if migrations are also broken).
   private async _fetchTableIfPresent(tableName: string): Promise<Buffer|null> {
@@ -2045,27 +2561,44 @@ export class ActiveDoc extends EventEmitter {
   // inactivityTimer, since a user formulas with an infinite loop can disable it forever.
   // TODO find a solution to this issue.
   @ActiveDoc.keepDocOpen
-  private async _finishInitialization(
-    docSession: OptDocSession, pendingTableNames: string[], onDemandNames: string[], startTime: number
-  ): Promise<void> {
+  private async _finishInitialization(docSession: OptDocSession, docData: DocData, startTime: number): Promise<void> {
     try {
       await this._tableMetadataLoader.wait();
       await this._tableMetadataLoader.clean();
-      await this._loadTables(docSession, pendingTableNames);
 
-      const tableStats = await this._pyCall('get_table_stats');
-      log.rawInfo("Loading complete, table statistics retrieved...", {
-        ...this.getLogMeta(docSession),
-        ...tableStats,
-        num_on_demand_tables: onDemandNames.length,
-      });
+      const tables = docData.getMetaTable('_grist_Tables');
+      const skipLoadingUserTables = this._recoveryMode;
+      const onDemandCount = skipLoadingUserTables ? tables.numRecords() : tables.filterRowIds({onDemand: true}).length;
 
-      await this._pyCall('initialize', this._options?.docUrl);
+      if (this._isSnapshot) {
+        log.rawInfo("Loading complete", {
+          ...this.getLogMeta(docSession),
+          num_on_demand_tables: onDemandCount,
+        });
+      } else {
+        if (!skipLoadingUserTables) {
+          const pendingTableNames = tables.filterRecords({onDemand: false}).map(r => r.tableId);
+          pendingTableNames.sort();   // Sort for a consistent order (affects DocRegressionTest)
+          await this._loadTables(docSession, pendingTableNames);
+        }
+        const tableStats = await this._pyCall('get_table_stats');
+        log.rawInfo("Loading complete, table statistics retrieved...", {
+          ...this.getLogMeta(docSession),
+          ...tableStats,
+          num_on_demand_tables: onDemandCount,
+        });
+        await this._pyCall('initialize', this._options?.docUrl);
 
-      // Calculations are not associated specifically with the user opening the document.
-      // TODO: be careful with which users can create formulas.
-      await this._applyUserActions(makeExceptionalDocSession('system'), [['Calculate']]);
-      await this._reportDataEngineMemory();
+        if (this.isTimingOn) {
+          await this._doStartTiming();
+        }
+
+        // Calculations are not associated specifically with the user opening the document.
+        // TODO: be careful with which users can create formulas.
+        await this._applyUserActionsAsSystem([['Calculate']]);
+        await this._reportDataEngineMemory();
+      }
+
       this._fullyLoaded = true;
       const endTime = Date.now();
       const loadMs = endTime - startTime;
@@ -2073,8 +2606,26 @@ export class ActiveDoc extends EventEmitter {
       // took longer, scale it up proportionately.
       const closeTimeout = Math.max(loadMs, 1000) * Deps.ACTIVEDOC_TIMEOUT;
       this._inactivityTimer.setDelay(closeTimeout);
-      this._log.debug(docSession, `loaded in ${loadMs} ms, InactivityTimer set to ${closeTimeout} ms`);
+      log.rawDebug('ActiveDoc load timing', {
+        ...this.getLogMeta(docSession),
+        loadMs,
+        closeTimeout,
+      });
+      const docUsage = getDocSessionUsage(docSession);
+      if (!docUsage) {
+        // This looks be the first time this installation of Grist is touching
+        // the document. If it has any shares, the home db needs to know.
+        // TODO: could offer a UI to control whether shares are activated.
+        await this.syncShares(docSession, { skipIfNoShares: true });
+      }
       void this._initializeDocUsage(docSession);
+
+      // Start the periodic work, unless this doc has already started shutting down.
+      if (!this.muted) {
+        for (const interval of this._intervals) {
+          interval.enable();
+        }
+      }
     } catch (err) {
       this._fullyLoaded = true;
       if (!this._shuttingDown) {
@@ -2082,6 +2633,170 @@ export class ActiveDoc extends EventEmitter {
         throw new Error('ActiveDoc initialization failed: ' + String(err));
       }
     }
+  }
+
+  private _logSnapshotProgress(docSession: OptDocSession) {
+    const snapshotProgress = this._docManager.storageManager.getSnapshotProgress(this.docName);
+    const lastWindowTime = (snapshotProgress.lastWindowStartedAt &&
+        snapshotProgress.lastWindowDoneAt &&
+        snapshotProgress.lastWindowDoneAt > snapshotProgress.lastWindowStartedAt) ?
+        snapshotProgress.lastWindowDoneAt : Date.now();
+    const delay = snapshotProgress.lastWindowStartedAt ?
+        lastWindowTime - snapshotProgress.lastWindowStartedAt : null;
+    log.rawInfo('snapshot status', {
+      ...this.getLogMeta(docSession),
+      ...snapshotProgress,
+      lastChangeAt: normalizedDateTimeString(snapshotProgress.lastChangeAt),
+      lastWindowStartedAt: normalizedDateTimeString(snapshotProgress.lastWindowStartedAt),
+      lastWindowDoneAt: normalizedDateTimeString(snapshotProgress.lastWindowDoneAt),
+      delay,
+    });
+  }
+
+  private _logDocMetrics(docSession: OptDocSession, triggeredBy: 'docOpen' | 'interval'| 'docClose') {
+    this.logTelemetryEvent(docSession, 'documentUsage', {
+      limited: {
+        triggeredBy,
+        isPublic: (this.doc as unknown as APIDocument)?.public ?? false,
+        rowCount: this._docUsage?.rowCount?.total,
+        dataSizeBytes: this._docUsage?.dataSizeBytes,
+        attachmentsSize: this._docUsage?.attachmentsSizeBytes,
+        ...this._getAccessRuleMetrics(),
+        ...this._getAttachmentMetrics(),
+        ...this._getChartMetrics(),
+        ...this._getWidgetMetrics(),
+        ...this._getColumnMetrics(),
+        ...this._getTableMetrics(),
+        ...this._getCustomWidgetMetrics(),
+      },
+    });
+    // Log progress on making snapshots periodically, to catch anything
+    // excessively slow.
+    this._logSnapshotProgress(docSession);
+  }
+
+  private _getAccessRuleMetrics() {
+    const accessRules = this.docData?.getMetaTable('_grist_ACLRules');
+    const numAccessRules = accessRules?.numRecords() ?? 0;
+    const numUserAttributes = accessRules?.getRecords().filter(r => r.userAttributes).length ?? 0;
+
+    return {
+      numAccessRules,
+      numUserAttributes,
+    };
+  }
+
+  private _getAttachmentMetrics() {
+    const attachments = this.docData?.getMetaTable('_grist_Attachments');
+    const numAttachments = attachments?.numRecords() ?? 0;
+    const attachmentTypes = attachments?.getRecords()
+      // Exclude the leading ".", if any.
+      .map(r => r.fileExt?.trim()?.slice(1))
+      .filter(ext => Boolean(ext));
+    const uniqueAttachmentTypes = [...new Set(attachmentTypes ?? [])];
+    return {
+      numAttachments,
+      attachmentTypes: uniqueAttachmentTypes,
+    };
+  }
+
+  private _getChartMetrics() {
+    const viewSections = this.docData?.getMetaTable('_grist_Views_section');
+    const viewSectionRecords = viewSections?.getRecords() ?? [];
+    const chartRecords = viewSectionRecords?.filter(r => r.parentKey === 'chart') ?? [];
+    const chartTypes = chartRecords.map(r => r.chartType || 'bar');
+    const numCharts = chartRecords.length;
+    const numLinkedCharts = chartRecords.filter(r => r.linkSrcSectionRef).length;
+
+    return {
+      numCharts,
+      chartTypes,
+      numLinkedCharts,
+    };
+  }
+
+  private _getWidgetMetrics() {
+    const viewSections = this.docData?.getMetaTable('_grist_Views_section');
+    const viewSectionRecords = viewSections?.getRecords() ?? [];
+    const numLinkedWidgets = viewSectionRecords.filter(r => r.linkSrcSectionRef).length;
+
+    return {
+      numLinkedWidgets,
+    };
+  }
+
+  private _getColumnMetrics() {
+    const columns = this.docData?.getMetaTable('_grist_Tables_column');
+    const columnRecords = columns?.getRecords().filter(r => !isHiddenCol(r.colId)) ?? [];
+    const numColumns = columnRecords.length;
+    const numColumnsWithConditionalFormatting = columnRecords.filter(r => r.rules).length;
+    const numFormulaColumns = columnRecords.filter(r => r.isFormula && r.formula).length;
+    const numTriggerFormulaColumns = columnRecords.filter(r => !r.isFormula && r.formula).length;
+
+    const tables = this.docData?.getMetaTable('_grist_Tables');
+    const tableRecords = tables?.getRecords().filter(r =>
+      r.tableId && !r.tableId.startsWith('GristHidden_')) ?? [];
+    const summaryTables = tableRecords.filter(r => r.summarySourceTable);
+    const summaryTableIds = new Set([...summaryTables.map(t => t.id)]);
+    const numSummaryFormulaColumns = columnRecords.filter(r =>
+      r.isFormula && summaryTableIds.has(r.parentId)).length;
+
+    const viewSectionFields = this.docData?.getMetaTable('_grist_Views_section_field');
+    const viewSectionFieldRecords = viewSectionFields?.getRecords() ?? [];
+    const numFieldsWithConditionalFormatting = viewSectionFieldRecords.filter(r => r.rules).length;
+
+    return {
+      numColumns,
+      numColumnsWithConditionalFormatting,
+      numFormulaColumns,
+      numTriggerFormulaColumns,
+      numSummaryFormulaColumns,
+      numFieldsWithConditionalFormatting,
+    };
+  }
+
+  private _getTableMetrics() {
+    const tables = this.docData?.getMetaTable('_grist_Tables');
+    const tableRecords = tables?.getRecords().filter(r =>
+      r.tableId && !r.tableId.startsWith('GristHidden_')) ?? [];
+    const numTables = tableRecords.length;
+    const numOnDemandTables = tableRecords.filter(r => r.onDemand).length;
+
+    const viewSections = this.docData?.getMetaTable('_grist_Views_section');
+    const viewSectionRecords = viewSections?.getRecords() ?? [];
+    const numTablesWithConditionalFormatting = viewSectionRecords.filter(r => r.rules).length;
+
+    const summaryTables = tableRecords.filter(r => r.summarySourceTable);
+    const numSummaryTables = summaryTables.length;
+
+    return {
+      numTables,
+      numOnDemandTables,
+      numTablesWithConditionalFormatting,
+      numSummaryTables,
+    };
+  }
+
+  private _getCustomWidgetMetrics() {
+    const viewSections = this.docData?.getMetaTable('_grist_Views_section');
+    const viewSectionRecords = viewSections?.getRecords() ?? [];
+    const customWidgetIds: string[] = [];
+    for (const r of viewSectionRecords) {
+      const {customView} = safeJsonParse(r.options, {});
+      if (!customView) { continue; }
+
+      const {pluginId, url} = safeJsonParse(customView, {});
+      if (!url) { continue; }
+
+      const isGristLabsWidget = url.startsWith(commonUrls.gristLabsCustomWidgets);
+      customWidgetIds.push(isGristLabsWidget ? pluginId : 'externalId');
+    }
+    const numCustomWidgets = customWidgetIds.length;
+
+    return {
+      numCustomWidgets,
+      customWidgetIds,
+    };
   }
 
   private async _fetchQueryFromDB(query: ServerQuery, onDemand: boolean): Promise<TableDataAction> {
@@ -2125,7 +2840,10 @@ export class ActiveDoc extends EventEmitter {
     if (this._docUsage?.attachmentsSizeBytes === undefined) {
       promises.push(this._updateAttachmentsSize(options));
     }
-    if (promises.length === 0) { return; }
+    if (promises.length === 0) {
+      this._logDocMetrics(docSession, 'docOpen');
+      return;
+    }
 
     try {
       await Promise.all(promises);
@@ -2134,6 +2852,34 @@ export class ActiveDoc extends EventEmitter {
     } catch (e) {
       this._log.warn(docSession, 'failed to initialize doc usage', e);
     }
+
+    this._logDocMetrics(docSession, 'docOpen');
+  }
+
+  private _getAuditEventProperties<Action extends AuditEventAction>(): Partial<AuditEventProperties<Action>> {
+    const org = this.doc?.workspace.org;
+    return {
+      context: {
+        site: org ? pick(org, "id") : undefined,
+      },
+    };
+  }
+
+  private _getTelemetryMeta(docSession: OptDocSession|null): TelemetryMetadataByLevel {
+    const altSessionId = getAltSessionId(docSession);
+    return merge(
+      getTelemetryMeta(docSession),
+      altSessionId ? {altSessionId} : {},
+      {
+        limited: {
+          docIdDigest: this._docName,
+        },
+        full: {
+          siteId: this.doc?.workspace.org.id,
+          siteType: this._product?.name,
+        },
+      },
+    );
   }
 
   /**
@@ -2165,7 +2911,15 @@ export class ActiveDoc extends EventEmitter {
    */
   private async _rawPyCall(funcName: string, ...varArgs: unknown[]): Promise<any> {
     const dataEngine = await this._getEngine();
-    return dataEngine.pyCall(funcName, ...varArgs);
+    try {
+      return await dataEngine.pyCall(funcName, ...varArgs);
+    } catch (e) {
+      if (e instanceof UnavailableSandboxMethodError && this._isSnapshot) {
+        throw new UnavailableSandboxMethodError('pyCall is not available in snapshots');
+      }
+
+      throw e;
+    }
   }
 
   /**
@@ -2178,22 +2932,53 @@ export class ActiveDoc extends EventEmitter {
   }
 
   private async _getEngine(): Promise<ISandbox> {
-    if (this._shuttingDown) { throw new Error('shutting down, data engine unavailable'); }
-    this._dataEngine = this._dataEngine || this._makeEngine();
+    if (this._shuttingDown) {
+      throw new Error('shutting down, data engine unavailable');
+    }
+    if (this._dataEngine) { return this._dataEngine; }
+
+    this._dataEngine = this._isSnapshot ? this._makeNullEngine() : this._makeEngine();
     return this._dataEngine;
+  }
+
+  private _getDocumentSettings(): DocumentSettings {
+    const docSettings = this.docData?.docSettings();
+    if (!docSettings) {
+      throw new Error("No document settings found");
+    }
+    return docSettings;
+  }
+
+  private async _getDocumentSettingsIfPresent(): Promise<DocumentSettings|undefined> {
+    try {
+      return this._getDocumentSettings();
+    } catch (e) {
+      // If called before docData is initialized, pick up docSettings directly from SQLite.
+      const docInfo = await this.docStorage.get('SELECT documentSettings FROM _grist_DocInfo').catch(() => undefined);
+      return safeJsonParse(docInfo?.documentSettings || '', undefined);
+    }
+  }
+
+  private async _updateDocumentSettings(docSessions: OptDocSession, settings: DocumentSettings): Promise<void> {
+    const docInfo = this.docData?.docInfo();
+    if (!docInfo) {
+      throw new Error("No document info found");
+    }
+    await this.applyUserActions(docSessions, [
+      // Use docInfo.id to avoid hard-coding a reference to a specific row id, in case it changes.
+      ["UpdateRecord", "_grist_DocInfo", docInfo.id, { documentSettings: JSON.stringify(settings) }]
+    ]);
   }
 
   private async _makeEngine(): Promise<ISandbox> {
     // Figure out what kind of engine we need for this document.
-    let preferredPythonVersion: '2' | '3' = process.env.PYTHON_VERSION === '3' ? '3' : '2';
+    let preferredPythonVersion: '2' | '3' = process.env.PYTHON_VERSION === '2' ? '2' : '3';
 
     // Careful, migrations may not have run on this document and it may not have a
     // documentSettings column.  Failures are treated as lack of an engine preference.
-    const docInfo = await this.docStorage.get('SELECT documentSettings FROM _grist_DocInfo').catch(e => undefined);
-    const docSettingsString = docInfo?.documentSettings;
-    if (docSettingsString) {
-      const docSettings: DocumentSettings|undefined = safeJsonParse(docSettingsString, undefined);
-      const engine = docSettings?.engine;
+    const docSettings = await this._getDocumentSettingsIfPresent();
+    if (docSettings) {
+      const engine = docSettings.engine;
       if (engine) {
         if (engine === 'python2') {
           preferredPythonVersion = '2';
@@ -2204,22 +2989,22 @@ export class ActiveDoc extends EventEmitter {
         }
       }
     }
-    return this._docManager.gristServer.create.NSandbox({
-      comment: this._docName,
-      logCalls: false,
-      logTimes: true,
-      logMeta: {docId: this._docName},
+    return createSandbox({
+      server: this._server,
+      docId: this._docName,
       preferredPythonVersion,
       sandboxOptions: {
         exports: {
           request: (key: string, args: SandboxRequest) => this._requests.handleSingleRequestWithCache(key, args),
-          guessColInfo: (values: Array<string | null>) =>
-            guessColInfoWithDocData(values, this.docData!),
-          convertFromColumn: (...args: Parameters<ReturnType<typeof convertFromColumn>>) =>
-            convertFromColumn(this.docData!)(...args)
+          guessColInfo,
+          convertFromColumn,
         }
       },
     });
+  }
+
+  private async _makeNullEngine(): Promise<ISandbox> {
+    return new NullSandbox();
   }
 
   /**
@@ -2259,6 +3044,103 @@ export class ActiveDoc extends EventEmitter {
     await this._updateDocUsage({attachmentsSizeBytes}, options);
     return attachmentsSizeBytes;
   }
+
+  private _getCachedAttachmentColumns(): AttachmentColumns {
+    if (!this.docData) { return new Map(); }
+    if (!this._attachmentColumns) {
+      this._attachmentColumns = getAttachmentColumns(this.docData);
+    }
+    return this._attachmentColumns;
+  }
+
+  /**
+   * Waits for the data engine to be ready before calling `cb`, creating the
+   * engine if needed.
+   *
+   * Optionally shuts down and removes the engine after.
+   *
+   * NOTE: This method should be used with care, particularly when `shutdownAfter`
+   * is set. Currently, it's only used to run migrations on snapshots (which don't
+   * normally start the data engine).
+   */
+  private async _withDataEngine(
+    cb: () => Promise<void>,
+    options: {shutdownAfter?: boolean} = {}
+  ) {
+    const {shutdownAfter} = options;
+    this._dataEngine = this._dataEngine || this._makeEngine();
+    let engine = await this._dataEngine;
+    if (engine instanceof NullSandbox) {
+      // Make sure the current engine isn't a stub, which may be the case when the
+      // document is a snapshot. Normally, `shutdownAfter` will be true in such
+      // scenarios, so we'll revert back to using a stubbed engine after calling `cb`.
+      this._dataEngine = this._makeEngine();
+      engine = await this._dataEngine;
+    }
+
+    try {
+      await cb();
+    } finally {
+      if (shutdownAfter) {
+        await (await this._dataEngine)?.shutdown();
+        this._dataEngine = null;
+      }
+    }
+  }
+
+  private async _onInactive() {
+    if (Deps.ACTIVEDOC_TIMEOUT_ACTION === 'shutdown') {
+      await this.shutdown();
+    }
+  }
+
+  private _getHomeDbManagerOrFail() {
+    const dbManager = this.getHomeDbManager();
+    if (!dbManager) {
+      throw new Error('HomeDbManager not available');
+    }
+
+    return dbManager;
+  }
+
+  private _doStartTiming() {
+    return  this._pyCall('start_timing');
+  }
+
+  private _logForkDocumentEvents(
+    docSession: OptDocSession,
+    { document, fork }: { document: Document; fork: ForkResult }
+  ) {
+    this.logAuditEvent(docSession, {
+      action: "document.fork",
+      details: {
+        document: pick(document, "id", "name"),
+        fork: {
+          id: fork.forkId,
+          document_id: fork.docId,
+          url_id: fork.urlId,
+        },
+      },
+    });
+    this.logTelemetryEvent(docSession, 'documentForked', {
+      limited: {
+        forkIdDigest: fork.forkId,
+        forkDocIdDigest: fork.docId,
+        trunkIdDigest: document.trunkId,
+        isTemplate: document.type === "template",
+        lastActivity: document.updatedAt,
+      },
+    });
+  }
+
+  /**
+   * Register the underlying SQLiteDB we have so that it can
+   * be used for backup operations. It is important to use
+   * the same SQLite connection for all operations.
+   */
+  private _registerSQLiteDB() {
+    this._docManager.registerSQLiteDB(this.docName, this.docStorage.getDB());
+  }
 }
 
 // Helper to initialize a sandbox action bundle with no values.
@@ -2282,4 +3164,87 @@ export function tableIdToRef(metaTables: { [p: string]: TableDataAction }, table
     throw new ApiError(`Table not found "${tableId}"`, 404);
   }
   return tableRefs[tableRowIndex];
+}
+
+// Helper that converts a Grist column colId to a ref given the corresponding table.
+export function colIdToRef(metaTables: {[p: string]: TableDataAction}, tableId: string, colId: string) {
+  const tableRef = tableIdToRef(metaTables, tableId);
+
+  const [, , colRefs, columnData] = metaTables._grist_Tables_column;
+  const colRowIndex = columnData.colId.findIndex((_, i) => (
+    columnData.colId[i] === colId && columnData.parentId[i] === tableRef
+  ));
+  if (colRowIndex === -1) {
+    throw new ApiError(`Column not found "${colId}"`, 404);
+  }
+  return colRefs[colRowIndex];
+}
+
+// Helper that check if tableRef is used instead of tableId and return real tableId
+// If metaTables is not define, activeDoc and req allow it to be created
+interface MetaTables {
+  metaTables: { [p: string]: TableDataAction }
+}
+interface ActiveDocAndReq {
+  activeDoc: ActiveDoc, req: RequestWithLogin
+}
+export async function getRealTableId(
+  tableId: string,
+  options:  MetaTables | ActiveDocAndReq
+  ): Promise<string> {
+  if (parseInt(tableId)) {
+    const metaTables = "metaTables" in options
+      ? options.metaTables
+      : await getMetaTables(options.activeDoc, options.req);
+    const [, , tableRefs, tableData] = metaTables._grist_Tables;
+    if (tableRefs.indexOf(parseInt(tableId)) >= 0) {
+      const tableRowIndex = tableRefs.indexOf(parseInt(tableId));
+      return tableData.tableId[tableRowIndex]!.toString();
+    }
+  }
+  return tableId;
+}
+
+export function sanitizeApplyUAOptions(options?: ApplyUAOptions): ApplyUAOptions {
+  return pick(options||{}, ['desc', 'otherId', 'linkId', 'parseStrings']);
+}
+
+/**
+ * Create a sandbox in its default initial state and with default logging.
+ */
+export function createSandbox(options: {
+  server: GristServer,
+  docId: string,
+  preferredPythonVersion: '2' | '3' | undefined,
+  sandboxOptions?: Partial<ISandboxOptions>,
+}) {
+  const {docId, preferredPythonVersion, sandboxOptions, server} = options;
+  return server.create.NSandbox({
+    comment: docId,
+    logCalls: false,
+    logTimes: true,
+    logMeta: {docId},
+    preferredPythonVersion,
+    sandboxOptions,
+  });
+}
+
+/**
+ * Extract telemetry metadata from session.
+ */
+function getTelemetryMeta(docSession: OptDocSession|null): TelemetryMetadataByLevel {
+  if (!docSession) { return {}; }
+
+  const access = getDocSessionAccessOrNull(docSession);
+  const user = getFullUser(docSession);
+  const {client} = docSession;
+  return {
+    limited: {
+      access,
+    },
+    full: {
+      ...(user ? {userId: user.id} : {}),
+      ...(client ? client.getFullTelemetryMeta() : {}),   // Client if present will repeat and add to user info.
+    },
+  };
 }

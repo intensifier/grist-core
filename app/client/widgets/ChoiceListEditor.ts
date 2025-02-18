@@ -1,25 +1,33 @@
 import {createGroup} from 'app/client/components/commands';
-import {ACIndexImpl, ACItem, ACResults, buildHighlightedDom, HighlightFunc} from 'app/client/lib/ACIndex';
+import {GristDoc} from 'app/client/components/GristDoc';
+import {ACIndexImpl, ACItem, ACResults,
+        buildHighlightedDom, HighlightFunc, normalizeText} from 'app/client/lib/ACIndex';
 import {IAutocompleteOptions} from 'app/client/lib/autocomplete';
+import {makeT} from 'app/client/lib/localization';
 import {IToken, TokenField, tokenFieldStyles} from 'app/client/lib/TokenField';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {colors, testId, theme} from 'app/client/ui2018/cssVars';
 import {menuCssClass} from 'app/client/ui2018/menus';
 import {createMobileButtons, getButtonMargins} from 'app/client/widgets/EditorButtons';
 import {EditorPlacement} from 'app/client/widgets/EditorPlacement';
-import {NewBaseEditor, Options} from 'app/client/widgets/NewBaseEditor';
+import {FieldOptions, NewBaseEditor} from 'app/client/widgets/NewBaseEditor';
 import {csvEncodeRow} from 'app/common/csvFormat';
 import {CellValue} from "app/common/DocActions";
+import {CompiledPredicateFormula} from 'app/common/PredicateFormula';
+import {EmptyRecordView} from 'app/common/RecordView';
 import {decodeObject, encodeObject} from 'app/plugin/objtypes';
-import {dom, styled} from 'grainjs';
 import {ChoiceOptions, getRenderFillColor, getRenderTextColor} from 'app/client/widgets/ChoiceTextBox';
 import {choiceToken, cssChoiceACItem, cssChoiceToken} from 'app/client/widgets/ChoiceToken';
 import {icon} from 'app/client/ui2018/icons';
+import {dom, styled} from 'grainjs';
+
+const t = makeT('ChoiceListEditor');
 
 export class ChoiceItem implements ACItem, IToken {
-  public cleanText: string = this.label.toLowerCase().trim();
+  public cleanText: string = normalizeText(this.label);
   constructor(
     public label: string,
     public isInvalid: boolean,  // If set, this token is not one of the valid choices.
+    public isBlank: boolean,    // If set, this token is blank.
     public isNew?: boolean,     // If set, this is a choice to be added to the config.
   ) {}
 }
@@ -31,30 +39,42 @@ export class ChoiceListEditor extends NewBaseEditor {
   private _tokenField: TokenField<ChoiceItem>;
   private _textInput: HTMLInputElement;
   private _dom: HTMLElement;
-  private _editorPlacement: EditorPlacement;
+  private _editorPlacement!: EditorPlacement;
   private _contentSizer: HTMLElement;   // Invisible element to size the editor with all the tokens
-  private _inputSizer: HTMLElement;     // Part of _contentSizer to size the text input
+  private _inputSizer!: HTMLElement;     // Part of _contentSizer to size the text input
   private _alignment: string;
+
+  private _widgetOptionsJson = this.options.field.widgetOptionsJson.peek();
+  private _choices: string[] = this._widgetOptionsJson.choices || [];
+  private _choicesSet: Set<string> = new Set(this._choices);
+  private _choiceOptionsByName: ChoiceOptions = this._widgetOptionsJson.choiceOptions || {};
 
   // Whether to include a button to show a new choice.
   // TODO: Disable when the user cannot change column configuration.
-  private _enableAddNew: boolean = true;
+  private _enableAddNew: boolean;
   private _showAddNew: boolean = false;
 
-  private _choiceOptionsByName: ChoiceOptions;
+  private _hasDropdownCondition = Boolean(this.options.field.dropdownCondition.peek()?.text);
+  private _dropdownConditionError: string | undefined;
 
-  constructor(options: Options) {
+  constructor(protected options: FieldOptions) {
     super(options);
 
-    const choices: string[] = options.field.widgetOptionsJson.peek().choices || [];
-    this._choiceOptionsByName = options.field.widgetOptionsJson
-      .peek().choiceOptions || {};
-    const acItems = choices.map(c => new ChoiceItem(c, false));
-    const choiceSet = new Set(choices);
+    let acItems = this._choices.map(c => new ChoiceItem(c, false, false));
+    if (this._hasDropdownCondition) {
+      try {
+        const dropdownConditionFilter = this._buildDropdownConditionFilter();
+        acItems = acItems.filter((item) => dropdownConditionFilter(item));
+      } catch (e) {
+        acItems = [];
+        this._dropdownConditionError = e.message;
+      }
+    }
 
     const acIndex = new ACIndexImpl<ChoiceItem>(acItems);
     const acOptions: IAutocompleteOptions<ChoiceItem> = {
       menuCssClass: `${menuCssClass} ${cssChoiceList.className} test-autocomplete`,
+      buildNoItemsMessage: this._buildNoItemsMessage.bind(this),
       search: async (term: string) => this._maybeShowAddNew(acIndex.search(term), term),
       renderItem: (item, highlightFunc) => this._renderACItem(item, highlightFunc),
       getItemText: (item) => item.label,
@@ -63,24 +83,30 @@ export class ChoiceListEditor extends NewBaseEditor {
     this.commandGroup = this.autoDispose(createGroup(options.commands, null, true));
     this._alignment = options.field.widgetOptionsJson.peek().alignment || 'left';
 
+
     // If starting to edit by typing in a string, ignore previous tokens.
     const cellValue = decodeObject(options.cellValue);
-    const startLabels: unknown[] = options.editValue || !Array.isArray(cellValue) ? [] : cellValue;
-    const startTokens = startLabels.map(label => new ChoiceItem(String(label), !choiceSet.has(String(label))));
+    const startLabels: unknown[] = options.editValue !== undefined || !Array.isArray(cellValue) ? [] : cellValue;
+    const startTokens = startLabels.map(label => new ChoiceItem(
+      String(label),
+      !this._choicesSet.has(String(label)),
+      String(label).trim() === ''
+    ));
 
     this._tokenField = TokenField.ctor<ChoiceItem>().create(this, {
       initialValue: startTokens,
       renderToken: item => [
-        item.label,
+        item.isBlank ? '[Blank]' : item.label,
         dom.style('background-color', getRenderFillColor(this._choiceOptionsByName[item.label])),
         dom.style('color', getRenderTextColor(this._choiceOptionsByName[item.label])),
         dom.cls('font-bold', this._choiceOptionsByName[item.label]?.fontBold ?? false),
         dom.cls('font-underline', this._choiceOptionsByName[item.label]?.fontUnderline ?? false),
         dom.cls('font-italic', this._choiceOptionsByName[item.label]?.fontItalic ?? false),
         dom.cls('font-strikethrough', this._choiceOptionsByName[item.label]?.fontStrikethrough ?? false),
-        cssChoiceToken.cls('-invalid', item.isInvalid)
+        cssChoiceToken.cls('-invalid', item.isInvalid),
+        cssChoiceToken.cls('-blank', item.isBlank),
       ],
-      createToken: label => new ChoiceItem(label, !choiceSet.has(label)),
+      createToken: label => new ChoiceItem(label, !this._choicesSet.has(label), label.trim() === ''),
       acOptions,
       openAutocompleteOnFocus: true,
       readonly : options.readonly,
@@ -111,6 +137,8 @@ export class ChoiceListEditor extends NewBaseEditor {
       dom.prop('value', options.editValue || ''),
       this.commandGroup.attach(),
     );
+
+    this._enableAddNew = !this._hasDropdownCondition;
   }
 
   public attach(cellElem: Element): void {
@@ -143,7 +171,7 @@ export class ChoiceListEditor extends NewBaseEditor {
   }
 
   public getTextValue() {
-    const values = this._tokenField.tokensObs.get().map(t => t.label);
+    const values = this._tokenField.tokensObs.get().map(token => token.label);
     return csvEncodeRow(values, {prettier: true});
   }
 
@@ -157,7 +185,7 @@ export class ChoiceListEditor extends NewBaseEditor {
    */
   public async prepForSave() {
     const tokens = this._tokenField.tokensObs.get();
-    const newChoices = tokens.filter(t => t.isNew).map(t => t.label);
+    const newChoices = tokens.filter(({isNew}) => isNew).map(({label}) => label);
     if (newChoices.length > 0) {
       const choices = this.options.field.widgetOptionsJson.prop('choices');
       await choices.saveOnly([...(choices.peek() || []), ...new Set(newChoices)]);
@@ -211,6 +239,30 @@ export class ChoiceListEditor extends NewBaseEditor {
     this._textInput.style.width = this._inputSizer.getBoundingClientRect().width + 'px';
   }
 
+  private _buildDropdownConditionFilter() {
+    const dropdownConditionCompiled = this.options.field.dropdownConditionCompiled.get();
+    if (dropdownConditionCompiled?.kind !== 'success') {
+      throw new Error('Dropdown condition is not compiled');
+    }
+
+    return buildDropdownConditionFilter({
+      dropdownConditionCompiled: dropdownConditionCompiled.result,
+      gristDoc: this.options.gristDoc,
+      tableId: this.options.field.tableId(),
+      rowId: this.options.rowId,
+    });
+  }
+
+  private _buildNoItemsMessage(): string {
+    if (this._dropdownConditionError) {
+      return t('Error in dropdown condition');
+    } else if (this._hasDropdownCondition) {
+      return t('No choices matching condition');
+    } else {
+      return t('No choices to select');
+    }
+  }
+
   /**
    * If the search text does not match anything exactly, adds 'new' item to it.
    *
@@ -218,15 +270,21 @@ export class ChoiceListEditor extends NewBaseEditor {
    */
   private _maybeShowAddNew(result: ACResults<ChoiceItem>, text: string): ACResults<ChoiceItem> {
     this._showAddNew = false;
-    const trimmedText = text.trim();
-    if (!this._enableAddNew || !trimmedText) { return result; }
+    if (!this._enableAddNew) {
+      return result;
+    }
 
-    const addNewItem = new ChoiceItem(trimmedText, false, true);
+    const trimmedText = text.trim();
+    if (!trimmedText || this._choicesSet.has(trimmedText)) {
+      return result;
+    }
+
+    const addNewItem = new ChoiceItem(trimmedText, false, false, true);
     if (result.items.find((item) => item.cleanText === addNewItem.cleanText)) {
       return result;
     }
 
-    result.items.push(addNewItem);
+    result.extraItems.push(addNewItem);
     this._showAddNew = true;
 
     return result;
@@ -252,8 +310,27 @@ export class ChoiceListEditor extends NewBaseEditor {
   }
 }
 
+export interface GetACFilterFuncParams {
+  dropdownConditionCompiled: CompiledPredicateFormula;
+  gristDoc: GristDoc;
+  tableId: string;
+  rowId: number;
+}
+
+export function buildDropdownConditionFilter(
+  params: GetACFilterFuncParams
+): (item: ChoiceItem) => boolean {
+  const {dropdownConditionCompiled, gristDoc, tableId, rowId} = params;
+  const table = gristDoc.docData.getTable(tableId);
+  if (!table) { throw new Error(`Table ${tableId} not found`); }
+
+  const user = gristDoc.docPageModel.user.get() ?? undefined;
+  const rec = table.getRecord(rowId) || new EmptyRecordView();
+  return (item: ChoiceItem) => dropdownConditionCompiled({user, rec, choice: item.label});
+}
+
 const cssCellEditor = styled('div', `
-  background-color: white;
+  background-color: ${theme.cellEditorBg};
   font-family: var(--grist-font-family-data);
   font-size: var(--grist-medium-font-size);
 `);
@@ -269,18 +346,18 @@ const cssTokenField = styled(tokenFieldStyles.cssTokenField, `
   flex-wrap: wrap;
 `);
 
-const cssToken = styled(tokenFieldStyles.cssToken, `
+export const cssToken = styled(tokenFieldStyles.cssToken, `
   padding: 1px 4px;
   margin: 2px;
   line-height: 16px;
   white-space: pre;
 
   &.selected {
-    box-shadow: inset 0 0 0 1px ${colors.lightGreen};
+    box-shadow: inset 0 0 0 1px ${theme.choiceTokenSelectedBorder};
   }
 `);
 
-const cssDeleteButton = styled(tokenFieldStyles.cssDeleteButton, `
+export const cssDeleteButton = styled(tokenFieldStyles.cssDeleteButton, `
   position: absolute;
   top: -8px;
   right: -6px;
@@ -302,7 +379,7 @@ const cssDeleteButton = styled(tokenFieldStyles.cssDeleteButton, `
   }
 `);
 
-const cssDeleteIcon = styled(tokenFieldStyles.cssDeleteIcon, `
+export const cssDeleteIcon = styled(tokenFieldStyles.cssDeleteIcon, `
   --icon-color: ${colors.light};
   &:hover {
     --icon-color: ${colors.darkGrey};
@@ -332,7 +409,7 @@ const cssInputSizer = styled('div', `
 // Set z-index to be higher than the 1000 set for .cell_editor.
 export const cssChoiceList = styled('div', `
   z-index: 1001;
-  box-shadow: 0 0px 8px 0 rgba(38,38,51,0.6);
+  box-shadow: 0 0px 8px 0 ${theme.menuShadow};
   overflow-y: auto;
   padding: 8px 0 0 0;
   --weaseljs-menu-item-padding: 8px 16px;
@@ -340,7 +417,7 @@ export const cssChoiceList = styled('div', `
 
 const cssReadonlyStyle = styled('div', `
   padding-left: 16px;
-  background: white;
+  background: ${theme.cellEditorBg};
 `);
 
 export const cssMatchText = styled('span', `
@@ -348,20 +425,21 @@ export const cssMatchText = styled('span', `
 `);
 
 export const cssPlusButton = styled('div', `
-  display: inline-block;
+  display: flex;
   width: 20px;
   height: 20px;
   border-radius: 20px;
   margin-right: 8px;
-  text-align: center;
-  background-color: ${colors.lightGreen};
-  color: ${colors.light};
+  align-items: center;
+  justify-content: center;
+  background-color: ${theme.autocompleteAddNewCircleBg};
+  color: ${theme.autocompleteAddNewCircleFg};
 
   .selected > & {
-    background-color: ${colors.darkGreen};
+    background-color: ${theme.autocompleteAddNewCircleSelectedBg};
   }
 `);
 
 export const cssPlusIcon = styled(icon, `
-  background-color: ${colors.light};
+  background-color: ${theme.autocompleteAddNewCircleFg};
 `);

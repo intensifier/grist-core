@@ -37,7 +37,7 @@ schema_data = [
     [28, "country",     "Text",       False, "'US'", "country", ''],
     [29, "region",      "Any",        True,
           "{'US': 'North America', 'UK': 'Europe'}.get(rec.country, 'N/A')", "region", ''],
-    [30, "badSyntax",   "Any",        True, "for a in b\n10", "", ""],
+    [30, "badSyntax",   "Any",        True, "for a in\n10", "", ""],
   ]]
 ]
 
@@ -71,9 +71,11 @@ class TestGenCode(unittest.TestCase):
     gcode.make_module(self.schema)
     generated = gcode.get_user_text()
     if six.PY3:
-      generated = generated.replace(
-         ", 'for a in b'))",
-        ", u'for a in b'))",
+      saved_sample = saved_sample.replace(
+        "raise SyntaxError('invalid syntax', ('usercode', 1, 9, u'for a in'))",
+        "raise SyntaxError('invalid syntax\\n\\n"
+        "A `SyntaxError` occurs when Python cannot understand your code.\\n\\n', "
+        "('usercode', 1, 9, 'for a in'))"
       )
     self.assertEqual(generated, saved_sample, "Generated code doesn't match sample:\n" +
                      "".join(difflib.unified_diff(generated.splitlines(True),
@@ -88,6 +90,7 @@ class TestGenCode(unittest.TestCase):
     gcode = gencode.GenCode()
     gcode.make_module(self.schema)
     module = gcode.usercode
+    # pylint: disable=E1101
     self.assertTrue(isinstance(module.Students, table.UserTable))
 
   def test_ident_combining_chars(self):
@@ -240,7 +243,7 @@ class TestGenCode(unittest.TestCase):
     # Test the case of a bare-word function with a keyword argument appearing in a formula. This
     # case had a bug with code parsing.
     self.schema['Address'].columns['testcol'] = schema.SchemaColumn(
-      'testcol', 'Any', True, 'foo(bar=$region) or max(Students.all, key=lambda n: -n)')
+      'testcol', 'Any', True, 'foo(bar=$region) or max(Students.all, key=lambda n: -n)', None)
     gcode.make_module(self.schema)
     self.assertEqual(gcode.grist_names(), expected_names + [
       (('Address', 'testcol'), 9, 'Address', 'region'),

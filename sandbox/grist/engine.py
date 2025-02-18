@@ -4,6 +4,7 @@ The data engine ties the code generated from the schema with the document data, 
 dependency tracking.
 """
 import itertools
+import logging
 import re
 import rlcompleter
 import sys
@@ -13,19 +14,20 @@ from collections import namedtuple, OrderedDict, defaultdict
 
 import six
 from six.moves import zip
-from six.moves.collections_abc import Hashable  # pylint:disable-all
+from six.moves.collections_abc import Hashable  # pylint:disable=import-error,no-name-in-module
 from sortedcontainers import SortedSet
 
 import acl
 import actions
 import action_obj
-from autocomplete_context import AutocompleteContext
+from attribute_recorder import AttributeRecorder
+from autocomplete_context import AutocompleteContext, lookup_autocomplete_options, eval_suggestion
 from codebuilder import DOLLAR_REGEX
 import depend
 import docactions
 import docmodel
+from fake_std_streams import FakeStdStreams
 import gencode
-import logger
 import match_counter
 import objtypes
 from objtypes import strict_equal
@@ -34,12 +36,13 @@ import sandbox
 import schema
 from schema import RecalcWhen
 import table as table_module
+from timing import DummyTiming
 from user import User # pylint:disable=wrong-import-order
 import useractions
 import column
 import urllib_patch  # noqa imported for side effect # pylint:disable=unused-import
 
-log = logger.Logger(__name__, logger.INFO)
+log = logging.getLogger(__name__)
 
 if six.PY2:
   reload(sys)
@@ -261,6 +264,8 @@ class Engine(object):
     # make multiple different requests without needing to keep all the responses in memory.
     self._cached_request_keys = set()
 
+    self._timing = DummyTiming()
+
   @property
   def autocomplete_context(self):
     # See the comment on _autocomplete_context in __init__ above.
@@ -386,9 +391,27 @@ class Engine(object):
 
     query_cols = []
     if query:
-      query_cols = [(table.get_column(col_id), values) for (col_id, values) in six.iteritems(query)]
-    row_ids = [r for r in table.row_ids
-               if all((c.raw_get(r) in values) for (c, values) in query_cols)]
+      for col_id, values in six.iteritems(query):
+        col = table.get_column(col_id)
+        try:
+          # Try to use a set for speed.
+          values = set(values)
+        except TypeError:
+          # Values contains an unhashable value, leave it as a list.
+          pass
+        query_cols.append((col, values))
+    row_ids = []
+    for r in table.row_ids:
+      for (c, values) in query_cols:
+        try:
+          if c.raw_get(r) not in values:
+            break
+        except TypeError:
+          # values is a set but c.raw_get(r) is unhashable, so it's definitely not in values
+          break
+      else:
+        # No break, i.e. all columns matched
+        row_ids.append(r)
 
     for c in six.itervalues(table.all_columns):
       # pylint: disable=too-many-boolean-expressions
@@ -450,7 +473,7 @@ class Engine(object):
     if n:
       matched_cols = matched_cols[:n]
 
-    log.info('Found column from values in %.3fs' % (time.time() - start_time))
+    log.info('Found column from values in %.3fs', time.time() - start_time)
     return [c[1] for c in matched_cols]
 
   def assert_schema_consistent(self):
@@ -484,9 +507,11 @@ class Engine(object):
     if col_parent_ids > valid_table_refs:
       collist = sorted(actions.transpose_bulk_action(meta_columns),
                        key=lambda c: (c.parentId, c.parentPos))
+      reverse_col_id = schema.get_reverse_col_id_lookup_func(collist)
       raise AssertionError("Internal schema inconsistent; extra columns in metadata:\n"
           + "\n".join('  #%s %s' %
-                      (c.id, schema.SchemaColumn(c.colId, c.type, bool(c.isFormula), c.formula))
+                      (c.id, schema.SchemaColumn(c.colId, c.type, bool(c.isFormula), c.formula,
+                        reverse_col_id(c)))
                       for c in collist if c.parentId not in valid_table_refs))
 
   def dump_state(self):
@@ -494,9 +519,9 @@ class Engine(object):
     self.dump_recompute_map()
 
   def dump_recompute_map(self):
-    log.debug("Recompute map (%d nodes):" % len(self.recompute_map))
+    log.debug("Recompute map (%d nodes):", len(self.recompute_map))
     for node, dirty_rows in six.iteritems(self.recompute_map):
-      log.debug("  Node %s: %s" % (node, dirty_rows))
+      log.debug("  Node %s: %s", node, dirty_rows)
 
   def _use_node(self, node, relation, row_ids=[]):
     # This is used whenever a formula accesses any part of any record. It's hot code, and
@@ -693,22 +718,27 @@ class Engine(object):
     not recomputing the whole column and dependent columns as well. So it recomputes the formula
     for this cell and returns error message with details.
     """
+    result = self.get_formula_value(table_id, col_id, row_id)
+    table = self.tables[table_id]
+    col = table.get_column(col_id)
+    # If the error is gone for a trigger formula
+    if col.has_formula() and not col.is_formula():
+      if not isinstance(result, objtypes.RaisedException):
+        # Get the error stored in the cell
+        # and change it to show to the user that no traceback is available
+        error_in_cell = objtypes.decode_object(col.raw_get(row_id))
+        assert isinstance(error_in_cell, objtypes.RaisedException)
+        return error_in_cell.no_traceback()
+    return result
+
+  def get_formula_value(self, table_id, col_id, row_id, record_attributes=None):
     table = self.tables[table_id]
     col = table.get_column(col_id)
     checkpoint = self._get_undo_checkpoint()
     # Makes calls to REQUEST synchronous, since raising a RequestingError can't work here.
     self._sync_request = True
     try:
-      result = self._recompute_one_cell(table, col, row_id)
-      # If the error is gone for a trigger formula
-      if col.has_formula() and not col.is_formula():
-        if not isinstance(result, objtypes.RaisedException):
-          # Get the error stored in the cell
-          # and change it to show to the user that no traceback is available
-          error_in_cell = objtypes.decode_object(col.raw_get(row_id))
-          assert isinstance(error_in_cell, objtypes.RaisedException)
-          return error_in_cell.no_traceback()
-      return result
+      return self._recompute_one_cell(table, col, row_id, record_attributes=record_attributes)
     finally:
       # It is possible for formula evaluation to have side-effects that produce DocActions (e.g.
       # lookupOrAddDerived() creates those). In case of get_formula_error(), these aren't fully
@@ -826,11 +856,6 @@ class Engine(object):
           # know, so it can set the cell value appropriately and do some other bookkeeping.
           cycle = required and (node, row_id) in self._locked_cells
           value = self._recompute_one_cell(table, col, row_id, cycle=cycle, node=node)
-        except table_module.EmptySummaryRow:
-          # This record is going to be deleted after the update loop completes.
-          # Don't save a value for it because that will lead to broken undo actions
-          # trying to update a record that doesn't exist.
-          save_value = False
         except RequestingError:
           # The formula will be evaluated again soon when we have a response.
           save_value = False
@@ -853,7 +878,7 @@ class Engine(object):
           is_first = node not in self._is_node_exception_reported
           if is_first:
             self._is_node_exception_reported.add(node)
-            log.info(value.details)
+            log.info("Formula error in %s: %s", node, value.details)
             # strip out details after logging
             value = objtypes.RaisedException(value.error, user_input=value.user_input)
 
@@ -924,7 +949,7 @@ class Engine(object):
 
     raise RequestingError()
 
-  def _recompute_one_cell(self, table, col, row_id, cycle=False, node=None):
+  def _recompute_one_cell(self, table, col, row_id, cycle=False, node=None, record_attributes=None):
     """
     Recomputes an one formula cell and returns a value.
     The value can be:
@@ -943,51 +968,59 @@ class Engine(object):
 
     checkpoint = self._get_undo_checkpoint()
     record = table.Record(row_id, table._identity_relation)
+    if record_attributes is not None:
+      assert isinstance(record_attributes, dict)
+      assert col.is_formula()
+      assert not cycle
+      record = AttributeRecorder(record, "rec", record_attributes)
     value = None
-    try:
-      if cycle:
-        raise depend.CircularRefError("Circular Reference")
-      if not col.is_formula():
-        value = col.get_cell_value(int(record), restore=True)
-        result = col.method(record, table.user_table, value, self._user)
-      else:
-        result = col.method(record, table.user_table)
-      if self._cell_required_error:
-        raise self._cell_required_error  # pylint: disable=raising-bad-type
-      self.formula_tracer(col, record)
-      return result
-    except (MemoryError, table_module.EmptySummaryRow):
-      # Don't try to wrap memory errors.
-      # EmptySummaryRow should be handled in _recompute_step
-      raise
-    except:  # pylint: disable=bare-except
-      # Since col.method runs untrusted user code, we use a bare except to catch all
-      # exceptions (even those not derived from BaseException).
+    with self._timing.measure(col.node):
+      try:
+        if cycle:
+          raise depend.CircularRefError("Circular Reference")
+        if not col.is_formula():
+          value = col.get_cell_value(int(record), restore=True)
+          with FakeStdStreams():
+            result = col.method(record, table.user_table, value, self._user)
+        else:
+          with FakeStdStreams():
+            result = col.method(record, table.user_table)
+        if self._cell_required_error:
+          raise self._cell_required_error  # pylint: disable=raising-bad-type
+        self.formula_tracer(col, record)
+        return result
+      except MemoryError:
+        # Don't try to wrap memory errors.
+        raise
+      except:  # pylint: disable=bare-except
+        # Since col.method runs untrusted user code, we use a bare except to catch all
+        # exceptions (even those not derived from BaseException).
 
-      # Before storing the exception value, make sure there isn't an OrderError pending.
-      # If there is, we will raise it after undoing any side effects.
-      order_error = self._cell_required_error
+        # Before storing the exception value, make sure there isn't an OrderError pending.
+        # If there is, we will raise it after undoing any side effects.
+        order_error = self._cell_required_error
 
-      # Otherwise, we use sys.exc_info to recover the raised exception object.
-      regular_error = sys.exc_info()[1] if not order_error else None
+        # Otherwise, we use sys.exc_info to recover the raised exception object.
+        regular_error = sys.exc_info()[1] if not order_error else None
 
-      # It is possible for formula evaluation to have side-effects that produce DocActions (e.g.
-      # lookupOrAddDerived() creates those). If there is an error, undo any such side-effects.
-      self._undo_to_checkpoint(checkpoint)
+        # It is possible for formula evaluation to have side-effects that produce DocActions (e.g.
+        # lookupOrAddDerived() creates those). If there is an error, undo any such side-effects.
+        self._undo_to_checkpoint(checkpoint)
 
-      # Now we can raise the order error, if there was one.  Cell evaluation will be reordered
-      # in response.
-      if order_error:
-        self._cell_required_error = None
-        raise order_error  # pylint: disable=raising-bad-type
+        # Now we can raise the order error, if there was one.  Cell evaluation will be reordered
+        # in response.
+        if order_error:
+          self._timing.mark("order_error")
+          self._cell_required_error = None
+          raise order_error  # pylint: disable=raising-bad-type
 
-      self.formula_tracer(col, record)
+        self.formula_tracer(col, record)
 
-      include_details = (node not in self._is_node_exception_reported) if node else True
-      if not col.is_formula():
-        return objtypes.RaisedException(regular_error, include_details, user_input=value)
-      else:
-        return objtypes.RaisedException(regular_error, include_details)
+        include_details = (node not in self._is_node_exception_reported) if node else True
+        if not col.is_formula():
+          return objtypes.RaisedException(regular_error, include_details, user_input=value)
+        else:
+          return objtypes.RaisedException(regular_error, include_details)
 
   def convert_action_values(self, action):
     """
@@ -1004,11 +1037,9 @@ class Engine(object):
 
       # If there are values for any PositionNumber columns, ensure PositionNumbers are ordered as
       # intended but are all unique, which may require updating other positions.
-      nvalues, adjustments = col_obj.prepare_new_values(values,
+      nvalues, adjustments = col_obj.prepare_new_values(row_ids, values,
           action_summary=self.out_actions.summary)
-      if adjustments:
-        extra_actions.append(actions.BulkUpdateRecord(
-          action.table_id, [r for r,v in adjustments], {col_id: [v for r,v in adjustments]}))
+      extra_actions.extend(adjustments)
 
       new_values[col_id] = nvalues
 
@@ -1023,11 +1054,10 @@ class Engine(object):
         defaults = [col_obj.getdefault() for r in row_ids]
         # We use defaults to get new values or adjustments. If we are replacing data, we'll make
         # the adjustments without regard to the existing data.
-        nvalues, adjustments = col_obj.prepare_new_values(defaults, ignore_data=ignore_data,
+        nvalues, adjustments = col_obj.prepare_new_values(row_ids, defaults,
+            ignore_data=ignore_data,
             action_summary=self.out_actions.summary)
-        if adjustments:
-          extra_actions.append(actions.BulkUpdateRecord(
-            action.table_id, [r for r,v in adjustments], {col_id: [v for r,v in adjustments]}))
+        extra_actions.extend(adjustments)
         if nvalues != defaults:
           new_values[col_id] = nvalues
 
@@ -1307,7 +1337,7 @@ class Engine(object):
       # If we get an exception, we should revert all changes applied so far, to keep things
       # consistent internally as well as with the clients and database outside of the sandbox
       # (which won't see any changes in case of an error).
-      log.info("Failed to apply useractions; reverting: %r" % (e,))
+      log.info("Failed to apply useractions; reverting: %r", e)
       self._undo_to_checkpoint(checkpoint)
 
       # Check schema consistency again. If this fails, something is really wrong (we tried to go
@@ -1316,7 +1346,7 @@ class Engine(object):
         if self._schema_updated:
           self.assert_schema_consistent()
       except Exception:
-        log.error("Inconsistent schema after revert on failure: %s" % traceback.format_exc())
+        log.error("Inconsistent schema after revert on failure: %s", traceback.format_exc())
 
       # Re-raise the original exception
       # In Python 2, 'raise' raises the most recent exception,
@@ -1357,7 +1387,7 @@ class Engine(object):
     Applies a single user action to the document, without running any triggered updates.
     A UserAction is a tuple whose first element is the name of the action.
     """
-    log.debug("applying user_action %s" % (user_action,))
+    log.debug("applying user_action %s", user_action)
     return getattr(self.user_actions, user_action.__class__.__name__)(*user_action)
 
   def apply_doc_action(self, doc_action):
@@ -1365,7 +1395,6 @@ class Engine(object):
     Applies a doc action, which is a step of a user action. It is represented by an Action object
     as defined in actions.py.
     """
-    #log.warn("Engine.apply_doc_action %s" % (doc_action,))
     self._gone_columns = []
 
     action_name = doc_action.__class__.__name__
@@ -1388,7 +1417,7 @@ class Engine(object):
         try:
           self.rebuild_usercode()
         except Exception:
-          log.error("Error rebuilding usercode after restoring schema: %s" % traceback.format_exc())
+          log.error("Error rebuilding usercode after restoring schema: %s", traceback.format_exc())
 
       # Re-raise the original exception
       # In Python 2, 'raise' raises the most recent exception,
@@ -1414,16 +1443,39 @@ class Engine(object):
     if not self._in_update_loop:
       self._bring_mlookups_up_to_date(doc_action)
 
-  def autocomplete(self, txt, table_id, column_id, user):
+  def autocomplete(self, txt, table_id, column_id, row_id, user):
     """
     Return a list of suggested completions of the python fragment supplied.
     """
+    table = self.tables[table_id]
+
+    # Table.lookup methods are special to suggest arguments after '('
+    match = re.match(r"(\w+)\.(lookupRecords|lookupOne)\($", txt)
+    if match:
+      # Get the 'Table1' in 'Table1.lookupRecords('
+      lookup_table_id = match.group(1)
+      if lookup_table_id in self.tables:
+        lookup_table = self.tables[lookup_table_id]
+        # Add a keyword argument with no value for each column name in the lookup table.
+        result = [
+          txt + col_id + "="
+          for col_id in lookup_table.all_columns
+          if column.is_visible_column(col_id) or col_id == 'id'
+        ]
+        # Add specific complete lookups involving reference columns.
+        result += [
+          txt + option
+          for option in lookup_autocomplete_options(lookup_table, table, reverse_only=False)
+        ]
+        # Add a dummy empty example value for each result to produce the correct shape.
+        result = [(r, None) for r in result]
+        return sorted(result)
+
     # replace $ with rec. and add a dummy rec object
     tweaked_txt = DOLLAR_REGEX.sub(r'rec.', txt)
     # convert a bare $ with nothing after it also
     if txt == '$':
       tweaked_txt = 'rec.'
-    table = self.tables[table_id]
 
     autocomplete_context = self.autocomplete_context
     context = autocomplete_context.get_context()
@@ -1433,10 +1485,10 @@ class Engine(object):
     context.pop('value', None)
     context.pop('user', None)
 
-    column = table.get_column(column_id) if table.has_column(column_id) else None
-    if column and not column.is_formula():
+    col = table.get_column(column_id) if table.has_column(column_id) else None
+    if col and not col.is_formula():
       # Add trigger formula completions.
-      context['value'] = column.sample_value()
+      context['value'] = col.sample_value()
       context['user'] = User(user, self.tables, is_sample=True)
 
     completer = rlcompleter.Completer(context)
@@ -1450,13 +1502,38 @@ class Engine(object):
         break
       if skipped_completions.search(result):
         continue
-      results.append(autocomplete_context.process_result(result))
+      result = autocomplete_context.process_result(result)
+      results.append(result)
+      funcname = result[0]
+      # Suggest reverse reference lookups, specifically only for .lookupRecords(),
+      # not for .lookupOne().
+      if isinstance(result, tuple) and funcname.endswith(".lookupRecords"):
+        lookup_table_id = funcname.split(".")[0]
+        if lookup_table_id in self.tables:
+          lookup_table = self.tables[lookup_table_id]
+          results += [
+            funcname + "(" + option
+            for option in lookup_autocomplete_options(lookup_table, table, reverse_only=True)
+          ]
+
+    ### Add example values to all results where possible.
+    if row_id == "new":
+      row_id = table.row_ids.max()
+    rec = table.Record(row_id)
+    # Don't use the same user object as above because we don't want is_sample=True,
+    # which is only needed for the sake of suggesting completions.
+    # Here we want to show actual values.
+    user_obj = User(user, self.tables)
+    results = [
+      (result, eval_suggestion(result, rec, user_obj))
+      for result in results
+    ]
 
     # If we changed the prefix (expanding the $ symbol) we now need to change it back.
     if tweaked_txt != txt:
-      results = [txt + result[len(tweaked_txt):] for result in results]
+      results = [(txt + result[len(tweaked_txt):], value) for result, value in results]
     # pylint:disable=unidiomatic-typecheck
-    results.sort(key=lambda r: r[0] if type(r) == tuple else r)
+    results.sort(key=lambda r: r[0][0] if type(r[0]) == tuple else r[0])
     return results
 
   def _get_undo_checkpoint(self):
@@ -1479,7 +1556,7 @@ class Engine(object):
     if new_checkpoint != checkpoint:
       (len_calc, len_stored, len_undo, len_ret) = checkpoint
       undo_actions = self.out_actions.undo[len_undo:]
-      log.info("Reverting %d doc actions" % len(undo_actions))
+      log.info("Reverting %d doc actions", len(undo_actions))
       self.user_actions.ApplyUndoActions([actions.get_action_repr(a) for a in undo_actions])
       del self.out_actions.calc[len_calc:]
       del self.out_actions.stored[len_stored:]

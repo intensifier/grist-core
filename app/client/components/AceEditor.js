@@ -1,13 +1,16 @@
-var ace = require('brace');
+var ace = require('ace-builds');
 var _ = require('underscore');
-// Used to load python language settings and 'chrome' ace style
-require('brace/mode/python');
-require('brace/theme/chrome');
-require('brace/ext/language_tools');
+// ace-builds also has a minified build (src-min-noconflict), but we don't
+// use it since webpack already handles minification.
+require('ace-builds/src-noconflict/mode-python');
+require('ace-builds/src-noconflict/theme-chrome');
+require('ace-builds/src-noconflict/theme-dracula');
+require('ace-builds/src-noconflict/ext-language_tools');
 var {setupAceEditorCompletions} = require('./AceEditorCompletions');
 var dom = require('../lib/dom');
 var dispose = require('../lib/dispose');
 var modelUtil = require('../models/modelUtil');
+var {gristThemeObs} = require('../ui2018/theme');
 
 /**
  * A class to help set up the ace editor with standard formatting and convenience functions
@@ -25,10 +28,9 @@ function AceEditor(options) {
   this.observable = options.observable || null;
   this.saveValueOnBlurEvent = !(options.saveValueOnBlurEvent === false);
   this.calcSize = options.calcSize || ((_elem, size) => size);
-  this.gristDoc = options.gristDoc || null;
-  this.field = options.field || null;
   this.editorState = options.editorState || null;
   this._readonly = options.readonly || false;
+  this._getSuggestions = options.getSuggestions || null;
 
   this.editor = null;
   this.editorDom = null;
@@ -112,9 +114,9 @@ AceEditor.prototype.enable = function(bool) {
  *  Note: Ace defers to standard behavior when false is returned.
  */
 AceEditor.prototype.attachCommandGroup = function(commandGroup) {
-  _.each(commandGroup.knownKeys, (command, key) => {
+  _.each(commandGroup.knownKeys, (commandName, key) => {
     this.editor.commands.addCommand({
-      name: command,
+      name: commandName,
       // We are setting readonly as true to enable all commands
       // in a readonly mode.
       // Because FieldEditor in readonly mode will rewire all commands that
@@ -127,7 +129,7 @@ AceEditor.prototype.attachCommandGroup = function(commandGroup) {
       },
       // AceEditor wants a command to return true if it got handled, whereas our command returns
       // true to avoid stopPropagation/preventDefault, i.e. if it hasn't been handled.
-      exec: () => !commandGroup.commands[command]()
+      exec: () => !commandGroup.commands[commandName]()
     });
   });
 };
@@ -142,12 +144,9 @@ AceEditor.prototype.attachSaveCommand = function() {
   if (!this.observable) {
     throw new Error("Cannot attach save command to editor with no bound observable");
   }
-  var key = 'Shift+Enter';
   this.editor.commands.addCommand({
     name: 'saveFormula',
     bindKey: {
-      win: key,
-      mac: key,
       sender: 'editor|cli'
     },
     // AceEditor wants a command to return true if it got handled
@@ -185,20 +184,19 @@ AceEditor.prototype.setFontSize = function(pxVal) {
 AceEditor.prototype._setup = function() {
   // Standard editor setup
   this.editor = this.autoDisposeWith('destroy', ace.edit(this.editorDom));
-  if (this.gristDoc && this.field) {
-    const getSuggestions = (prefix) => {
-      const tableId = this.gristDoc.viewModel.activeSection().table().tableId();
-      const columnId = this.field.column().colId();
-      return this.gristDoc.docComm.autocomplete(prefix, tableId, columnId);
-    };
-    setupAceEditorCompletions(this.editor, {getSuggestions});
+  if (this._getSuggestions) {
+    setupAceEditorCompletions(this.editor, {getSuggestions: this._getSuggestions});
   }
   this.editor.setOptions({
     enableLiveAutocompletion: true,   // use autocompletion without needing special activation.
   });
   this.session = this.editor.getSession();
   this.session.setMode('ace/mode/python');
-  this.editor.setTheme('ace/theme/chrome');
+
+  this._setAceTheme(gristThemeObs().get());
+  this.autoDispose(gristThemeObs().addListener((newTheme) => {
+    this._setAceTheme(newTheme);
+  }));
 
   // Default line numbers to hidden
   this.editor.renderer.setShowGutter(false);
@@ -258,7 +256,7 @@ AceEditor.prototype.resize = function() {
   // This won't help for zooming (where the same problem occurs but in many more places), but will
   // help for Windows users who have different pixel ratio.
   this.editorDom.style.width = size.width ? Math.ceil(size.width) + 'px' : 'auto';
-  this.editorDom.style.height = Math.ceil(size.height) + 'px';
+  this.editorDom.style.height = size.height ? Math.ceil(size.height) + 'px' : 'auto';
   this.editor.resize();
 };
 
@@ -270,10 +268,15 @@ AceEditor.prototype._getContentHeight = function() {
   return Math.max(1, this.session.getScreenLength()) * this.editor.renderer.lineHeight;
 };
 
+AceEditor.prototype._setAceTheme = function(newTheme) {
+  const {appearance} = newTheme;
+  const aceTheme = appearance === 'dark' ? 'dracula' : 'chrome';
+  this.editor.setTheme(`ace/theme/${aceTheme}`);
+};
 
 let _RangeConstructor = null; //singleton, load it lazily
 AceEditor.makeRange = function(a, b, c, d) {
-  _RangeConstructor = _RangeConstructor || ace.acequire('ace/range').Range;
+  _RangeConstructor = _RangeConstructor || ace.require('ace/range').Range;
   return new _RangeConstructor(a, b, c, d);
 };
 

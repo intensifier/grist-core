@@ -1,5 +1,18 @@
-import {delay} from 'app/common/delay';
-import {BindableValue, DomElementMethod, ISubscribable, Listener, Observable, subscribeElem, UseCB} from 'grainjs';
+import {
+  BindableValue,
+  Computed,
+  DomElementMethod,
+  Holder,
+  IDisposableOwner,
+  IKnockoutReadObservable,
+  ISubscribable,
+  Listener,
+  MultiHolder,
+  Observable,
+  subscribeElem,
+  UseCB,
+  UseCBOwner
+} from 'grainjs';
 import {Observable as KoObservable} from 'knockout';
 import identity = require('lodash/identity');
 
@@ -10,7 +23,7 @@ export const UP_TRIANGLE = '\u25B2';
 export const DOWN_TRIANGLE = '\u25BC';
 
 const EMAIL_RE = new RegExp("^\\w[\\w%+/='-]*(\\.[\\w%+/='-]+)*@([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z" +
-  "0-9])?\\.)+[A-Za-z]{2,6}$", "u");
+  "0-9])?\\.)+[A-Za-z]{2,24}$", "u");
 
 // Returns whether str starts with prefix. (Note that this implementation avoids creating a new
 // string, and only checks a single location.)
@@ -76,7 +89,7 @@ export function clamp(value: number, min: number, max: number): number {
 /**
  * Checks if ele is contained within the given bounds.
  * @param {Number} value
- * @param {Number} bound1 - does not have to be less than/eqal to bound2
+ * @param {Number} bound1 - does not have to be less than/equal to bound2
  * @param {Number} bound2
  * @returns {Boolean} - True/False
  */
@@ -160,6 +173,21 @@ export async function firstDefined<T>(...list: Array<() => Promise<T>>): Promise
     if (value !== undefined) { return value; }
   }
   return undefined;
+}
+
+/**
+ * Returns the number representation of `value`, or `defaultVal` if it cannot
+ * be represented as a valid number.
+ */
+export function numberOrDefault<T>(value: unknown, defaultVal: T): number | T {
+  if (typeof value === 'number') {
+    return !Number.isNaN(value) ? value : defaultVal;
+  } else if (typeof value === 'string') {
+    const maybeNumber = Number.parseFloat(value);
+    return !Number.isNaN(maybeNumber) ? maybeNumber : defaultVal;
+  } else {
+    return defaultVal;
+  }
 }
 
 /**
@@ -713,7 +741,7 @@ export function cloneFunc(fn: Function): Function {     // tslint:disable-line:b
 
 /**
  * Generates a random id using a sequence of uppercase alphanumeric characters
- * preceeded by an optional prefix.
+ * preceded by an optional prefix.
  */
 export function genRandomId(len: number, optPrefix?: string): string {
   const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
@@ -827,9 +855,9 @@ export async function waitGrainObs<T>(observable: Observable<T>,
 // `dom.style` does not work here because custom css property (ie: `--foo`) needs to be set using
 // `style.setProperty` (credit: https://vanseodesign.com/css/custom-properties-and-javascript/).
 // TODO: consider making PR to fix `dom.style` in grainjs.
-export function inlineStyle(property: string, valueObs: BindableValue<string>): DomElementMethod {
+export function inlineStyle(property: string, valueObs: BindableValue<any>): DomElementMethod {
   return (elem) => subscribeElem(elem, valueObs, (val) => {
-    elem.style.setProperty(property, val);
+    elem.style.setProperty(property, String(val ?? ''));
   });
 }
 
@@ -878,23 +906,44 @@ export function isColorDark(hexColor: string, isDarkBelow: number = 220): boolea
  * not accept neither short notation nor hex with transparency, ie: #aab, #aabb and #aabbaabb are
  * invalid.
  */
-export function isValidHex(val: string): boolean {
+export function isValidHex(val: unknown): val is string {
+  if (typeof val !== "string") {
+    return false;
+  }
+
   return /^#([0-9A-F]{6})$/i.test(val);
 }
 
+/**
+ * Resolves to true if promise is still pending after msec milliseconds have passed. Otherwise
+ * returns false, including when promise is rejected.
+ */
+export async function timeoutReached(
+  msec: number, promise: Promise<unknown>, options: {rethrow: boolean} = {rethrow: false}
+): Promise<boolean> {
+  const timedOut = {};
+  // Be careful to clean up the timer after ourselves, so it doesn't remain in the event loop.
+  let timer: NodeJS.Timer;
+  const delayPromise = new Promise<any>((resolve) => { timer = setTimeout(() => resolve(timedOut), msec); });
+  try {
+    const res = await Promise.race([promise, delayPromise]);
+    return res == timedOut;
+  } catch (err) {
+    if (options.rethrow) {
+      throw err;
+    }
+    return false;
+  } finally {
+    clearTimeout(timer!);
+  }
+}
 
 /**
  * Returns a promise that resolves to true if promise takes longer than timeoutMsec to resolve. If not
- * or if promise throws returns false.
+ * or if promise throws returns false. Same as timeoutReached(), with reversed order of arguments.
  */
-export async function isLongerThan(promise: Promise<any>, timeoutMsec: number): Promise<boolean> {
-  let isPending = true;
-  const done = () => { isPending = false; };
-  await Promise.race([
-    promise.then(done, done),
-    delay(timeoutMsec)
-  ]);
-  return isPending;
+export async function isLongerThan(promise: Promise<unknown>, timeoutMsec: number): Promise<boolean> {
+  return timeoutReached(timeoutMsec, promise);
 }
 
 /**
@@ -917,6 +966,13 @@ export function isNonNullish<T>(value: T | null | undefined): value is T {
 }
 
 /**
+ * Ensures that a value is truthy, with a type guard for the return type.
+ */
+export function truthy<T>(value: T | null | undefined): value is Exclude<T, false | "" | 0> {
+  return Boolean(value);
+}
+
+/**
  * Returns the value of both grainjs and knockout observable without creating a dependency.
  */
 export const unwrap: UseCB = (obs: ISubscribable) => {
@@ -924,6 +980,33 @@ export const unwrap: UseCB = (obs: ISubscribable) => {
     return obs.get();
   }
   return (obs as ko.Observable).peek();
+};
+
+/**
+ * Subscribes to BindableValue
+ */
+export function useBindable<T>(use: UseCBOwner, obs: BindableValue<T>): T {
+  if (obs === null || obs === undefined) { return obs; }
+
+  const smth = obs as any;
+
+  // If knockout
+  if (typeof smth === 'function' && 'peek' in smth) { return use(smth) as T; }
+  // If grainjs Observable or Computed
+  if (typeof smth === 'object' && '_getDepItem' in smth) { return use(smth) as T; }
+  // If use function ComputedCallback
+  if (typeof smth === 'function') { return smth(use) as T; }
+
+  return obs as T;
+}
+
+/**
+ * Useful helper for simple boolean negation.
+ */
+export const not = (obs: Observable<any>|IKnockoutReadObservable<any>|boolean|undefined|null) => (use: UseCBOwner) =>  {
+  if (typeof obs === 'boolean') { return !obs; }
+  if (obs === null || obs === undefined) { return true; }
+  return !use(obs);
 };
 
 /**
@@ -951,11 +1034,81 @@ export function assertIsDefined<T>(name: string, value: T): asserts value is Non
  * Calls function `fn`, passes any thrown errors to function `recover`, and finally calls `fn`
  * once more if `recover` doesn't throw.
  */
- export async function retryOnce<T>(fn: () => Promise<T>, recover: (e: unknown) => Promise<void>): Promise<T> {
+export async function retryOnce<T>(fn: () => Promise<T>, recover: (e: unknown) => Promise<void>): Promise<T> {
   try {
     return await fn();
   } catch (e) {
     await recover(e);
     return await fn();
+  }
+}
+
+/**
+ * Checks if value is 'empty' (like null, undefined, empty string, empty array/set/map, empty object).
+ * Values like 0, true, false are not empty.
+ */
+export function notSet(value: any) {
+  return value === undefined || value === null || value === ''
+         || (Array.isArray(value) && !value.length)
+         || (typeof value === 'object' && !Object.keys(value).length)
+         || (['[object Map]', '[object Set'].includes(value.toString()) && !value.size);
+}
+
+/**
+ * Checks if value is 'empty', if it is, returns the default value (which is null).
+ */
+export function ifNotSet(value: any, def: any = null) {
+  return notSet(value) ? def : value;
+}
+
+/**
+ * Creates a computed observable with a nested owner that can be used to dispose,
+ * any disposables created inside the computed. Similar to domComputedOwned method.
+ */
+export function computedOwned<T>(
+  owner: IDisposableOwner,
+  func: (owner: IDisposableOwner, use: UseCBOwner) => T
+): Computed<T> {
+  const holder = Holder.create(owner);
+  return Computed.create(owner, use => {
+    const computedOwner = MultiHolder.create(holder);
+    return func(computedOwner, use);
+  });
+}
+
+export type Constructor<T> = new (...args: any[]) => T;
+
+/**
+ * Simple memoization function that caches the result of a function call based on its arguments.
+ * Unlike lodash's memoize, it uses all arguments to generate the key.
+ */
+export function cached<T>(fn: T): T {
+  const dict = new Map();
+  const impl = (...args: any[]) => {
+    const key = JSON.stringify(args);
+    if (!dict.has(key)) {
+      dict.set(key, (fn as any)(...args));
+    }
+    return dict.get(key);
+  };
+  return impl as any as T;
+}
+
+/**
+ * Converts a duration string like "1d", "2h", "14m", "10s" to seconds.
+ */
+export function inSeconds(text: string): number {
+  const match = text.match(/^(\d+)([smhd])$/);
+  if (!match) {
+    throw new Error(`Invalid duration: ${text}`);
+  }
+  const [, value, unit] = match;
+  const seconds = parseInt(value, 10);
+  switch (unit) {
+    case 's': return seconds;
+    case 'm': return seconds * 60;
+    case 'h': return seconds * 60 * 60;
+    case 'd': return seconds * 60 * 60 * 24;
+    default: throw new Error(`Invalid duration unit: ${unit}`);
   }
 }

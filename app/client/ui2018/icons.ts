@@ -49,14 +49,14 @@
  *   `);
  */
 
-import { colors } from 'app/client/ui2018/cssVars';
+import { theme } from 'app/client/ui2018/cssVars';
 import { dom, DomElementArg, styled } from 'grainjs';
 import { IconName } from './IconList';
 
 /**
  * Defaults for all icons.
  */
-const iconDiv = styled('div', `
+const iconStyles = `
   position: relative;
   display: inline-block;
   vertical-align: middle;
@@ -65,27 +65,58 @@ const iconDiv = styled('div', `
   -webkit-mask-size: contain;
   width: 16px;
   height: 16px;
-  background-color: var(--icon-color, black);
-`);
+  background-color: var(--icon-color, var(--grist-theme-text, black));
+`;
 
-export const cssIconBackground = styled(iconDiv, `
-  background-color: var(--icon-background, inherit);
-  -webkit-mask: none;
-  & .${iconDiv.className} {
-    transition: inherit;
-    display: block;
-  }
-`);
+const iconColorStyles = `
+  position: relative;
+  display: inline-block;
+  vertical-align: middle;
+  width: 16px;
+  height: 16px;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: contain;
+`;
+
+const cssIconDiv = styled('div', iconStyles);
+
+const cssIconSpan = styled('span', iconStyles);
+
+const cssColorIcon = styled('div', iconColorStyles);
 
 export function icon(name: IconName, ...domArgs: DomElementArg[]): HTMLElement {
-  return iconDiv(
+  return cssIconDiv(
     dom.style('-webkit-mask-image', `var(--icon-${name})`),
     ...domArgs
   );
 }
 
+export function iconSpan(name: IconName, ...domArgs: DomElementArg[]): HTMLElement {
+  return cssIconSpan(
+    dom.style('-webkit-mask-image', `var(--icon-${name})`),
+    ...domArgs
+  );
+}
+
+export function colorIcon(name: IconName, ...domArgs: DomElementArg[]): HTMLElement {
+  return cssColorIcon(
+    dom.style('background-image', `var(--icon-${name})`),
+    ...domArgs
+  );
+}
+
+export const cssIconSpanBackground = styled(cssIconSpan, `
+  background-color: var(--icon-background, inherit);
+  -webkit-mask: none;
+  & .${cssIconSpan.className} {
+    transition: inherit;
+    display: block;
+  }
+`);
+
 /**
- * Container box for an slate-colored icon to serve as a button, with a grey background on hover.
+ * Container box for an icon to serve as a button..
  */
 export const cssIconButton = styled('div', `
   flex: none;
@@ -95,9 +126,9 @@ export const cssIconButton = styled('div', `
   border-radius: 3px;
   line-height: 0px;
   cursor: default;
-  --icon-color: ${colors.slate};
+  --icon-color: ${theme.controlSecondaryFg};
   &:hover, &.weasel-popup-open {
-    background-color: ${colors.darkGrey};
-    --icon-color: ${colors.slate};
+    background-color: ${theme.controlSecondaryHoverBg};
+    --icon-color: ${theme.controlSecondaryFg};
   }
 `);

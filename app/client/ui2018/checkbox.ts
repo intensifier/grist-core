@@ -15,22 +15,22 @@
  *  labeledSquareCheckbox(observable(false), 'Include other values', dom.prop('disabled', true)),
  */
 
-import { colors } from 'app/client/ui2018/cssVars';
-import { Computed, dom, DomArg, styled } from 'grainjs';
-import { Observable } from 'grainjs';
+import {testId, theme} from 'app/client/ui2018/cssVars';
+import {Computed, dom, DomArg, DomContents, DomElementArg, Observable, styled} from 'grainjs';
 
 export const cssLabel = styled('label', `
   position: relative;
   display: inline-flex;
   min-width: 0px;
   margin-bottom: 0px;
+  flex-shrink: 0;
 
   outline: none;
   user-select: none;
 
-  --color: ${colors.darkGrey};
+  --color: ${theme.checkboxBorder};
   &:hover {
-    --color: ${colors.hover};
+    --color: ${theme.checkboxBorderHover};
   }
 `);
 
@@ -53,19 +53,13 @@ export const cssCheckboxSquare = styled('input', `
   --radius: 3px;
 
   &:checked:enabled, &:indeterminate:enabled {
-    --color: ${colors.lightGreen};
+    --color: ${theme.controlPrimaryBg};
   }
 
   &:disabled {
-    --color: ${colors.darkGrey};
+    --color: ${theme.checkboxDisabledBg};
     cursor: not-allowed;
   }
-
-  .${cssLabel.className}:hover > &:checked:enabled,
-  .${cssLabel.className}:hover > &:indeterminate:enabled, {
-    --color: ${colors.darkGreen};
-  }
-
 
   &::before, &::after {
     content: '';
@@ -86,6 +80,14 @@ export const cssCheckboxSquare = styled('input', `
     background-color: var(--color);
   }
 
+  &:not(:checked):indeterminate::after {
+    -webkit-mask-image: var(--icon-Minus);
+  }
+
+  &:not(:disabled)::after {
+    background-color: ${theme.checkboxBg};
+  }
+
   &:checked::after, &:indeterminate::after {
     content: '';
     position: absolute;
@@ -95,15 +97,7 @@ export const cssCheckboxSquare = styled('input', `
     -webkit-mask-size: contain;
     -webkit-mask-position: center;
     -webkit-mask-repeat: no-repeat;
-    background-color: ${colors.light};
-  }
-
-  &:not(:checked):indeterminate::after {
-    -webkit-mask-image: var(--icon-Minus);
-  }
-
-  &:not(:disabled)::after {
-    background-color: ${colors.light};
+    background-color: ${theme.controlPrimaryFg};
   }
 `);
 
@@ -113,10 +107,11 @@ export const cssCheckboxCircle = styled(cssCheckboxSquare, `
 
 export const cssLabelText = styled('span', `
   margin-left: 8px;
-  color: ${colors.dark};
+  color: ${theme.text};
   font-weight: initial;   /* negate bootstrap */
   overflow: hidden;
   text-overflow: ellipsis;
+  line-height: 16px;
 `);
 
 type CheckboxArg = DomArg<HTMLInputElement>;
@@ -181,6 +176,61 @@ export function triStateSquareCheckbox(obs: Observable<TriState>, ...domArgs: Ch
 export function labeledTriStateSquareCheckbox(obs: Observable<TriState>, label: string, ...domArgs: CheckboxArg[]) {
   return triStateCheckbox(obs, cssCheckboxSquare, label, ...domArgs);
 }
+
+export function radioCheckboxOption<T>(selectedObservable: Observable<T>, optionId: T, content: DomContents) {
+  const selected = Computed.create(null, use => use(selectedObservable) === optionId)
+    .onWrite(val => val ? selectedObservable.set(optionId) : void 0);
+  return dom.update(
+    labeledCircleCheckbox(selected, content, dom.autoDispose(selected)),
+    testId(`option-${optionId}`),
+    cssBlockCheckbox.cls(''),
+    cssBlockCheckbox.cls('-block', selected),
+  );
+}
+
+export const cssRadioCheckboxOptions = styled('div', `
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+`);
+
+export function toggle(value: Observable<boolean|null>, ...domArgs: DomElementArg[]): DomContents {
+  return dom('div.widget_switch',
+    (elem) => elem.style.setProperty('--grist-actual-cell-color', theme.controlFg.toString()),
+    dom.hide((use) => use(value) === null),
+    dom.cls('switch_on', (use) => use(value) || false),
+    dom.cls('switch_transition', true),
+    dom.on('click', () => value.set(!value.get())),
+    dom('div.switch_slider'),
+    dom('div.switch_circle'),
+    ...domArgs
+  );
+}
+
+// We need to reset top and left of ::before element, as it is wrongly set
+// on the inline checkbox.
+// To simulate radio button behavior, we will block user input after option is selected, because
+// checkbox doesn't support two-way binding.
+const cssBlockCheckbox = styled('div', `
+  display: flex;
+  padding: 10px 8px;
+  border: 1px solid ${theme.controlSecondaryDisabledFg};
+  border-radius: 3px;
+  cursor: pointer;
+  & input::before, & input::after  {
+    top: unset;
+    left: unset;
+  }
+  &:hover {
+    border-color: ${theme.controlFg};
+  }
+  &-block {
+    pointer-events: none;
+  }
+  &-block a {
+    pointer-events: all;
+  }
+`);
 
 const cssInlineRelative = styled('div', `
   display: inline-block;

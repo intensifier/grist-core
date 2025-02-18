@@ -1,13 +1,14 @@
+# pylint: disable=line-too-long
 """
 Test of Summary tables grouped by ChoiceList columns.
 """
+import logging
 import column
-import logger
 import lookup
 import testutil
-from test_engine import EngineTestCase, Table, Column
+from test_engine import EngineTestCase, Table, Column, test_undo
 
-log = logger.Logger(__name__, logger.INFO)
+log = logging.getLogger(__name__)
 
 
 class TestSummaryChoiceList(EngineTestCase):
@@ -35,6 +36,7 @@ class TestSummaryChoiceList(EngineTestCase):
 
   # ----------------------------------------------------------------------
 
+  @test_undo
   def test_summary_by_choice_list(self):
     self.load_sample(self.sample)
 
@@ -143,22 +145,22 @@ class TestSummaryChoiceList(EngineTestCase):
       {
         '#summary#Source_summary_choices1': column.ReferenceListColumn,
         "#lookup#_Contains(value='#summary#Source_summary_choices1', match_empty=no_match_empty)":
-          lookup.ContainsLookupMapColumn,
+          lookup.LookupMapColumn,
         '#summary#Source_summary_choices1_choices2': column.ReferenceListColumn,
         "#lookup#_Contains(value='#summary#Source_summary_choices1_choices2', "
         "match_empty=no_match_empty)":
-          lookup.ContainsLookupMapColumn,
+          lookup.LookupMapColumn,
 
         # simple summary and lookup
         '#summary#Source_summary_other': column.ReferenceColumn,
-        '#lookup##summary#Source_summary_other': lookup.SimpleLookupMapColumn,
+        '#lookup##summary#Source_summary_other': lookup.LookupMapColumn,
 
         '#summary#Source_summary_choices1_other': column.ReferenceListColumn,
         "#lookup#_Contains(value='#summary#Source_summary_choices1_other', "
         "match_empty=no_match_empty)":
-          lookup.ContainsLookupMapColumn,
+          lookup.LookupMapColumn,
 
-        "#lookup#": lookup.SimpleLookupMapColumn,
+        "#lookup#": lookup.LookupMapColumn,
       }
     )
 
@@ -306,6 +308,7 @@ class TestSummaryChoiceList(EngineTestCase):
 
     self.assertTableData('Table1', data=summary_data, cols="subset")
 
+  @test_undo
   def test_change_choice_to_choicelist(self):
     sample = testutil.parse_test_sample({
       "SCHEMA": [
@@ -369,6 +372,7 @@ class TestSummaryChoiceList(EngineTestCase):
     self.assertTables([starting_table, summary_table])
     self.assertTableData('Source_summary_choices1', data=data)
 
+  @test_undo
   def test_rename_choices(self):
     self.load_sample(self.sample)
 

@@ -12,14 +12,28 @@ import mapValues = require('lodash/mapValues');
 import {ActionGroupOptions, ActionHistory, ActionHistoryUndoInfo, asActionGroup,
         asMinimalActionGroup} from './ActionHistory';
 import {ISQLiteDB, ResultRow} from './SQLiteDB';
+import { appSettings } from './AppSettings';
+
+const section = appSettings.section('history').section('action');
 
 // History will from time to time be pruned back to within these limits
 // on rows and the maximum total number of bytes in the "body" column.
 // Pruning is done when the history has grown above these limits, to
 // the specified factor.
-const ACTION_HISTORY_MAX_ROWS = 1000;
-const ACTION_HISTORY_MAX_BYTES = 1000 * 1000 * 1000;  // 1 GB.
-const ACTION_HISTORY_GRACE_FACTOR = 1.25;  // allow growth to 1250 rows / 1.25 GB.
+const ACTION_HISTORY_MAX_ROWS = section.flag('maxRows').requireInt({
+  envVar: 'GRIST_ACTION_HISTORY_MAX_ROWS',
+  defaultValue: 1000,
+
+  minValue: 1,
+});
+
+const ACTION_HISTORY_MAX_BYTES = section.flag('maxBytes').requireInt({
+  envVar: 'GRIST_ACTION_HISTORY_MAX_BYTES',
+  defaultValue: 1e9, // 1 GB.
+  minValue: 1,  // 1 B.
+});
+
+const ACTION_HISTORY_GRACE_FACTOR = 1.25;  // allow growth to 1.25 times the above limits.
 const ACTION_HISTORY_CHECK_PERIOD = 10;    // number of actions between size checks.
 
 /**
@@ -314,7 +328,7 @@ export class ActionHistoryImpl implements ActionHistory {
     } finally {
       if (tip) {
         await this._db.run(`UPDATE _gristsys_ActionHistoryBranch SET actionRef = ?
-                              WHERE name = "local_sent"`,
+                              WHERE name = 'local_sent'`,
                            tip);
       }
     }
@@ -336,7 +350,7 @@ export class ActionHistoryImpl implements ActionHistory {
       }
     }
     await this._db.run(`UPDATE _gristsys_ActionHistoryBranch SET actionRef = ?
-                          WHERE name = "shared"`,
+                          WHERE name = 'shared'`,
                        candidate.id);
     if (candidates.length === 1) {
       this._haveLocalSent = false;
@@ -405,9 +419,10 @@ export class ActionHistoryImpl implements ActionHistory {
   }
 
   public async getActions(actionNums: number[]): Promise<Array<LocalActionBundle|undefined>> {
-    const actions = await this._db.all(`SELECT actionHash, actionNum, body FROM _gristsys_ActionHistory
-                                         where actionNum in (${actionNums.map(x => '?').join(',')})`,
-                                       actionNums);
+    const actions = await this._db.all(
+      `SELECT actionHash, actionNum, body FROM _gristsys_ActionHistory
+       where actionNum in (${actionNums.map(x => '?').join(',')})`,
+      ...actionNums);
     return reportTimeTaken("getActions", () => {
       const actionsByActionNum = keyBy(actions, 'actionNum');
       return actionNums
@@ -516,7 +531,7 @@ export class ActionHistoryImpl implements ActionHistory {
                                        FROM _gristsys_ActionHistoryBranch as Branch
                                        LEFT JOIN _gristsys_ActionHistory as History
                                          ON History.id = Branch.actionRef
-                                       WHERE name in ("shared", "local_sent", "local_unsent")`);
+                                       WHERE name in ('shared', 'local_sent', 'local_unsent')`);
     const bits = mapValues(keyBy(rows, 'name'), this._asActionIdentifiers);
     const missing = { actionHash: null, actionRef: null, actionNum: null } as ActionIdentifiers;
     return {

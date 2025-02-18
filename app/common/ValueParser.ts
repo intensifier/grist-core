@@ -268,7 +268,8 @@ export function createParserOrFormatterArguments(
   const col = columnsTable.getRecord(colRef)!;
   let fieldOrCol: MetaRowRecord<'_grist_Tables_column' | '_grist_Views_section_field'> = col;
   if (fieldRef) {
-    fieldOrCol = fieldsTable.getRecord(fieldRef) || col;
+    const field = fieldsTable.getRecord(fieldRef);
+    fieldOrCol = field?.widgetOptions ? field : col;
   }
 
   return createParserOrFormatterArgumentsRaw(docData, col.type, fieldOrCol.widgetOptions, fieldOrCol.visibleCol);
@@ -354,6 +355,10 @@ export function parseUserAction(ua: UserAction, docData: DocData): UserAction {
       // (`col_values` is called `fields` in the API)
       ua = _parseUserActionColValues(ua, docData, false, 2);
       ua = _parseUserActionColValues(ua, docData, false, 3);
+      return ua;
+    case 'BulkAddOrUpdateRecord':
+      ua = _parseUserActionColValues(ua, docData, true, 2);
+      ua = _parseUserActionColValues(ua, docData, true, 3);
       return ua;
     default:
       return ua;

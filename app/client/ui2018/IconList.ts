@@ -4,6 +4,7 @@ export type IconName = "ChartArea" |
   "ChartKaplan" |
   "ChartLine" |
   "ChartPie" |
+  "TypeCalendar" |
   "TypeCard" |
   "TypeCardList" |
   "TypeCell" |
@@ -22,6 +23,7 @@ export type IconName = "ChartArea" |
   "FieldFunctionEqual" |
   "FieldInteger" |
   "FieldLink" |
+  "FieldMarkdown" |
   "FieldNumeric" |
   "FieldReference" |
   "FieldSpinner" |
@@ -36,22 +38,33 @@ export type IconName = "ChartArea" |
   "GoogleLogo" |
   "GristLogo" |
   "ThumbPreview" |
+  "AddUser" |
+  "ArrowLeft" |
+  "ArrowRight" |
+  "ArrowRightOutlined" |
   "BarcodeQR" |
   "BarcodeQR2" |
+  "Board" |
+  "Bookmark" |
   "CenterAlign" |
+  "Chat" |
+  "Clock" |
   "Code" |
   "Collapse" |
+  "Columns" |
   "Convert" |
   "Copy" |
   "CrossBig" |
   "CrossSmall" |
   "Database" |
+  "Desktop" |
   "Dots" |
   "Download" |
   "DragDrop" |
   "Dropdown" |
   "DropdownUp" |
   "Empty" |
+  "Exclamation" |
   "Expand" |
   "EyeHide" |
   "EyeShow" |
@@ -59,23 +72,37 @@ export type IconName = "ChartArea" |
   "Filter" |
   "FilterSimple" |
   "Fireworks" |
+  "Flag" |
   "Folder" |
+  "Folder2" |
   "FontBold" |
   "FontItalic" |
   "FontStrikethrough" |
   "FontUnderline" |
+  "FormConfig" |
   "FunctionResult" |
+  "GreenArrow" |
+  "Grow" |
+  "Headband" |
+  "Heart" |
   "Help" |
   "Home" |
   "Idea" |
   "Import" |
   "ImportArrow" |
   "Info" |
+  "Layers" |
   "LeftAlign" |
+  "Lighting" |
   "Lock" |
   "Log" |
   "Mail" |
+  "Maximize" |
+  "Memo" |
+  "Message" |
+  "Minimize" |
   "Minus" |
+  "Mobile" |
   "MobileChat" |
   "MobileChat2" |
   "NewNotification" |
@@ -84,33 +111,49 @@ export type IconName = "ChartArea" |
   "Page" |
   "PanelLeft" |
   "PanelRight" |
+  "Paragraph" |
   "Pencil" |
+  "Pin2" |
   "PinBig" |
   "PinSmall" |
+  "PinTilted" |
   "Pivot" |
   "PivotLight" |
   "Plus" |
+  "Popup" |
   "Public" |
   "PublicColor" |
   "PublicFilled" |
+  "Question" |
   "Redo" |
   "Remove" |
+  "RemoveBig" |
   "Repl" |
   "ResizePanel" |
+  "Revert" |
   "RightAlign" |
+  "Robot" |
   "Script" |
   "Search" |
+  "Section" |
+  "Separator" |
   "Settings" |
   "Share" |
+  "Skip" |
+  "Smiley" |
   "Sort" |
   "Sparks" |
+  "Star" |
   "Tick" |
   "TickSolid" |
   "Undo" |
   "Validation" |
   "Video" |
+  "VideoPlay" |
+  "VideoPlay2" |
   "Warning" |
   "Widget" |
+  "World" |
   "Wrap" |
   "Zoom" |
   "UseChart" |
@@ -130,6 +173,7 @@ export const IconList: IconName[] = ["ChartArea",
   "ChartKaplan",
   "ChartLine",
   "ChartPie",
+  "TypeCalendar",
   "TypeCard",
   "TypeCardList",
   "TypeCell",
@@ -148,6 +192,7 @@ export const IconList: IconName[] = ["ChartArea",
   "FieldFunctionEqual",
   "FieldInteger",
   "FieldLink",
+  "FieldMarkdown",
   "FieldNumeric",
   "FieldReference",
   "FieldSpinner",
@@ -162,22 +207,33 @@ export const IconList: IconName[] = ["ChartArea",
   "GoogleLogo",
   "GristLogo",
   "ThumbPreview",
+  "AddUser",
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowRightOutlined",
   "BarcodeQR",
   "BarcodeQR2",
+  "Board",
+  "Bookmark",
   "CenterAlign",
+  "Chat",
+  "Clock",
   "Code",
   "Collapse",
+  "Columns",
   "Convert",
   "Copy",
   "CrossBig",
   "CrossSmall",
   "Database",
+  "Desktop",
   "Dots",
   "Download",
   "DragDrop",
   "Dropdown",
   "DropdownUp",
   "Empty",
+  "Exclamation",
   "Expand",
   "EyeHide",
   "EyeShow",
@@ -185,23 +241,37 @@ export const IconList: IconName[] = ["ChartArea",
   "Filter",
   "FilterSimple",
   "Fireworks",
+  "Flag",
   "Folder",
+  "Folder2",
   "FontBold",
   "FontItalic",
   "FontStrikethrough",
   "FontUnderline",
+  "FormConfig",
   "FunctionResult",
+  "GreenArrow",
+  "Grow",
+  "Headband",
+  "Heart",
   "Help",
   "Home",
   "Idea",
   "Import",
   "ImportArrow",
   "Info",
+  "Layers",
   "LeftAlign",
+  "Lighting",
   "Lock",
   "Log",
   "Mail",
+  "Maximize",
+  "Memo",
+  "Message",
+  "Minimize",
   "Minus",
+  "Mobile",
   "MobileChat",
   "MobileChat2",
   "NewNotification",
@@ -210,33 +280,49 @@ export const IconList: IconName[] = ["ChartArea",
   "Page",
   "PanelLeft",
   "PanelRight",
+  "Paragraph",
   "Pencil",
+  "Pin2",
   "PinBig",
   "PinSmall",
+  "PinTilted",
   "Pivot",
   "PivotLight",
   "Plus",
+  "Popup",
   "Public",
   "PublicColor",
   "PublicFilled",
+  "Question",
   "Redo",
   "Remove",
+  "RemoveBig",
   "Repl",
   "ResizePanel",
+  "Revert",
   "RightAlign",
+  "Robot",
   "Script",
   "Search",
+  "Section",
+  "Separator",
   "Settings",
   "Share",
+  "Skip",
+  "Smiley",
   "Sort",
   "Sparks",
+  "Star",
   "Tick",
   "TickSolid",
   "Undo",
   "Validation",
   "Video",
+  "VideoPlay",
+  "VideoPlay2",
   "Warning",
   "Widget",
+  "World",
   "Wrap",
   "Zoom",
   "UseChart",

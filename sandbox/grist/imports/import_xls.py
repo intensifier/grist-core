@@ -4,8 +4,9 @@ and returns a object formatted so that it can be used by grist for a bulk add re
 """
 import logging
 
-import messytables
 import openpyxl
+from openpyxl.utils.datetime import from_excel
+from openpyxl.worksheet import _reader    # pylint:disable=no-name-in-module
 import six
 from six.moves import zip
 
@@ -13,6 +14,20 @@ import parse_data
 from imports import import_utils
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.WARNING)
+
+
+# Some strange Excel files have values that are marked as dates but are invalid as dates.
+# Normally, openpyxl converts these to `#VALUE!`, but keeping the original value is better.
+# In the case where this was encountered, the original value is a large number:
+# the 6281228502068 in test_excel_strange_dates.
+# Here we monkeypatch openpyxl to keep the original value.
+def new_from_excel(value, *args, **kwargs):
+  try:
+    return from_excel(value, *args, **kwargs)
+  except (ValueError, OverflowError):
+    return value
+_reader.from_excel = new_from_excel
 
 
 def import_file(file_source):
@@ -51,15 +66,10 @@ def parse_open_file(file_obj):
       # `if not any(row)` would be slightly faster, but would count `0` as empty.
       if not set(row) <= {None, ""}
     ]
-    sample = [
-      # Create messytables.Cells for the sake of messytables.headers_guess
-      [messytables.Cell(cell) for cell in row]
-      # Resetting dimensions via openpyxl causes rows to not be padded. Make sure
-      # sample rows are padded; get_table_data will handle padding the rest.
-      for row in _with_padding(rows[:1000])
-    ]
-    offset, headers = messytables.headers_guess(sample)
-    data_offset = offset + 1  # Add the header line
+    # Resetting dimensions via openpyxl causes rows to not be padded. Make sure
+    # sample rows are padded; get_table_data will handle padding the rest.
+    sample = _with_padding(rows[:1000])
+    data_offset, headers = import_utils.headers_guess(sample)
     rows = rows[data_offset:]
 
     # Make sure all header values are strings.

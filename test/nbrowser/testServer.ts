@@ -11,13 +11,14 @@
  * into a file whose path is printed when server starts.
  */
 import {encodeUrl, IGristUrlState, parseSubdomain} from 'app/common/gristUrls';
-import {HomeDBManager} from 'app/gen-server/lib/HomeDBManager';
+import {HomeDBManager} from 'app/gen-server/lib/homedb/HomeDBManager';
 import log from 'app/server/lib/log';
 import {getAppRoot} from 'app/server/lib/places';
 import {makeGristConfig} from 'app/server/lib/sendAppPage';
 import {exitPromise} from 'app/server/lib/serverUtils';
 import {connectTestingHooks, TestingHooksClient} from 'app/server/lib/TestingHooks';
 import {ChildProcess, execFileSync, spawn} from 'child_process';
+import EventEmitter from 'events';
 import * as fse from 'fs-extra';
 import {driver, IMochaServer, WebDriver} from 'mocha-webdriver';
 import fetch from 'node-fetch';
@@ -27,7 +28,7 @@ import {removeConnection} from 'test/gen-server/seed';
 import {HomeUtil} from 'test/nbrowser/homeUtil';
 import {getDatabase} from 'test/testUtils';
 
-export class TestServerMerged implements IMochaServer {
+export class TestServerMerged extends EventEmitter implements IMochaServer {
   public testDir: string;
   public testDocDir: string;
   public testingHooks: TestingHooksClient;
@@ -42,10 +43,12 @@ export class TestServerMerged implements IMochaServer {
   private _exitPromise: Promise<number|string>;
   private _starts: number = 0;
   private _dbManager?: HomeDBManager;
-  private _driver: WebDriver;
+  private _driver?: WebDriver;
 
   // The name is used to name the directory for server logs and data.
-  constructor(private _name: string) {}
+  constructor(private _name: string) {
+    super();
+  }
 
   public async start() {
     await this.restart(true);
@@ -55,20 +58,24 @@ export class TestServerMerged implements IMochaServer {
    * Restart the server.  If reset is set, the database is cleared.  If reset is not set,
    * the database is preserved, and the temporary directory is unchanged.
    */
-  public async restart(reset: boolean = false) {
+  public async restart(reset: boolean = false, quiet = false) {
     if (this.isExternalServer()) { return; }
     if (this._starts > 0) {
       this.resume();
       await this.stop();
     }
     this._starts++;
+    const workerIdText = process.env.MOCHA_WORKER_ID || '0';
     if (reset) {
+      // Make sure this test server doesn't keep using the DB that's about to disappear.
+      await this.closeDatabase();
+
       if (process.env.TESTDIR) {
-        this.testDir = process.env.TESTDIR;
+        this.testDir = path.join(process.env.TESTDIR, workerIdText);
       } else {
-        // Create a testDir of the form grist_test_{USER}_{SERVER_NAME}, removing any previous one.
+        // Create a testDir of the form grist_test_{USER}_{SERVER_NAME}_{WORKER_ID}, removing any previous one.
         const username = process.env.USER || "nobody";
-        this.testDir = path.join(tmpdir(), `grist_test_${username}_${this._name}`);
+        this.testDir = path.join(tmpdir(), `grist_test_${username}_${this._name}_${workerIdText}`);
         await fse.remove(this.testDir);
       }
     }
@@ -83,6 +90,10 @@ export class TestServerMerged implements IMochaServer {
     // immediately.  It is simplest to use a diffent socket each time
     // we restart.
     const testingSocket = path.join(this.testDir, `testing-${this._starts}.socket`);
+    if (testingSocket.length >= 104) {
+      // Unix socket paths typically can't be longer than this. Who knew. Make the error obvious.
+      throw new Error(`Path of testingSocket too long: ${testingSocket.length} (${testingSocket})`);
+    }
 
     const stubCmd = '_build/stubs/app/server/server';
     const isCore = await fse.pathExists(stubCmd + '.js');
@@ -95,9 +106,11 @@ export class TestServerMerged implements IMochaServer {
     // logging. Server code uses a global logger, so it's hard to separate out (especially so if
     // we ever run different servers for different tests).
     const serverLog = process.env.VERBOSE ? 'inherit' : nodeLogFd;
+    const workerId = parseInt(workerIdText, 10);
+    const corePort = String(8295 + workerId * 2);
+    const untrustedPort = String(8295 + workerId * 2 + 1);
     const env: Record<string, string> = {
       TYPEORM_DATABASE: this._getDatabaseFile(),
-      TEST_CLEAN_DATABASE: reset ? 'true' : '',
       GRIST_DATA_DIR: this.testDocDir,
       GRIST_INST_DIR: this.testDir,
       // uses the test installed plugins folder as the user installed plugins.
@@ -108,27 +121,33 @@ export class TestServerMerged implements IMochaServer {
       GRIST_MAX_UPLOAD_ATTACHMENT_MB: '2',
       // The following line only matters for testing with non-localhost URLs, which some tests do.
       GRIST_SERVE_SAME_ORIGIN: 'true',
-      APP_UNTRUSTED_URL : "http://localhost:18096",
       // Run with HOME_PORT, STATIC_PORT, DOC_PORT, DOC_WORKER_COUNT in the environment to override.
       ...(useSinglePort ? {
-        APP_HOME_URL: this.getHost(),
+        // APP_HOME_URL needed if proxyUrl is set, otherwise can be omitted.
+        ...(this._proxyUrl ? {
+          APP_HOME_URL: this.getHost()
+        } : undefined),
         GRIST_SINGLE_PORT: 'true',
       } : (isCore ? {
-        HOME_PORT: '8095',
-        STATIC_PORT: '8095',
-        DOC_PORT: '8095',
+        HOME_PORT: corePort,
+        STATIC_PORT: corePort,
+        DOC_PORT: corePort,
         DOC_WORKER_COUNT: '1',
-        PORT: '8095',
+        PORT: corePort,
+        APP_UNTRUSTED_URL: `http://localhost:${untrustedPort}`,
+        GRIST_SERVE_PLUGINS_PORT: untrustedPort,
       } : {
         HOME_PORT: '8095',
         STATIC_PORT: '8096',
         DOC_PORT: '8100',
         DOC_WORKER_COUNT: '5',
         PORT: '0',
+        APP_UNTRUSTED_URL : "http://localhost:18096",
       })),
       // This skips type-checking when running server, but reduces startup time a lot.
       TS_NODE_TRANSPILE_ONLY: 'true',
       ...process.env,
+      TEST_CLEAN_DATABASE: reset ? 'true' : '',
     };
     if (!process.env.REDIS_URL) {
       // Multiple doc workers only possible when redis is available.
@@ -136,8 +155,11 @@ export class TestServerMerged implements IMochaServer {
       delete env.DOC_WORKER_COUNT;
     }
     this._server = spawn('node', [cmd], {
-      env,
-      stdio: ['inherit', serverLog, serverLog],
+      env: {
+        ...env,
+        ...(process.env.SERVER_NODE_OPTIONS ? {NODE_OPTIONS: process.env.SERVER_NODE_OPTIONS} : {})
+      },
+      stdio: quiet ? 'ignore' : ['inherit', serverLog, serverLog],
     });
     this._exitPromise = exitPromise(this._server);
 
@@ -147,7 +169,7 @@ export class TestServerMerged implements IMochaServer {
 
     // Try to be more helpful when server exits by printing out the tail of its log.
     this._exitPromise.then((code) => {
-        if (this._server.killed) { return; }
+        if (this._server.killed || quiet) { return; }
         log.error("Server died unexpectedly, with code", code);
         const output = execFileSync('tail', ['-30', nodeLogPath]);
         log.info(`\n===== BEGIN SERVER OUTPUT ====\n${output}\n===== END SERVER OUTPUT =====`);
@@ -158,6 +180,7 @@ export class TestServerMerged implements IMochaServer {
 
     // Prepare testingHooks for certain behind-the-scenes interactions with the server.
     this.testingHooks = await connectTestingHooks(testingSocket);
+    this.emit('start');
   }
 
   public async stop() {
@@ -168,6 +191,7 @@ export class TestServerMerged implements IMochaServer {
       this.testingHooks.close();
     }
     await this._exitPromise;
+    this.emit('stop');
   }
 
   /**
@@ -176,6 +200,9 @@ export class TestServerMerged implements IMochaServer {
    * request takes a long time.
    */
   public async pauseUntil(callback: () => Promise<void>) {
+    if (this.isExternalServer()) {
+      throw new Error("Can't pause external server");
+    }
     log.info("Pausing node server");
     this._server.kill('SIGSTOP');
     try {
@@ -202,7 +229,11 @@ export class TestServerMerged implements IMochaServer {
     }
     const state: IGristUrlState = { org: team };
     const baseDomain = parseSubdomain(new URL(this.getHost()).hostname).base;
-    const gristConfig = makeGristConfig(this.getHost(), {}, baseDomain);
+    const gristConfig = makeGristConfig({
+      homeUrl: this.getHost(),
+      extra: {},
+      baseDomain,
+    });
     const url = encodeUrl(gristConfig, state, new URL(this.getHost())).replace(/\/$/, "");
     return `${url}${relPath}`;
   }
@@ -254,7 +285,7 @@ export class TestServerMerged implements IMochaServer {
   }
 
   // substitute a custom driver
-  public setDriver(customDriver: WebDriver = driver) {
+  public setDriver(customDriver?: WebDriver) {
     this._driver = customDriver;
   }
 
@@ -270,6 +301,11 @@ export class TestServerMerged implements IMochaServer {
    * Returns the path to the database.
    */
   private _getDatabaseFile(): string {
+    if (process.env.TYPEORM_TYPE === 'postgres') {
+      const db = process.env.TYPEORM_DATABASE;
+      if (!db) { throw new Error("Missing TYPEORM_DATABASE"); }
+      return db;
+    }
     return path.join(this.testDir, 'landing.db');
   }
 }

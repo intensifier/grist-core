@@ -1,7 +1,6 @@
 // tslint:disable:no-console
 // TODO: Add documentation and clean up log statements.
 
-import {CursorPos} from 'app/client/components/Cursor';
 import {GristDoc} from 'app/client/components/GristDoc';
 import {PageRec, ViewFieldRec, ViewSectionRec} from 'app/client/models/DocModel';
 import {reportError} from 'app/client/models/errors';
@@ -10,8 +9,12 @@ import {IDocPage} from 'app/common/gristUrls';
 import {nativeCompare, waitObs} from 'app/common/gutil';
 import {TableData} from 'app/common/TableData';
 import {BaseFormatter} from 'app/common/ValueFormatter';
+import { makeT } from 'app/client/lib/localization';
+import {CursorPos} from 'app/plugin/GristAPI';
 import {Computed, Disposable, Observable} from 'grainjs';
 import debounce = require('lodash/debounce');
+
+const t = makeT('SearchModel');
 
 /**
  * SearchModel used to maintain the state of the search UI.
@@ -128,7 +131,16 @@ class PageRecWrapper implements ISearchablePageRec {
 
   }
   public viewSections(): ViewSectionRec[] {
-    return this._page.view.peek().viewSections.peek().peek();
+    const sections = this._page.view.peek().viewSections.peek().peek();
+    const collapsed = new Set(this._page.view.peek().activeCollapsedSections.peek());
+    const activeSectionId = this._page.view.peek().activeSectionId.peek();
+    // If active section is collapsed, it means it is rendered in the popup, so narrow
+    // down the search to only it.
+    const inPopup = collapsed.has(activeSectionId);
+    if (inPopup) {
+      return sections.filter((s) => s.getRowId() === activeSectionId);
+    }
+    return sections.filter((s) => !collapsed.has(s.getRowId()));
   }
 
   public activeSectionId() {
@@ -192,7 +204,7 @@ class FinderImpl implements IFinder {
                               // sort in order that is the same as on the raw data list page,
                               .sort((a, b) => nativeCompare(a.tableNameDef.peek(), b.tableNameDef.peek()))
                               // get rawViewSection,
-                              .map(t => t.rawViewSection.peek())
+                              .map(table => table.rawViewSection.peek())
                               // and test if it isn't an empty record.
                               .filter(s => Boolean(s.id.peek()));
       // Pretend that those are pages.
@@ -209,7 +221,7 @@ class FinderImpl implements IFinder {
       // Else read all visible pages.
       const pages = this._gristDoc.docModel.visibleDocPages.peek();
       this._pageStepper.array = pages.map(p => new PageRecWrapper(p, this._openDocPageCB));
-      this._pageStepper.index = pages.findIndex(t => t.viewRef.peek() === this._gristDoc.activeViewId.get());
+      this._pageStepper.index = pages.findIndex(page => page.viewRef.peek() === this._gristDoc.activeViewId.get());
       if (this._pageStepper.index < 0) { return false; }
     }
 
@@ -305,14 +317,18 @@ class FinderImpl implements IFinder {
   private _initNewSectionShown() {
     this._initNewSectionCommon();
     const viewInstance = this._sectionStepper.value.viewInstance.peek()!;
-    this._rowStepper.array = viewInstance.sortedRows.getKoArray().peek() as number[];
+    const skip = ['chart'].includes(this._sectionStepper.value.parentKey.peek());
+    this._rowStepper.array = skip ? [] : viewInstance.sortedRows.getKoArray().peek() as number[];
   }
 
   private async _initNewSectionAny() {
     const tableModel = this._initNewSectionCommon();
 
     const viewInstance = this._sectionStepper.value.viewInstance.peek();
-    if (viewInstance) {
+    const skip = ['chart'].includes(this._sectionStepper.value.parentKey.peek());
+    if (skip) {
+      this._rowStepper.array = [];
+    } else if (viewInstance) {
       this._rowStepper.array = viewInstance.sortedRows.getKoArray().peek() as number[];
     } else {
       // If we are searching through another page (not currently loaded), we will NOT have a
@@ -455,7 +471,7 @@ export class SearchModelImpl extends Disposable implements SearchModel {
     this.autoDispose(this.multiPage.addListener(v => { if (v) { this.noMatch.set(false); } }));
 
     this.allLabel = Computed.create(this, use => use(this._gristDoc.activeViewId) === 'data' ?
-        'Search all tables' : 'Search all pages');
+      t('Search all tables') : t('Search all pages'));
 
     // Schedule a search restart when user changes pages (otherwise search would resume from the
     // previous page that is not shown anymore). Also revert noMatch flag when in single page mode.

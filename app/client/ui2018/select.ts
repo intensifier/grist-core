@@ -1,4 +1,4 @@
-import {colors, vars} from 'app/client/ui2018/cssVars';
+import {theme, vars} from 'app/client/ui2018/cssVars';
 import {styled} from 'grainjs';
 
 // Import popweasel so that the styles we define here are included later in CSS, and take priority
@@ -19,12 +19,12 @@ export const cssSelectBtn = styled('div', `
   width: 100%;
   height: 30px;
   line-height: 16px;
-  background-color: white;
-  color: ${colors.dark};
-  --icon-color: ${colors.dark};
+  background-color: ${theme.selectButtonBg};
+  color: ${theme.selectButtonFg};
+  --icon-color: ${theme.selectButtonFg};
   font-size: ${vars.mediumFontSize};
   padding: 5px;
-  border: 1px solid ${colors.darkGrey};
+  border: 1px solid ${theme.selectButtonBorder};
   border-radius: 3px;
   cursor: pointer;
   overflow: hidden;
@@ -41,8 +41,9 @@ export const cssSelectBtn = styled('div', `
     box-shadow: 0px 0px 2px 2px #5E9ED6;
   }
 
-  &.disabled {
-    color: grey;
-    cursor: pointer;
+  &.disabled, &-disabled {
+    opacity: 0.4;
+    pointer-events: none;
+    cursor: default;
   }
 `);

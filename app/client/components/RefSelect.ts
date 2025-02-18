@@ -4,14 +4,16 @@ import * as tableUtil from 'app/client/lib/tableUtil';
 import {ColumnRec, DocModel, ViewFieldRec} from 'app/client/models/DocModel';
 import {KoSaveableObservable} from 'app/client/models/modelUtil';
 import {cssFieldEntry, cssFieldLabel} from 'app/client/ui/VisibleFieldsConfig';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {testId, theme} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
-import {menuText} from 'app/client/ui2018/menus';
+import {menu, menuItem, menuText} from 'app/client/ui2018/menus';
 import {FieldBuilder} from 'app/client/widgets/FieldBuilder';
 import * as gutil from 'app/common/gutil';
 import {Disposable, dom, fromKo, styled} from 'grainjs';
 import ko from 'knockout';
-import {menu, menuItem} from 'popweasel';
+import {makeT} from 'app/client/lib/localization';
+
+const t = makeT('RefSelect');
 
 interface Item {
   label: string;
@@ -44,8 +46,8 @@ export class RefSelect extends Disposable {
     // Indicates whether this is a ref col that references a different table.
     // (That's the only time when RefSelect is offered.)
     this.isForeignRefCol = this.autoDispose(ko.computed(() => {
-      const t = this._origColumn.refTable();
-      return Boolean(t && t.getRowId() !== this._origColumn.parentId());
+      const table = this._origColumn.refTable();
+      return Boolean(table && table.getRowId() !== this._origColumn.parentId());
     }));
 
     // Computed for the current fieldBuilder's field, if it exists.
@@ -86,7 +88,7 @@ export class RefSelect extends Disposable {
       testId('ref-select'),
       dom.forEach(fromKo(this._added.getObservable()), (col) =>
         cssFieldEntry(
-          cssFieldLabel(dom.text(col.label)),
+          cssColumnLabel(dom.text(col.label)),
           cssRemoveIcon('Remove',
             dom.on('click', () => this._removeFormulaField(col)),
             testId('ref-select-remove'),
@@ -94,7 +96,7 @@ export class RefSelect extends Disposable {
           testId('ref-select-item'),
         )
       ),
-      cssAddLink(cssAddIcon('Plus'), 'Add Column',
+      cssAddLink(cssAddIcon('Plus'), t("Add Column"),
         menu(() => [
           ...this._validCols.peek()
             .filter((col) => !this._addedSet.peek().has(col.colId.peek()))
@@ -102,7 +104,7 @@ export class RefSelect extends Disposable {
               menuItem(() => this._addFormulaField({ label: col.label(), value: col.colId() }),
                 col.label.peek())
             ),
-          cssEmptyMenuText("No columns to add"),
+          cssEmptyMenuText(t("No columns to add")),
           testId('ref-select-menu'),
         ]),
         testId('ref-select-add'),
@@ -166,7 +168,7 @@ export class RefSelect extends Disposable {
     this._getReferrerFields(item.value).forEach(refField => {
       const sectionId = this._fieldObs()!.viewSection().getRowId();
       if (refField.column().viewFields().all()
-          .filter(field => !field.viewSection().isRaw())
+          .filter(field => !field.viewSection().isRaw() && !field.viewSection().isRecordCard())
           .some(field => field.parentId() !== sectionId)) {
         // The col has fields in other sections, remove only the fields in this section.
         return this._docModel.viewFields.sendTableAction(['RemoveRecord', refField.getRowId()]);
@@ -230,15 +232,15 @@ const cssEmptyMenuText = styled(menuText, `
 const cssAddLink = styled('div', `
   display: flex;
   cursor: pointer;
-  color: ${colors.lightGreen};
-  --icon-color: ${colors.lightGreen};
+  color: ${theme.controlFg};
+  --icon-color: ${theme.controlFg};
 
   &:not(:first-child) {
     margin-top: 8px;
   }
   &:hover, &:focus, &:active {
-    color: ${colors.darkGreen};
-    --icon-color: ${colors.darkGreen};
+    color: ${theme.controlHoverFg};
+    --icon-color: ${theme.controlHoverFg};
   }
 `);
 
@@ -254,4 +256,8 @@ const cssRemoveIcon = styled(icon, `
   .${cssFieldEntry.className}:hover & {
     display: block;
   }
+`);
+
+const cssColumnLabel = styled(cssFieldLabel, `
+  line-height: 16px;
 `);

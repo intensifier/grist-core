@@ -1,6 +1,7 @@
 import {bigBasicButton, bigPrimaryButton} from 'app/client/ui2018/buttons';
 import {squareCheckbox} from 'app/client/ui2018/checkbox';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {testId, theme} from 'app/client/ui2018/cssVars';
+import {makeLinks} from 'app/client/ui2018/links';
 import {cssModalButtons} from 'app/client/ui2018/modals';
 import {ParseOptionSchema} from 'app/plugin/FileParserAPI';
 import {Computed, dom, DomContents, IDisposableOwner, input, Observable, styled} from 'grainjs';
@@ -60,7 +61,7 @@ export function buildParseOptionsForm(
   return [
     cssParseOptionForm(
       items.map((item) => cssParseOption(
-        cssParseOptionName(item.label),
+        cssParseOptionName(makeLinks(item.label)),
         optionToInput(owner, item.type, optionsMap.get(item.name)!),
         testId('parseopts-opt'),
       )),
@@ -68,7 +69,7 @@ export function buildParseOptionsForm(
     cssModalButtons(
       dom.domComputed((use) => items.every((item) => use(optionsMap.get(item.name)!) === values[item.name]),
         (unchanged) => (unchanged ?
-          bigBasicButton('Back to preview', dom.on('click', doCancel), testId('parseopts-back')) :
+          bigBasicButton('Close', dom.on('click', doCancel), testId('parseopts-back')) :
           bigPrimaryButton('Update preview', dom.on('click', () => doUpdate(collectParseOptions())),
             testId('parseopts-update'))
         )
@@ -107,12 +108,18 @@ const cssParseOptionName = styled('div', `
   margin-bottom: 8px;
 `);
 const cssInputText = styled(input, `
+  color: ${theme.inputFg};
+  background-color: ${theme.inputBg};
   position: relative;
   display: inline-block;
   outline: none;
   height: 28px;
-  border: 1px solid ${colors.darkGrey};
+  border: 1px solid ${theme.inputBorder};
   border-radius: 3px;
   padding: 0 6px;
   width: 100%;
+
+  &::placeholder {
+    color: ${theme.inputPlaceholderFg};
+  }
 `);

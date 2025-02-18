@@ -6,18 +6,6 @@ import re
 import six
 
 import actions
-import logger
-
-def limit_log_stderr(min_level):
-  """
-  Returns a log handler suitable for logger.set_handler(), which logs using log_stderr but only
-  messages at the given level or higher.
-  """
-  def handler(level, name, msg):
-    if level >= min_level:
-      logger.log_stderr(level, name, msg)
-  return handler
-
 
 def table_data_from_rows(table_id, col_names, rows):
   """
@@ -30,6 +18,17 @@ def table_data_from_rows(table_id, col_names, rows):
     column_values[col.lstrip('@')] = [row[i] for row in rows]
   return actions.TableData(table_id, column_values.pop('id'), column_values)
 
+
+def table_data_from_row_dicts(table_id, row_dict_list):
+  """
+  Returns a TableData object built from table_id and a list of dictionaries, one per row, mapping
+  column names to cell values.
+  """
+  col_ids = {'id': None}    # Collect the set of col_ids. Use a dict for predictable order.
+  for row in row_dict_list:
+    col_ids.update({c: None for c in row})
+  column_values = {col: [row.get(col) for row in row_dict_list] for col in col_ids}
+  return actions.TableData(table_id, column_values.pop('id'), column_values)
 
 
 def parse_testscript(script_path=None):

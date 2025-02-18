@@ -1,26 +1,36 @@
+import {detectCurrentLang, makeT} from 'app/client/lib/localization';
+import {checkName} from 'app/client/lib/nameUtils';
 import {AppModel, reportError} from 'app/client/models/AppModel';
 import {urlState} from 'app/client/models/gristUrlState';
+import * as css from 'app/client/ui/AccountPageCss';
 import {ApiKey} from 'app/client/ui/ApiKey';
 import {AppHeader} from 'app/client/ui/AppHeader';
 import {buildChangePasswordDialog} from 'app/client/ui/ChangePasswordDialog';
+import {DeleteAccountDialog} from 'app/client/ui/DeleteAccountDialog';
+import {translateLocale} from 'app/client/ui/LanguageMenu';
 import {leftPanelBasic} from 'app/client/ui/LeftPanelCommon';
 import {MFAConfig} from 'app/client/ui/MFAConfig';
 import {pagePanels} from 'app/client/ui/PagePanels';
+import {ThemeConfig} from 'app/client/ui/ThemeConfig';
 import {createTopBarHome} from 'app/client/ui/TopBar';
 import {transientInput} from 'app/client/ui/transientInput';
-import {cssBreadcrumbs, cssBreadcrumbsLink, separator} from 'app/client/ui2018/breadcrumbs';
+import {cssBreadcrumbs, separator} from 'app/client/ui2018/breadcrumbs';
 import {labeledSquareCheckbox} from 'app/client/ui2018/checkbox';
-import {icon} from 'app/client/ui2018/icons';
-import {colors, vars} from 'app/client/ui2018/cssVars';
+import {cssLink} from 'app/client/ui2018/links';
+import {select} from 'app/client/ui2018/menus';
+import {getPageTitleSuffix} from 'app/common/gristUrls';
+import {getGristConfig} from 'app/common/urlUtils';
 import {FullUser} from 'app/common/UserAPI';
-import {Computed, Disposable, dom, domComputed, makeTestId, Observable, styled} from 'grainjs';
+import {Computed, Disposable, dom, domComputed, makeTestId, Observable, styled, subscribe} from 'grainjs';
 
 const testId = makeTestId('test-account-page-');
+const t = makeT('AccountPage');
 
 /**
  * Creates the account page where a user can manage their profile settings.
  */
 export class AccountPage extends Disposable {
+  private readonly _currentPage = Computed.create(this, urlState().state, (_use, s) => s.account);
   private _apiKey = Observable.create<string>(this, '');
   private _userObs = Observable.create<FullUser|null>(this, null);
   private _isEditingName = Observable.create(this, false);
@@ -31,6 +41,7 @@ export class AccountPage extends Disposable {
 
   constructor(private _appModel: AppModel) {
     super();
+    this._setPageTitle();
     this._fetchAll().catch(reportError);
   }
 
@@ -41,24 +52,42 @@ export class AccountPage extends Disposable {
         panelWidth: Observable.create(this, 240),
         panelOpen,
         hideOpener: true,
-        header: dom.create(AppHeader, this._appModel.currentOrgName, this._appModel),
+        header: dom.create(AppHeader, this._appModel),
         content: leftPanelBasic(this._appModel, panelOpen),
       },
       headerMain: this._buildHeaderMain(),
       contentMain: this._buildContentMain(),
+      testId,
     });
   }
 
   private _buildContentMain() {
+    const {enableCustomCss} = getGristConfig();
+    const supportedLngs = getGristConfig().supportedLngs ?? ['en'];
+    const languageOptions = supportedLngs
+      .map((lng) => ({value: lng, label: translateLocale(lng)!}))
+      .sort((a, b) => a.value.localeCompare(b.value));
+
+    const userLocale = Computed.create(this, use => {
+      const selected = detectCurrentLang();
+      if (!supportedLngs.includes(selected)) { return 'en'; }
+      return selected;
+    });
+    userLocale.onWrite(async value => {
+      await this._appModel.api.updateUserLocale(value || null);
+      // Reload the page to apply the new locale.
+      window.location.reload();
+    });
+
     return domComputed(this._userObs, (user) => user && (
-      cssContainer(cssAccountPage(
-        cssHeader('Account settings'),
-        cssDataRow(
-          cssSubHeader('Email'),
-          cssEmail(user.email),
+      css.container(css.accountPage(
+        css.header(t("Account settings")),
+        css.dataRow(
+          css.inlineSubHeader(t("Email")),
+          css.email(user.email),
         ),
-        cssDataRow(
-          cssSubHeader('Name'),
+        css.dataRow(
+          css.inlineSubHeader(t("Name")),
           domComputed(this._isEditingName, (isEditing) => (
             isEditing ? [
               transientInput(
@@ -67,18 +96,18 @@ export class AccountPage extends Disposable {
                   save: (val) => this._isNameValid.get() && this._updateUserName(val),
                   close: () => { this._isEditingName.set(false); this._nameEdit.set(''); },
                 },
-                { size: '5' }, // Lower size so that input can shrink below ~152px.
+                {size: '5'}, // Lower size so that input can shrink below ~152px.
                 dom.on('input', (_ev, el) => this._nameEdit.set(el.value)),
-                cssFlexGrow.cls(''),
+                css.flexGrow.cls(''),
               ),
-              cssTextBtn(
-                cssIcon('Settings'), 'Save',
+              css.textBtn(
+                css.icon('Settings'), t("Save"),
                 // No need to save on 'click'. The transient input already does it on close.
               ),
             ] : [
-              cssName(user.name),
-              cssTextBtn(
-                cssIcon('Settings'), 'Edit',
+              css.name(user.name),
+              css.textBtn(
+                css.icon('Settings'), t("Edit"),
                 dom.on('click', () => this._isEditingName.set(true)),
               ),
             ]
@@ -86,52 +115,66 @@ export class AccountPage extends Disposable {
           testId('username'),
         ),
         // show warning for invalid name but not for the empty string
-        dom.maybe(use => use(this._nameEdit) && !use(this._isNameValid), cssWarnings),
-        cssHeader('Password & Security'),
-        cssDataRow(
-          cssSubHeader('Login Method'),
-          cssLoginMethod(user.loginMethod),
-          user.loginMethod === 'Email + Password' ? cssTextBtn('Change Password',
+        dom.maybe(use => use(this._nameEdit) && !use(this._isNameValid), this._buildNameWarningsDom.bind(this)),
+        css.header(t("Password & Security")),
+        css.dataRow(
+          css.inlineSubHeader(t("Login Method")),
+          css.loginMethod(user.loginMethod),
+          user.loginMethod === 'Email + Password' ? css.textBtn(t("Change Password"),
             dom.on('click', () => this._showChangePasswordDialog()),
           ) : null,
           testId('login-method'),
         ),
         user.loginMethod !== 'Email + Password' ? null : dom.frag(
-          cssDataRow(
+          css.dataRow(
             labeledSquareCheckbox(
               this._allowGoogleLogin,
-              'Allow signing in to this account with Google',
+              t("Allow signing in to this account with Google"),
               testId('allow-google-login-checkbox'),
             ),
             testId('allow-google-login'),
           ),
-          cssSubHeaderFullWidth('Two-factor authentication'),
-          cssDescription(
-            "Two-factor authentication is an extra layer of security for your Grist account designed " +
-            "to ensure that you're the only person who can access your account, even if someone " +
-            "knows your password."
+          css.subHeader(t("Two-factor authentication")),
+          css.description(
+            t("Two-factor authentication is an extra layer of security for your Grist account \
+designed to ensure that you're the only person who can access your account, even if someone knows your password.")
           ),
           dom.create(MFAConfig, user),
         ),
-        cssHeader('API'),
-        cssDataRow(cssSubHeader('API Key'), cssContent(
+        css.header(t("Theme")),
+        // Custom CSS is incompatible with custom themes.
+        enableCustomCss ? null : dom.create(ThemeConfig, this._appModel),
+        css.subHeader(t("Language")),
+        css.dataRow({ style: 'width: 300px'},
+          select(userLocale, languageOptions, {
+            renderOptionArgs: () => {
+              return dom.cls(cssFirstUpper.className);
+            }
+          }),
+          testId('language'),
+        ),
+        css.header(t("API")),
+        css.dataRow(css.inlineSubHeader(t("API Key")), css.content(
           dom.create(ApiKey, {
             apiKey: this._apiKey,
             onCreate: () => this._createApiKey(),
             onDelete: () => this._deleteApiKey(),
             anonymous: false,
-            inputArgs: [{ size: '5' }], // Lower size so that input can shrink below ~152px.
+            inputArgs: [{size: '5'}], // Lower size so that input can shrink below ~152px.
           })
         )),
-      ),
+        !getGristConfig().canCloseAccount ? null : [
+            dom.create(DeleteAccountDialog, user),
+        ],
+),
       testId('body'),
     )));
   }
 
   private _buildHeaderMain() {
     return dom.frag(
-      cssBreadcrumbs({ style: 'margin-left: 16px;' },
-        cssBreadcrumbsLink(
+      cssBreadcrumbs({style: 'margin-left: 16px;'},
+        cssLink(
           urlState().setLinkUrl({}),
           'Home',
           testId('home'),
@@ -183,124 +226,36 @@ export class AccountPage extends Disposable {
   private _showChangePasswordDialog() {
     return buildChangePasswordDialog();
   }
-}
 
-/**
- * We allow alphanumeric characters and certain common whitelisted characters (except at the start),
- * plus everything non-ASCII (for non-English alphabets, which we want to allow but it's hard to be
- * more precise about what exactly to allow).
- */
-// eslint-disable-next-line no-control-regex
-const VALID_NAME_REGEXP = /^(\w|[^\u0000-\u007F])(\w|[- ./'"()]|[^\u0000-\u007F])*$/;
-
-/**
- * Test name against various rules to check if it is a valid username.
- */
-export function checkName(name: string): boolean {
-  return VALID_NAME_REGEXP.test(name);
-}
-
-/**
- * Builds dom to show marning messages to the user.
- */
-function buildNameWarningsDom() {
-  return cssWarning(
-    "Names only allow letters, numbers and certain special characters",
-    testId('username-warning'),
-  );
-}
-
-const cssContainer = styled('div', `
-  display: flex;
-  justify-content: center;
-  overflow: auto;
-`);
-
-const cssHeader = styled('div', `
-  height: 32px;
-  line-height: 32px;
-  margin: 28px 0 16px 0;
-  color: ${colors.dark};
-  font-size: ${vars.xxxlargeFontSize};
-  font-weight: ${vars.headerControlTextWeight};
-`);
-
-const cssAccountPage = styled('div', `
-  max-width: 600px;
-  padding: 16px;
-`);
-
-const cssDataRow = styled('div', `
-  margin: 8px 0px;
-  display: flex;
-  align-items: baseline;
-`);
-
-const cssSubHeaderFullWidth = styled('div', `
-  padding: 8px 0;
-  display: inline-block;
-  vertical-align: top;
-  font-weight: bold;
-`);
-
-const cssSubHeader = styled(cssSubHeaderFullWidth, `
-  min-width: 110px;
-`);
-
-const cssContent = styled('div', `
-  flex: 1 1 300px;
-`);
-
-const cssTextBtn = styled('button', `
-  font-size: ${vars.mediumFontSize};
-  color: ${colors.lightGreen};
-  cursor: pointer;
-  margin-left: 16px;
-  background-color: transparent;
-  border: none;
-  padding: 0;
-  text-align: left;
-  min-width: 110px;
-
-  &:hover {
-    color: ${colors.darkGreen};
+  /**
+  * Builds dom to show marning messages to the user.
+  */
+  private _buildNameWarningsDom() {
+    return cssWarnings(
+      t("Names only allow letters, numbers and certain special characters"),
+      testId('username-warning'),
+    );
   }
-`);
 
-const cssIcon = styled(icon, `
-  background-color: ${colors.lightGreen};
-  margin: 0 4px 2px 0;
-
-  .${cssTextBtn.className}:hover > & {
-    background-color: ${colors.darkGreen};
+  private _setPageTitle() {
+    this.autoDispose(subscribe(this._currentPage, (_use, page): string => {
+      const suffix = getPageTitleSuffix(getGristConfig());
+      switch (page) {
+        case undefined:
+        case 'account': {
+          return document.title = `Account${suffix}`;
+        }
+      }
+    }));
   }
-`);
+}
 
-const cssWarnings = styled(buildNameWarningsDom, `
+const cssWarnings = styled(css.warning, `
   margin: -8px 0 0 110px;
 `);
 
-const cssDescription = styled('div', `
-  color: #8a8a8a;
-  font-size: 13px;
-`);
-
-const cssFlexGrow = styled('div', `
-  flex-grow: 1;
-`);
-
-const cssName = styled(cssFlexGrow, `
-  word-break: break-word;
-`);
-
-const cssEmail = styled('div', `
-  word-break: break-word;
-`);
-
-const cssLoginMethod = styled(cssFlexGrow, `
-  word-break: break-word;
-`);
-
-const cssWarning = styled('div', `
-  color: red;
+const cssFirstUpper = styled('div', `
+  & > div::first-letter {
+    text-transform: capitalize;
+  }
 `);

@@ -1,7 +1,10 @@
 import {CellValue} from "app/common/DocActions";
-import {FilterState, isRangeFilter, makeFilterState} from "app/common/FilterState";
+import {FilterState, IRangeBoundType, isRangeFilter, makeFilterState} from "app/common/FilterState";
 import {decodeObject} from "app/plugin/objtypes";
-import {isDateLikeType, isList, isListType, isNumberType} from "./gristTypes";
+import moment, { Moment } from "moment-timezone";
+import {extractInfoFromColType, isDateLikeType, isList, isListType, isNumberType} from "app/common/gristTypes";
+import {isRelativeBound, relativeDateToUnixTimestamp} from "app/common/RelativeDates";
+import noop from "lodash/noop";
 
 export type ColumnFilterFunc = (value: CellValue) => boolean;
 
@@ -11,8 +14,16 @@ export function makeFilterFunc(state: FilterState,
                                columnType: string = ''): ColumnFilterFunc {
 
   if (isRangeFilter(state)) {
-    const {min, max} = state;
+    let {min, max} = state;
     if (isNumberType(columnType) || isDateLikeType(columnType)) {
+
+      if (isDateLikeType(columnType)) {
+        const info = extractInfoFromColType(columnType);
+        const timezone = (info.type === 'DateTime' && info.timezone) || 'utc';
+        min = changeTimezone(min, timezone, m => m.startOf('day'));
+        max = changeTimezone(max, timezone, m => m.endOf('day'));
+      }
+
       return (val) => {
         if (typeof val !== 'number') { return false; }
         return (
@@ -49,4 +60,16 @@ export function makeFilterFunc(state: FilterState,
 export function buildColFilter(filterJson: string | undefined,
                                columnType?: string): ColumnFilterFunc | null {
   return filterJson ? makeFilterFunc(makeFilterState(filterJson), columnType) : null;
+}
+
+// Returns the unix timestamp for date in timezone. Function support relative date. Also support
+// optional mod argument that let you modify date as a moment instance.
+function changeTimezone(date: IRangeBoundType,
+                        timezone: string,
+                        mod: (m: Moment) => void = noop): number|undefined {
+  if (date === undefined) { return undefined; }
+  const val = isRelativeBound(date) ? relativeDateToUnixTimestamp(date) : date;
+  const m = moment.tz(val * 1000, timezone);
+  mod(m);
+  return Math.floor(m.valueOf() / 1000);
 }

@@ -18,7 +18,7 @@
 import { ACItem } from 'app/client/lib/ACIndex';
 import { modKeyProp } from 'app/client/lib/browserInfo';
 import { Autocomplete, IAutocompleteOptions } from 'app/client/lib/autocomplete';
-import { colors, testId } from 'app/client/ui2018/cssVars';
+import { colors, testId, theme } from 'app/client/ui2018/cssVars';
 import { icon } from 'app/client/ui2018/icons';
 import { csvDecodeRow, csvEncodeRow } from 'app/common/csvFormat';
 import { computedArray, IDisposableCtor, IObsArraySplice, ObsArray, obsArray, Observable } from 'grainjs';
@@ -652,14 +652,14 @@ const cssToken = styled('div', `
   position: relative;
   flex: none;
   border-radius: 3px;
-  background-color: ${colors.mediumGreyOpaque};
+  background-color: ${theme.choiceTokenBg};
   padding: 4px;
   margin: 3px 2px;
   user-select: none;
   cursor: grab;
 
   &.selected {
-    background-color: ${colors.darkGrey};
+    background-color: ${theme.choiceTokenSelectedBg};
   }
   &.token-dragging {
     pointer-events: none;
@@ -679,6 +679,8 @@ const cssInputWrapper = styled('div', `
 `);
 
 const cssTokenInput = styled('input', `
+  color: ${theme.cellEditorFg};
+  background-color: ${theme.cellEditorBg};
   flex: auto;
   -webkit-appearance: none;
   -moz-appearance: none;
@@ -708,7 +710,7 @@ const cssDragTarget = styled('div', `
   &:hover::after {
     content: "";
     position: absolute;
-    background-color: ${colors.lightGreen};
+    background-color: ${theme.controlFg};
     width: 2px;
     top: 0px;
     bottom: 0px;
@@ -738,7 +740,7 @@ const cssVerticalDragTarget = styled('div', `
   &:hover::after {
     content: "";
     position: absolute;
-    background-color: ${colors.lightGreen};
+    background-color: ${theme.controlFg};
     height: 2px;
     top: -5px;
     bottom: 0px;

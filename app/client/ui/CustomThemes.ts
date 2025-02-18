@@ -1,7 +1,19 @@
-import {GristLoadConfig} from 'app/common/gristUrls';
+// TODO: document this all, no tests are exercising this code.
+
+import {getGristConfig} from 'app/common/urlUtils';
 import {styled} from 'grainjs';
 
-export type ProductFlavor = 'grist' | 'efcr' | 'fieldlink';
+/**
+ * Is this grist installation or someone's modified installation. We allow modifying logo
+ * at the right corner, and making it wider (removing site switcher in the process).
+ *
+ * If fieldLink, shows wide logo and hides the switcher, otherwise shows the regular logo.
+ *
+ * We can convert any org name to a ProductFlavor and any ProductFlavor to a CustomTheme.
+ *
+ * TODO: explain what is fieldlink, I think this is an user of custom Grist build.
+ */
+export type ProductFlavor = 'grist' | 'fieldlink';
 
 export interface CustomTheme {
   bodyClassName?: string;
@@ -14,15 +26,15 @@ export function getFlavor(org?: string): ProductFlavor {
   const themeOrg = new URLSearchParams(window.location.search).get('__themeOrg');
   if (themeOrg) { org = themeOrg; }
 
-  if (!org) {
-    const gristConfig: GristLoadConfig = (window as any).gristConfig;
-    org = gristConfig && gristConfig.org;
-  }
+  // If still not set, use the org from the config.
+  org ||= getGristConfig()?.org;
+
+  // If the org is 'fieldlink', use the fieldlink flavor.
   if (org === 'fieldlink') {
     return 'fieldlink';
-  } else if (org && /^nioxus(-.*)?$/.test(org)) {
-    return 'efcr';
   }
+
+  // For any other situation, use the grist flavor.
   return 'grist';
 }
 
@@ -33,24 +45,10 @@ export function getTheme(flavor: ProductFlavor): CustomTheme {
         wideLogo: true,
         bodyClassName: cssFieldLinkBody.className,
       };
-    case 'efcr':
-      return {bodyClassName: cssEfcrBody.className};
     default:
       return {};
   }
 }
-
-const cssEfcrBody = styled('body', `
-  --icon-GristLogo: url("icons/logo-efcr.png");
-  --grist-logo-bg: #009975;
-  --grist-color-light-green: #009975;
-  --grist-color-dark-green: #007F61;
-  --grist-primary-fg: #009975;
-  --grist-primary-fg-hover: #007F61;
-  --grist-control-fg: #009975;
-  --grist-color-darker-green: #004C38;
-  --grist-color-dark-bg: #004C38;
-`);
 
 const cssFieldLinkBody = styled('body', `
   --icon-GristLogo: url("icons/logo-fieldlink.png");

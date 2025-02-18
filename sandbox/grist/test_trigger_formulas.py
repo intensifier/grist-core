@@ -1,6 +1,9 @@
 import copy
+import logging
 import time
-import logger
+
+import six
+
 import objtypes
 import testutil
 import test_engine
@@ -8,7 +11,7 @@ from schema import RecalcWhen
 
 # pylint: disable=line-too-long
 
-log = logger.Logger(__name__, logger.INFO)
+log = logging.getLogger(__name__)
 
 def column_error(table, column, user_input):
   return objtypes.RaisedException(
@@ -354,7 +357,7 @@ class TestTriggerFormulas(test_engine.EngineTestCase):
     ])
 
     # ModifyColumn doesn't trigger recalcs.
-    out_actions = self.apply_user_action(["ModifyColumn", "Creatures", "Size", {type: 'Numeric'}])
+    out_actions = self.apply_user_action(["ModifyColumn", "Creatures", "Size", {"type": 'Numeric'}])
     self.assertEqual(out_actions.calls, {})
 
 
@@ -562,24 +565,28 @@ class TestTriggerFormulas(test_engine.EngineTestCase):
     user1 = {
       'Name': 'Foo Bar',
       'UserID': 1,
+      'UserRef': '1',
       'StudentInfo': ['Students', 1],
       'LinkKey': {},
       'Origin': None,
       'Email': 'foo.bar@getgrist.com',
       'Access': 'owners',
       'SessionID': 'u1',
-      'IsLoggedIn': True
+      'IsLoggedIn': True,
+      'ShareRef': None
     }
     user2 = {
       'Name': 'Baz Qux',
       'UserID': 2,
+      'UserRef': '2',
       'StudentInfo': ['Students', 1],
       'LinkKey': {},
       'Origin': None,
       'Email': 'baz.qux@getgrist.com',
       'Access': 'owners',
       'SessionID': 'u2',
-      'IsLoggedIn': True
+      'IsLoggedIn': True,
+      'ShareRef': None
     }
     # Use formula to store last modified by data (user name and email). Check that it works as expected.
     self.load_sample(self.sample)
@@ -669,8 +676,20 @@ class TestTriggerFormulas(test_engine.EngineTestCase):
       ["id",  "A",  "B",  "C"],
       [1,     0,    0,    div_error(0)],
     ])
+    message = 'float division by zero'
+    if six.PY3:
+      message += """
+
+A `ZeroDivisionError` occurs when you are attempting to divide a value
+by zero either directly or by using some other mathematical operation.
+
+You are dividing by the following term
+
+    rec.A
+
+which is equal to zero."""
     self.assertFormulaError(self.engine.get_formula_error('Math', 'C', 1),
-                            ZeroDivisionError, 'float division by zero',
+                            ZeroDivisionError, message,
                             r"1/rec\.A \+ 1/rec\.B")
     self.update_record("Math", 1, A=1)
 
@@ -682,7 +701,6 @@ class TestTriggerFormulas(test_engine.EngineTestCase):
     ])
     error = self.engine.get_formula_error('Math', 'C', 1)
     self.assertFormulaError(error, ZeroDivisionError, 'float division by zero')
-    self.assertEqual(error._message, 'float division by zero')
     self.assertEqual(error.details, objtypes.RaisedException(ZeroDivisionError()).no_traceback().details)
 
 

@@ -8,6 +8,8 @@ if (window._gristAppLoaded) {
 }
 window._gristAppLoaded = true;
 
+const {setupLocale} = require('./lib/localization');
+
 const {App} = require('./ui/App');
 
 // Disable longStackTraces, which seem to be enabled in the browser by default.
@@ -28,7 +30,14 @@ $(function() {
     if (event.persisted) { window.location.reload(); }
   };
 
-  window.gristApp = App.create(null);
+  const localeSetup = setupLocale();
+  // By the time dom ready is fired, resource files should already be loaded, but
+  // if that is not the case, we will redirect to an error page by throwing an error.
+  localeSetup.then(() => {
+    window.gristApp = App.create(null);
+  }).catch(error => {
+    throw new Error(`Failed to load locale: ${error?.message || 'Unknown error'}`);
+  })
   // Set from the login tests to stub and un-stub functions during execution.
   window.loginTestSandbox = null;
 
@@ -36,14 +45,8 @@ $(function() {
   window.exposeModulesForTests = function() {
     return (import('./exposeModulesForTests' /* webpackChunkName: "modulesForTests" */));
   };
-  window.exposedModules = {
-    // Several existing tests use window.exposedModules.loadScript has loaded
-    // a file for them.  We now load exposedModules asynchronously, so that it
-    // doesn't slow down application startup.  To avoid changing tests
-    // unnecessarily, we implement a loadScript wrapper.
-    loadScript(name) {
-      return window.exposeModulesForTests()
-        .then(() => window.exposedModules._loadScript(name));
-    }
-  };
+  window.exposedModules = {};
+  // Make it easy for tests to use loadScript() whether or not exposedModules has already loaded.
+  window.loadScript = (name) =>
+    window.exposeModulesForTests().then(() => window.exposedModules.loadScript.loadScript(name));
 });

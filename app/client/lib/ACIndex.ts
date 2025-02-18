@@ -10,11 +10,19 @@
 import {localeCompare, nativeCompare, sortedIndex} from 'app/common/gutil';
 import {DomContents} from 'grainjs';
 import escapeRegExp = require("lodash/escapeRegExp");
+import deburr = require("lodash/deburr");
+import split = require("lodash/split");
 
 export interface ACItem {
   // This should be a trimmed lowercase version of the item's text. It may be an accessor.
-  // Note that items with empty cleanText are never suggested.
   cleanText: string;
+}
+
+// Returns a trimmed, lowercase version of a string,
+// from which accents and other diacritics have been removed,
+// so that autocomplete is case- and accent-insensitive.
+export function normalizeText(text: string): string {
+  return deburr(text).trim().toLowerCase();
 }
 
 // Regexp used to split text into words; includes nearly all punctuation. This means that
@@ -43,6 +51,9 @@ export interface ACResults<Item extends ACItem> {
   // Matching items in order from best match to worst.
   items: Item[];
 
+  // Additional items to show (e.g. the "Add New" item, for Choice and Reference fields).
+  extraItems: Item[];
+
   // May be used to highlight matches using buildHighlightedDom().
   highlightFunc: HighlightFunc;
 
@@ -56,6 +67,19 @@ interface Word {
   pos: number;      // Position of the word within the item where it occurred.
 }
 
+export interface ACIndexOptions {
+  /** The max number of items to suggest. Defaults to 50. */
+  maxResults?: number;
+  /**
+   * Suggested matches in the same relative order as items, rather than by score.
+   *
+   * Defaults to false.
+   */
+  keepOrder?: boolean;
+  /** Show items with an empty `cleanText`. Defaults to false. */
+  showEmptyItems?: boolean;
+}
+
 /**
  * Implements a search index. It doesn't currently support updates; when any values change, the
  * index needs to be rebuilt from scratch.
@@ -66,11 +90,12 @@ export class ACIndexImpl<Item extends ACItem> implements ACIndex<Item> {
   // All words from _allItems, sorted.
   private _words: Word[];
 
+  private _maxResults = this._options.maxResults ?? 50;
+  private _keepOrder = this._options.keepOrder ?? false;
+  private _showEmptyItems = this._options.showEmptyItems ?? false;
+
   // Creates an index for the given list of items.
-  // The max number of items to suggest may be set using _maxResults (default is 50).
-  // If _keepOrder is true, best matches will be suggested in the order they occur in items,
-  // rather than order by best score.
-  constructor(items: Item[], private _maxResults: number = 50, private _keepOrder = false) {
+  constructor(items: Item[], private _options: ACIndexOptions = {}) {
     this._allItems = items.slice(0);
 
     // Collects [word, occurrence, position] tuples for all words in _allItems.
@@ -91,7 +116,7 @@ export class ACIndexImpl<Item extends ACItem> implements ACIndex<Item> {
   // The main search function. SearchText will be cleaned (trimmed and lowercased) at the start.
   // Empty search text returns the first N items in the search universe.
   public search(searchText: string): ACResults<Item> {
-    const cleanedSearchText = searchText.trim().toLowerCase();
+    const cleanedSearchText = normalizeText(searchText);
     const searchWords = cleanedSearchText.split(wordSepRegexp).filter(w => w);
 
     // Maps item index in _allItems to its score.
@@ -123,7 +148,9 @@ export class ACIndexImpl<Item extends ACItem> implements ACIndex<Item> {
 
     // Append enough non-matching indices to reach maxResults.
     for (let i = 0; i < this._allItems.length && itemIndices.length < this._maxResults; i++) {
-      if (this._allItems[i].cleanText && !myMatches.has(i)) {
+      if (myMatches.has(i)) { continue; }
+
+      if (this._allItems[i].cleanText || this._showEmptyItems) {
         itemIndices.push(i);
       }
     }
@@ -135,7 +162,7 @@ export class ACIndexImpl<Item extends ACItem> implements ACIndex<Item> {
 
     if (!cleanedSearchText) {
       // In this case we are just returning the first few items.
-      return {items, highlightFunc: highlightNone, selectIndex: -1};
+      return {items, extraItems: [], highlightFunc: highlightNone, selectIndex: -1};
     }
 
     const highlightFunc = highlightMatches.bind(null, searchWords);
@@ -146,7 +173,7 @@ export class ACIndexImpl<Item extends ACItem> implements ACIndex<Item> {
     if (selectIndex >= 0 && !startsWithText(items[selectIndex], cleanedSearchText, searchWords)) {
       selectIndex = -1;
     }
-    return {items, highlightFunc, selectIndex};
+    return {items, extraItems: [], highlightFunc, selectIndex};
   }
 
   /**
@@ -235,11 +262,17 @@ function highlightMatches(searchWords: string[], text: string): string[] {
   for (let i = 0; i < textParts.length; i += 2) {
     const word = textParts[i];
     const separator = textParts[i + 1] || '';
-    const prefixLen = findLongestPrefixLen(word.toLowerCase(), searchWords);
+    // deburr (remove diacritics) was used to produce searchWords, so `word` needs to match that.
+    const prefixLen = findLongestPrefixLen(deburr(word).toLowerCase(), searchWords);
     if (prefixLen === 0) {
       outputs[outputs.length - 1] += word + separator;
     } else {
-      outputs.push(word.slice(0, prefixLen), word.slice(prefixLen) + separator);
+      // Split into unicode 'characters' that keep diacritics combined
+      const chars = split(word, '');
+      outputs.push(
+        chars.slice(0, prefixLen).join(''),
+        chars.slice(prefixLen).join('') + separator
+      );
     }
   }
   return outputs;

@@ -2,45 +2,61 @@ import { ALL_PERMISSION_PROPS } from 'app/common/ACLPermissions';
 import { ACLRuleCollection, SPECIAL_RULES_TABLE_ID } from 'app/common/ACLRuleCollection';
 import { ActionGroup } from 'app/common/ActionGroup';
 import { createEmptyActionSummary } from 'app/common/ActionSummary';
-import { ServerQuery } from 'app/common/ActiveDocAPI';
+import { ApplyUAExtendedOptions, ServerQuery } from 'app/common/ActiveDocAPI';
 import { ApiError } from 'app/common/ApiError';
+import { MapWithTTL } from 'app/common/AsyncCreate';
 import {
   AddRecord,
   BulkAddRecord,
   BulkColValues,
   BulkRemoveRecord,
   BulkUpdateRecord,
+  getColValues,
+  isBulkAddRecord,
+  isBulkRemoveRecord,
+  isBulkUpdateRecord,
+  isUpdateRecord,
 } from 'app/common/DocActions';
+import { AttachmentColumns, gatherAttachmentIds, getAttachmentColumns } from 'app/common/AttachmentColumns';
 import { RemoveRecord, ReplaceTableData, UpdateRecord } from 'app/common/DocActions';
 import { CellValue, ColValues, DocAction, getTableId, isSchemaAction } from 'app/common/DocActions';
-import { TableDataAction, UserAction } from 'app/common/DocActions';
+import { getColIdsFromDocAction, TableDataAction, UserAction } from 'app/common/DocActions';
 import { DocData } from 'app/common/DocData';
 import { UserOverride } from 'app/common/DocListAPI';
 import { DocUsageSummary, FilteredDocUsageSummary } from 'app/common/DocUsage';
 import { normalizeEmail } from 'app/common/emails';
 import { ErrorWithCode } from 'app/common/ErrorWithCode';
-import { AclMatchInput, InfoEditor, InfoView } from 'app/common/GranularAccessClause';
-import { UserInfo } from 'app/common/GranularAccessClause';
+import { InfoEditor } from 'app/common/GranularAccessClause';
 import * as gristTypes from 'app/common/gristTypes';
 import { getSetMapValue, isNonNullish, pruneArray } from 'app/common/gutil';
-import { SingleCell } from 'app/common/TableData';
+import { compilePredicateFormula, PredicateFormulaInput } from 'app/common/PredicateFormula';
+import { MetaRowRecord, SingleCell } from 'app/common/TableData';
+import { EmptyRecordView, InfoView, RecordView } from 'app/common/RecordView';
 import { canEdit, canView, isValidRole, Role } from 'app/common/roles';
+import { User } from 'app/common/User';
 import { FullUser, UserAccessData } from 'app/common/UserAPI';
-import { HomeDBManager } from 'app/gen-server/lib/HomeDBManager';
+import { HomeDBManager } from 'app/gen-server/lib/homedb/HomeDBManager';
 import { GristObjCode } from 'app/plugin/GristData';
-import { compileAclFormula } from 'app/server/lib/ACLFormula';
 import { DocClients } from 'app/server/lib/DocClients';
-import { getDocSessionAccess, getDocSessionAltSessionId, getDocSessionUser,
-         OptDocSession } from 'app/server/lib/DocSession';
-import { DocStorage } from 'app/server/lib/DocStorage';
+import { OptDocSession } from 'app/server/lib/DocSession';
+import { DocStorage, REMOVE_UNUSED_ATTACHMENTS_DELAY } from 'app/server/lib/DocStorage';
 import log from 'app/server/lib/log';
-import { IPermissionInfo, PermissionInfo, PermissionSetWithContext } from 'app/server/lib/PermissionInfo';
+import { IPermissionInfo, MixedPermissionSetWithContext,
+         PermissionInfo, PermissionSetWithContext } from 'app/server/lib/PermissionInfo';
 import { TablePermissionSetWithContext } from 'app/server/lib/PermissionInfo';
 import { integerParam } from 'app/server/lib/requestUtils';
 import { getRelatedRows, getRowIdsFromDocAction } from 'app/server/lib/RowAccess';
+import {
+  getAltSessionId,
+  getDocSessionAccess,
+  getDocSessionShare,
+  getFullUser,
+} from 'app/server/lib/sessionUtils';
+import { quoteIdent } from 'app/server/lib/SQLiteDB';
 import cloneDeep = require('lodash/cloneDeep');
 import fromPairs = require('lodash/fromPairs');
 import get = require('lodash/get');
+import memoize = require('lodash/memoize');
 
 // tslint:disable:no-bitwise
 
@@ -77,28 +93,34 @@ function isAclTable(tableId: string): boolean {
   return ['_grist_ACLRules', '_grist_ACLResources'].includes(tableId);
 }
 
+const ADD_OR_UPDATE_RECORD_ACTIONS = ['AddOrUpdateRecord', 'BulkAddOrUpdateRecord'];
+
+function isAddOrUpdateRecordAction([actionName]: UserAction): boolean {
+  return ADD_OR_UPDATE_RECORD_ACTIONS.includes(String(actionName));
+}
+
 // A list of key metadata tables that need special handling.  Other metadata tables may
 // refer to material in some of these tables but don't need special handling.
 // TODO: there are other metadata tables that would need access control, or redesign -
 // specifically _grist_Attachments.
 const STRUCTURAL_TABLES = new Set(['_grist_Tables', '_grist_Tables_column', '_grist_Views',
                                    '_grist_Views_section', '_grist_Views_section_field',
-                                   '_grist_ACLResources', '_grist_ACLRules']);
+                                   '_grist_ACLResources', '_grist_ACLRules',
+                                   '_grist_Shares']);
 
 // Actions that won't be allowed (yet) for a user with nuanced access to a document.
-// A few may be innocuous, but generally I've put them in this list if there are problems
-// tracking down what table the refer to, or they could allow creation/modification of a
-// formula, and are not handled elsewhere.
+// A few may be innocuous, but that hasn't been figured out yet.
 const SPECIAL_ACTIONS = new Set(['InitNewDoc',
                                  'EvalCode',
                                  'UpdateSummaryViewSection',
                                  'DetachSummaryViewSection',
                                  'GenImporterView',
+                                 'MakeImportTransformColumns',
+                                 'FillTransformRuleColIds',
                                  'TransformAndFinishImport',
                                  'AddView',
-                                 'CopyFromColumn',
-                                 'ConvertFromColumn',
                                  'AddHiddenColumn',
+                                 'RespondToRequests',
                                 ]);
 
 // Odd-ball actions marked as deprecated or which seem unlikely to be used.
@@ -109,6 +131,87 @@ const SURPRISING_ACTIONS = new Set([
 
 // Actions we'll allow unconditionally for now.
 const OK_ACTIONS = new Set(['Calculate', 'UpdateCurrentTime']);
+
+// Other actions that are believed to be compatible with granular access.
+// Only add an action to OTHER_RECOGNIZED_ACTIONS if you know access control
+// has been handled for it, or it is clear that access control can be done
+// by looking at the Create/Update/Delete permissions for the DocActions it
+// will create.
+const OTHER_RECOGNIZED_ACTIONS = new Set([
+  // Data actions.
+  'AddRecord',
+  'BulkAddRecord',
+  'UpdateRecord',
+  'BulkUpdateRecord',
+  'RemoveRecord',
+  'BulkRemoveRecord',
+  'ReplaceTableData',
+
+  // Data actions handled specially because of read needs.
+  'AddOrUpdateRecord',
+  'BulkAddOrUpdateRecord',
+
+  // Certain column actions are handled specially because of reads that
+  // don't fit the pattern of data actions.
+  'ConvertFromColumn',
+  'CopyFromColumn',
+
+  // Groups of actions.
+  'ApplyDocActions',
+  'ApplyUndoActions',
+
+  // Column-level schema changes.
+  'AddColumn',
+  'AddVisibleColumn',
+  'RemoveColumn',
+  'RenameColumn',
+  'ModifyColumn',
+  'AddReverseColumn',
+
+  // Table-level schema changes.
+  'AddEmptyTable',
+  'AddTable',
+  'AddRawTable',
+  'RemoveTable',
+  'RenameTable',
+
+  // A schema action handled specially because of read needs.
+  'DuplicateTable',
+
+  // Display column support.
+  'SetDisplayFormula',
+  'MaybeCopyDisplayFormula',
+
+  // Sundry misc.
+  'RenameChoices',
+  'AddEmptyRule',
+  'CreateViewSection',
+  'RemoveViewSection',
+]);
+
+// When an attachment is uploaded, it isn't immediately added to a cell in
+// the document. We grant the uploader a special period where they can freely
+// add or re-add the attachment to the document without access control fuss.
+// We keep that period within the time range where an unused attachment
+// would get deleted.
+const UPLOADED_ATTACHMENT_OWNERSHIP_PERIOD =
+  (REMOVE_UNUSED_ATTACHMENTS_DELAY.delayMs - REMOVE_UNUSED_ATTACHMENTS_DELAY.varianceMs) / 2;
+
+// When a user undoes their own action or actions, checks of attachment ownership
+// are handled specially. This special handling will not apply for undoes of actions
+// older than this limit.
+const HISTORICAL_ATTACHMENT_OWNERSHIP_PERIOD = 24 * 60 * 60 * 1000;
+
+// Transform columns are special. In case we have some rules defined they are only visible
+// to those with SCHEMA_EDIT permission.
+const TRANSFORM_COLUMN_PREFIXES = ['gristHelper_Converted', 'gristHelper_Transform'];
+
+/**
+ * Checks if this is a special helper column used during type conversion.
+ */
+function isTransformColumn(colId: string): boolean {
+  return TRANSFORM_COLUMN_PREFIXES.some(prefix => colId.startsWith(prefix));
+}
 
 interface DocUpdateMessage {
   actionGroup: ActionGroup;
@@ -145,10 +248,11 @@ export interface GranularAccessForBundle {
  *    (the UserAction has been compiled to DocActions).
  *  - canApplyBundle(), called when DocActions have been produced from UserActions,
  *    but before those DocActions have been applied to the DB.  If fails, the modification
- *    will be abandoned.
+ *    will be abandoned. This method will also finalize some bundle state,
+ *    specifically the `maybeHasShareChanges` flag.
  *  - appliedBundle(), called when DocActions have been applied to the DB, but before
  *    those changes have been sent to clients.
- *  - sendDocUpdateforBundle() is called once a bundle has been applied, to notify
+ *  - sendDocUpdateForBundle() is called once a bundle has been applied, to notify
  *    client of changes.
  *  - finishedBundle(), called when completely done with modification and any needed
  *    client notifications, whether successful or failed.
@@ -163,6 +267,7 @@ export class GranularAccess implements GranularAccessForBundle {
   // garbage-collection once docSession is no longer in use.
   private _userAttributesMap = new WeakMap<OptDocSession, UserAttributes>();
   private _prevUserAttributesMap: WeakMap<OptDocSession, UserAttributes>|undefined;
+  private _attachmentUploads = new MapWithTTL<number, string>(UPLOADED_ATTACHMENT_OWNERSHIP_PERIOD);
 
   // When broadcasting a sequence of DocAction[]s, this contains the state of
   // affected rows for the relevant table before and after each DocAction.  It
@@ -185,6 +290,9 @@ export class GranularAccess implements GranularAccessForBundle {
     // Flag for whether doc actions mention a rule change, even if passive due to
     // schema changes.
     hasAnyRuleChange: boolean,
+    maybeHasShareChanges: boolean,
+    options: ApplyUAExtendedOptions|null,
+    shareRef?: number;
   }|null;
 
   public constructor(
@@ -197,8 +305,13 @@ export class GranularAccess implements GranularAccessForBundle {
     private _docId: string) {
   }
 
+  public async close() {
+    this._attachmentUploads.clear();
+  }
+
   public getGranularAccessForBundle(docSession: OptDocSession, docActions: DocAction[], undo: DocAction[],
-                                    userActions: UserAction[], isDirect: boolean[]): void {
+                                    userActions: UserAction[], isDirect: boolean[],
+                                    options: ApplyUAExtendedOptions|null): void {
     if (this._activeBundle) { throw new Error('Cannot start a bundle while one is already in progress'); }
     // This should never happen - attempts to write to a pre-fork session should be
     // caught by an Authorizer.  But let's be paranoid, since we may be pretending to
@@ -207,12 +320,14 @@ export class GranularAccess implements GranularAccessForBundle {
     if (docSession.forkingAsOwner) { throw new Error('Should never modify a prefork'); }
     this._activeBundle = {
       docSession, docActions, undo, userActions, isDirect,
-      applied: false, hasDeliberateRuleChange: false, hasAnyRuleChange: false
+      applied: false, hasDeliberateRuleChange: false, hasAnyRuleChange: false,
+      maybeHasShareChanges: false,
+      options,
     };
     this._activeBundle.hasDeliberateRuleChange =
       scanActionsRecursively(userActions, (a) => isAclTable(String(a[1])));
     this._activeBundle.hasAnyRuleChange =
-      scanActionsRecursively(docActions, (a) => isAclTable(String(a[1])));
+      scanActionsRecursively(docActions, a => actionHasRuleChange(a));
   }
 
   /**
@@ -225,13 +340,124 @@ export class GranularAccess implements GranularAccessForBundle {
     this._userAttributesMap = new WeakMap();
   }
 
-  public getUser(docSession: OptDocSession): Promise<UserInfo> {
-    return this._getUser(docSession);
+  /**
+   * Construct the UserInfo needed for evaluating rules. This also enriches the user with values
+   * created by user-attribute rules.
+   */
+  public async getUser(docSession: OptDocSession): Promise<User> {
+    const linkParameters = docSession.authorizer?.getLinkParameters() || {};
+    let access: Role | null;
+    let fullUser: FullUser | null;
+    const attrs = this._getUserAttributes(docSession);
+    access = getDocSessionAccess(docSession);
+
+    const linkId = getDocSessionShare(docSession);
+    let shareRef: number = 0;
+    if (linkId) {
+      const rowIds = this._docData.getMetaTable('_grist_Shares').filterRowIds({
+        linkId,
+      });
+      if (rowIds.length > 1) {
+        throw new Error('Share identifier is not unique');
+      }
+      if (rowIds.length === 1) {
+        shareRef = rowIds[0];
+      }
+    }
+
+    if (docSession.forkingAsOwner) {
+      // For granular access purposes, we become an owner.
+      // It is a bit of a bluff, done on the understanding that this session will
+      // never be used to edit the document, and that any edits will be done on a
+      // fork.
+      access = 'owners';
+    }
+
+    // If aclAsUserId/aclAsUser is set, then override user for acl purposes.
+    if (linkParameters.aclAsUserId || linkParameters.aclAsUser) {
+      if (access !== 'owners') { throw new ErrorWithCode('ACL_DENY', 'only an owner can override user'); }
+      if (attrs.override) {
+        // Used cached properties.
+        access = attrs.override.access;
+        fullUser = attrs.override.user;
+      } else {
+        attrs.override = await this._getViewAsUser(linkParameters);
+        fullUser = attrs.override.user;
+      }
+    } else {
+      fullUser = getFullUser(docSession);
+    }
+    const user = new User();
+    user.Access = access;
+    user.ShareRef = shareRef || null;
+    const isAnonymous = fullUser?.id === this._homeDbManager?.getAnonymousUserId() ||
+      fullUser?.id === null;
+    user.UserID = (!isAnonymous && fullUser?.id) || null;
+    user.Email = fullUser?.email || null;
+    user.Name = fullUser?.name || null;
+    // If viewed from a websocket, collect any link parameters included.
+    // TODO: could also get this from rest api access, just via a different route.
+    user.LinkKey = linkParameters;
+    // Include origin info if accessed via the rest api.
+    // TODO: could also get this for websocket access, just via a different route.
+    user.Origin = docSession.req?.get('origin') || null;
+    user.SessionID = isAnonymous ? `a${getAltSessionId(docSession)}` : `u${user.UserID}`;
+    user.IsLoggedIn = !isAnonymous;
+    user.UserRef = fullUser?.ref || null; // Empty string should be treated as null.
+
+    if (this._ruler.ruleCollection.ruleError && !this._recoveryMode) {
+      // It is important to signal that the doc is in an unexpected state,
+      // and prevent it opening.
+      throw this._ruler.ruleCollection.ruleError;
+    }
+
+    for (const clause of this._ruler.ruleCollection.getUserAttributeRules().values()) {
+      if (clause.name in user) {
+        log.warn(`User attribute ${clause.name} ignored; conflicts with an existing one`);
+        continue;
+      }
+      if (attrs.rows[clause.name]) {
+        user[clause.name] = attrs.rows[clause.name];
+        continue;
+      }
+      let rec = new EmptyRecordView();
+      let rows: TableDataAction|undefined;
+      try {
+        // TODO: add indexes to db.
+        const noCase = clause.charId === 'Email' ? ` COLLATE NOCASE` : '';
+        rows = await this._fetchQueryFromDB({
+          tableId: clause.tableId,
+          filters: {},
+          where: {
+            clause: `${quoteIdent(clause.lookupColId)}${noCase} = ?`,
+            // Use lodash's get() that supports paths, e.g. charId of 'a.b' would look up `user.a.b`.
+            params: [get(user, clause.charId)],
+          },
+        });
+      } catch (e) {
+        log.warn(`User attribute ${clause.name} failed`, e);
+      }
+      if (rows && rows[2].length > 0) { rec = new RecordView(rows, 0); }
+      user[clause.name] = rec;
+      attrs.rows[clause.name] = rec;
+    }
+    return user;
   }
 
-  public async getCachedUser(docSession: OptDocSession): Promise<UserInfo> {
+  public async getCachedUser(docSession: OptDocSession): Promise<User> {
     const access = await this._getAccess(docSession);
     return access.getUser();
+  }
+
+  /**
+   * Represent fields from the session in an input object for ACL rules.
+   * Just one field currently, "user".
+   */
+  public async inputs(docSession: OptDocSession): Promise<PredicateFormulaInput> {
+    return {
+      user: await this.getUser(docSession),
+      docId: this._docId
+    };
   }
 
   /**
@@ -243,32 +469,58 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   /**
-   * Get content of a given cell, if user has read access.
+   * Checks if user has read access to a cell. Optionally takes docData that will be used
+   * to retrieve the cell value instead of the current docData.
+   */
+  public async hasCellAccess(docSession: OptDocSession, cell: SingleCell, docData?: DocData): Promise<boolean> {
+    try {
+      await this.getCellValue(docSession, cell, docData);
+      return true;
+    } catch(err) {
+      if (err instanceof ErrorWithCode) { return false; }
+      throw err;
+    }
+  }
+
+  /**
+   * Get content of a given cell, if user has read access. Optionally takes docData that will be used
+   * to retrieve the cell value instead of the current docData.
    * Throws if not.
    */
-  public async getCellValue(docSession: OptDocSession, cell: SingleCell): Promise<CellValue> {
+  public async getCellValue(docSession: OptDocSession, cell: SingleCell, docData?: DocData): Promise<CellValue> {
     function fail(): never {
       throw new ErrorWithCode('ACL_DENY', 'Cannot access cell');
     }
-    const pset = await this.getTableAccess(docSession, cell.tableId);
-    const tableAccess = this.getReadPermission(pset);
-    if (tableAccess === 'deny') { fail(); }
-    const rows = await this._fetchQueryFromDB({
-      tableId: cell.tableId,
-      filters: { id: [cell.rowId] }
-    });
-    if (!rows || rows[2].length === 0) { fail(); }
-    const rec = new RecordView(rows, 0);
-    const input: AclMatchInput = {user: await this._getUser(docSession), rec, newRec: rec};
-    const rowPermInfo = new PermissionInfo(this._ruler.ruleCollection, input);
-    const rowAccess = rowPermInfo.getTableAccess(cell.tableId).perms.read;
-    if (rowAccess === 'deny') { fail(); }
-    if (rowAccess !== 'allow') {
-      const colAccess = rowPermInfo.getColumnAccess(cell.tableId, cell.colId).perms.read;
-      if (colAccess === 'deny') { fail(); }
+    const hasExceptionalAccess = this._hasExceptionalFullAccess(docSession);
+    if (!hasExceptionalAccess && !await this.hasTableAccess(docSession, cell.tableId)) { fail(); }
+    let rows: TableDataAction|null = null;
+    if (docData) {
+      const record = docData.getTable(cell.tableId)?.getRecord(cell.rowId);
+      if (record) {
+        rows = ['TableData', cell.tableId, [cell.rowId], getColValues([record])];
+      }
+    } else {
+      rows = await this._fetchQueryFromDB({
+        tableId: cell.tableId,
+        filters: { id: [cell.rowId] }
+      });
     }
-    const colValues = rows[3];
-    if (!(cell.colId in colValues)) { fail(); }
+    if (!rows || rows[2].length === 0) {
+      return fail();
+    }
+    const rec = new RecordView(rows, 0);
+    if (!hasExceptionalAccess) {
+      const input: PredicateFormulaInput = {...await this.inputs(docSession), rec, newRec: rec};
+      const rowPermInfo = new PermissionInfo(this._ruler.ruleCollection, input);
+      const rowAccess = rowPermInfo.getTableAccess(cell.tableId).perms.read;
+      if (rowAccess === 'deny') { fail(); }
+      if (rowAccess !== 'allow') {
+        const colAccess = rowPermInfo.getColumnAccess(cell.tableId, cell.colId).perms.read;
+        if (colAccess === 'deny') { fail(); }
+      }
+      const colValues = rows[3];
+      if (!(cell.colId in colValues)) { fail(); }
+    }
     return rec.get(cell.colId);
   }
 
@@ -294,6 +546,42 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   /**
+   * Check whether the specified attachment is known to have been uploaded
+   * by the user (identified by SessionID) recently.
+   */
+  public async isAttachmentUploadedByUser(docSession: OptDocSession, attId: number): Promise<boolean> {
+    const user = await this.getUser(docSession);
+    const id = user.SessionID || '';
+    return (this._attachmentUploads.get(attId) === id);
+  }
+
+  /**
+   * Find a cell in an attachment column that contains the specified attachment,
+   * and which is accessible by the user associated with the session.
+   */
+  public async findAttachmentCellForUser(docSession: OptDocSession, attId: number): Promise<SingleCell|undefined> {
+    // Find cells that refer to the given attachment.
+    const cells = await this._docStorage.findAttachmentReferences(attId);
+    // Run through them to see if the user has access to any of them.
+    // We'd expect in a typical document that this will be a small
+    // list of cells, typically 1 or less, but of course extreme cases
+    // are possible.
+    for (const possibleCell of cells) {
+      try {
+        await this.assertAttachmentAccess(docSession, possibleCell, attId);
+        return possibleCell;
+      } catch (e) {
+        if (e instanceof ErrorWithCode && e.code === 'ACL_DENY') {
+          continue;
+        }
+        throw e;
+      }
+    }
+    // Nothing found.
+    return undefined;
+  }
+
+  /**
    * Called after UserAction[]s have been applied in the sandbox, and DocAction[]s have been
    * computed, but before we have committed those DocAction[]s to the database.  If this
    * throws an exception, the sandbox changes will be reverted.
@@ -301,7 +589,9 @@ export class GranularAccess implements GranularAccessForBundle {
   public async canApplyBundle() {
     if (!this._activeBundle) { throw new Error('no active bundle'); }
     const {docActions, docSession, isDirect} = this._activeBundle;
-    if (this._activeBundle.hasDeliberateRuleChange && !await this.isOwner(docSession)) {
+    const currentUser = await this.getUser(docSession);
+    const userIsOwner = await this.isOwner(docSession);
+    if (this._activeBundle.hasDeliberateRuleChange && !userIsOwner) {
       throw new ErrorWithCode('ACL_DENY', 'Only owners can modify access rules');
     }
     // Normally, viewer requests would never reach this point, but they can happen
@@ -321,7 +611,38 @@ export class GranularAccess implements GranularAccessForBundle {
             return this._checkIncomingDocAction({docSession, action, actionIdx});
           }
         }));
+      const shares = this._docData.getMetaTable('_grist_Shares');
+      /**
+       * This is a good point at which to determine whether we may be
+       * making a change to special shares. If we may be, then currently
+       * we will reload any connected web clients accessing the document
+       * via a share.
+       *
+       * The role of the `maybeHasShareChanges` flag is to trigger
+       * reloads of web clients that are accessing the document via a
+       * share, if share configuration may have changed. It doesn't
+       * actually impact access control itself. The sketch of order of
+       * operations given in the docstring for the GranularAccess
+       * class is helpful for understanding this flow.
+       *
+       * At the time of writing, web client support for special shares
+       * is not an official feature - but it is super convenient for testing
+       * and will be important later.
+       */
+      if (shares.getRowIds().length > 0 &&
+          docActions.some(
+            action => getTableId(action).startsWith('_grist'))) {
+        // TODO: could actually compare new rules with old rules and
+        // see if they've changed. Or could exclude some tables that
+        // could easily change without an impact on share rules,
+        // such as _grist_Attachments. Either improvement could
+        // greatly reduce unnecessary web client reloads for shares
+        // if that becomes an issue.
+        this._activeBundle.maybeHasShareChanges = true;
+      }
     }
+
+    await this._canApplyCellActions(currentUser, userIsOwner);
 
     if (this._recoveryMode) {
       // Don't do any further checking in recovery mode.
@@ -339,6 +660,8 @@ export class GranularAccess implements GranularAccessForBundle {
           _grist_Tables_column: this._docData.getMetaTable('_grist_Tables_column').getTableDataAction(),
           _grist_ACLResources: this._docData.getMetaTable('_grist_ACLResources').getTableDataAction(),
           _grist_ACLRules: this._docData.getMetaTable('_grist_ACLRules').getTableDataAction(),
+          _grist_Shares: this._docData.getMetaTable('_grist_Shares').getTableDataAction(),
+          // WATCH OUT - Shares may need more tables, check.
         });
       for (const da of docActions) {
         tmpDocData.receiveAction(da);
@@ -346,7 +669,7 @@ export class GranularAccess implements GranularAccessForBundle {
 
       // Use the post-actions data to process the rules collection, and throw error if that fails.
       const ruleCollection = new ACLRuleCollection();
-      await ruleCollection.update(tmpDocData, {log, compile: compileAclFormula});
+      await ruleCollection.update(tmpDocData, {log, compile: compilePredicateFormula});
       if (ruleCollection.ruleError) {
         throw new ApiError(ruleCollection.ruleError.message, 400);
       }
@@ -356,6 +679,8 @@ export class GranularAccess implements GranularAccessForBundle {
         throw new ApiError(err.message, 400);
       }
     }
+
+    // TODO: any changes needed to this logic for shares?
   }
 
   /**
@@ -415,6 +740,11 @@ export class GranularAccess implements GranularAccessForBundle {
       throw new ErrorWithCode('NEED_RELOAD', 'document needs reload, access rules changed');
     }
 
+    const linkId = getDocSessionShare(docSession);
+    if (linkId && this._activeBundle?.maybeHasShareChanges) {
+      throw new ErrorWithCode('NEED_RELOAD', 'document needs reload, share may have changed');
+    }
+
     // Optimize case where there are no rules to enforce.
     if (!this._ruler.haveRules()) { return docActions; }
 
@@ -423,8 +753,13 @@ export class GranularAccess implements GranularAccessForBundle {
 
     const actions = await Promise.all(
       docActions.map((action, actionIdx) => this._filterOutgoingDocAction({docSession, action, actionIdx})));
-    return ([] as DocAction[]).concat(...actions);
+    let result = ([] as ActionCursor[]).concat(...actions);
+    result = await this._filterOutgoingAttachments(result);
+
+    return await this._filterOutgoingCellInfo(docSession, docActions,
+                                              result.map(a => a.action));
   }
+
 
   /**
    * Filter an ActionGroup to be sent to a client.
@@ -463,9 +798,13 @@ export class GranularAccess implements GranularAccessForBundle {
     options: {role?: Role | null} = {}
   ): Promise<FilteredDocUsageSummary> {
     const result: FilteredDocUsageSummary = { ...docUsage };
+    // Owners can see everything all the time.
+    if (await this.isOwner(docSession)) {
+      return result;
+    }
     const role = options.role ?? await this.getNominalAccess(docSession);
     const hasEditRole = canEdit(role);
-    if (!hasEditRole) { result.dataLimitStatus = null; }
+    if (!hasEditRole) { result.dataLimitInfo.status = null; }
     const hasFullReadAccess = await this.canReadEverything(docSession);
     if (!hasEditRole || !hasFullReadAccess) {
       result.rowCount = 'hidden';
@@ -476,26 +815,25 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   /**
-   * Check if user may be able to apply a list of actions.  Throws if
-   * user cannot apply an action.  Returns true if a user can perhaps apply an
-   * action, or false if we know we need to defer making that determination
-   * until the data engine translates the user actions to doc actions.
+   * Check the list of UserActions, throwing if something not permitted is found.
+   * The data engine is the definitive interpreter of UserActions, but we do what
+   * we can, and then rely on analysis of DocActions produced by the data engine
+   * later to finish the job. Any actions that read data and expose it in some way
+   * need to be caught at this point, since that won't be evident in the DocActions.
+   * So far, we've been restricting the permitted combinations of UserActions when
+   * data is read to make access control tractable. Likewise, any actions that might
+   * result in running user code that would not eventually be permitted needs to be
+   * caught now, since by the time it hits the data engine it is too late.
    */
-  public async assertCanMaybeApplyUserActions(docSession: OptDocSession, actions: UserAction[]): Promise<boolean> {
-    if (this._hasExceptionalFullAccess(docSession)) { return true; }
+  public async checkUserActions(docSession: OptDocSession, actions: UserAction[]): Promise<void> {
+    if (this._hasExceptionalFullAccess(docSession)) { return; }
 
-    let canMaybeApply = true;
-    for (const action of actions) {
-      if (!await this.assertCanMaybeApplyUserAction(docSession, action)) {
-        canMaybeApply = false;
-        break;
-      }
-    }
-
-    await this._checkPossiblePythonFormulaModification(docSession, actions);
+    // Checks are in no particular order.
+    await this._checkSimpleDataActions(docSession, actions);
+    await this._checkForSpecialOrSurprisingActions(docSession, actions);
+    await this._checkIfNeedsEarlySchemaPermission(docSession, actions);
+    await this._checkDuplicateTableAccess(docSession, actions);
     await this._checkAddOrUpdateAccess(docSession, actions);
-
-    return canMaybeApply;
   }
 
   /**
@@ -517,7 +855,8 @@ export class GranularAccess implements GranularAccessForBundle {
    * Any filtering done here is NOT a security measure, and the output should
    * not be granted any level of automatic trust.
    */
-  public async prefilterUserActions(docSession: OptDocSession, actions: UserAction[]): Promise<UserAction[]> {
+  public async prefilterUserActions(docSession: OptDocSession, actions: UserAction[],
+                                    options: ApplyUAExtendedOptions|null): Promise<UserAction[]> {
     // Currently we only attempt prefiltering for an ApplyUndoActions.
     if (actions.length !== 1) { return actions; }
     const userAction = actions[0];
@@ -551,7 +890,7 @@ export class GranularAccess implements GranularAccessForBundle {
       // any case (though we could rearrange to limit how undo actions are
       // requested).
       this.getGranularAccessForBundle(docSession, docActions, [], docActions,
-                                      docActions.map(() => true));
+                                      docActions.map(() => true), options);
       for (const [actionIdx, action] of docActions.entries()) {
         // A single action might contain forbidden material at cell, row, column,
         // or table level.  Retaining permitted material may require refactoring the
@@ -582,55 +921,24 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   /**
-   * Check if user may be able to apply a given action.  Throws if
-   * user cannot apply the action.  Returns true if a user can apply an
-   * action, or false if we need to defer making that determination
-   * until the data engine translates the user actions to doc actions.
-   */
-  public async assertCanMaybeApplyUserAction(docSession: OptDocSession, a: UserAction|DocAction): Promise<boolean> {
-    const name = a[0] as string;
-    if (this._hasExceptionalFullAccess(docSession)) { return true; }
-    if (OK_ACTIONS.has(name)) { return true; }
-    if (SPECIAL_ACTIONS.has(name)) {
-      if (await this.hasNuancedAccess(docSession)) {
-        throw new ErrorWithCode('ACL_DENY', `Blocked by access rules: '${name}' actions need uncomplicated access`);
-      }
-      return true;
-    }
-    if (SURPRISING_ACTIONS.has(name)) {
-      if (!await this.hasFullAccess(docSession)) {
-        throw new ErrorWithCode('ACL_DENY', `Blocked by access rules: '${name}' actions need full access`);
-      }
-      return true;
-    }
-    if (name === 'ApplyUndoActions') {
-      return this.assertCanMaybeApplyUserActions(docSession, a[1] as UserAction[]);
-    } else if (name === 'ApplyDocActions') {
-      return this.assertCanMaybeApplyUserActions(docSession, a[1] as UserAction[]);
-    } else if (name === 'AddOrUpdateRecord') {
-      // This case is a bit tricky.
-      // Access is checked separately in _checkAddOrUpdateAccess.
-      return true;
-    } else if (isDataAction(a)) {
-      const tableId = getTableId(a);
-      if (tableId.startsWith('_grist_')) {
-        return false;  // have to look closely
-      }
-      const tableAccess = await this.getTableAccess(docSession, tableId);
-      const accessCheck = await this._getAccessForActionType(docSession, a, 'fatal');
-      accessCheck.get(tableAccess);  // will throw if access denied.
-      return true;
-    } else {
-      return false;  // have to look closely
-    }
-  }
-
-  /**
    * For changes that could include Python formulas, check for schema access early.
    */
   public needEarlySchemaPermission(a: UserAction|DocAction): boolean {
     const name = a[0] as string;
-    if (name === 'ModifyColumn' || name === 'SetDisplayFormula') {
+    // ConvertFromColumn and CopyFromColumn are hard to reason
+    // about, especially since they appear in bundles with other
+    // actions. We throw up our hands a bit here, and just make
+    // sure the user has schema permissions. Today, in Grist, that
+    // gives a lot of power. If this gets narrowed down in future,
+    // we'll have to rethink this.
+    const actionNames = [
+      'ModifyColumn',
+      'SetDisplayFormula',
+      'ConvertFromColumn',
+      'CopyFromColumn',
+      'AddReverseColumn',
+    ];
+    if (actionNames.includes(name)) {
       return true;
     } else if (isDataAction(a)) {
       const tableId = getTableId(a);
@@ -683,8 +991,12 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   /**
-   * An odd little right for findColFromValues and autocomplete.  Allow if user can read
-   * all data, or is an owner.  Might be worth making a special permission.
+   * Allow if user can read all data, or is an owner.
+   * Might be worth making a special permission.
+   * At the time of writing, used for:
+   *   - findColFromValues
+   *   - autocomplete
+   *   - unfiltered access to attachment metadata
    */
   public async canScanData(docSession: OptDocSession): Promise<boolean> {
     return await this.isOwner(docSession) || await this.canReadEverything(docSession);
@@ -747,12 +1059,35 @@ export class GranularAccess implements GranularAccessForBundle {
     // If we are going to modify metadata, make a copy.
     tables = cloneDeep(tables);
 
+    // Prepare cell censorship information.
+    const cells = new CellData(this._docData).convertToCells(tables['_grist_Cells']);
+    let cellCensor: CellAccessHelper|undefined;
+    if (cells.length > 0) {
+      cellCensor = this._createCellAccess(docSession);
+      await cellCensor.calculate(cells);
+    }
+
     const permInfo = await this._getAccess(docSession);
     const censor = new CensorshipInfo(permInfo, this._ruler.ruleCollection, tables,
-                                      await this.hasAccessRulesPermission(docSession));
+                                      await this.hasAccessRulesPermission(docSession),
+                                      cellCensor);
+    if (cellCensor) {
+      censor.filter(tables["_grist_Cells"]);
+    }
 
     for (const tableId of STRUCTURAL_TABLES) {
       censor.apply(tables[tableId]);
+    }
+    if (await this.needAttachmentControl(docSession)) {
+      // Attachments? No attachments here (whistles innocently).
+      // Computing which attachments user has access to would require
+      // looking at entire document, which we don't want to do. So instead
+      // we'll be sending this info on a need-to-know basis later.
+      const attachments = tables['_grist_Attachments'];
+      attachments[2] = [];
+      Object.values(attachments[3]).forEach(values => {
+        values.length = 0;
+      });
     }
     return tables;
   }
@@ -792,7 +1127,7 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   public async getUserOverride(docSession: OptDocSession): Promise<UserOverride|undefined> {
-    await this._getUser(docSession);
+    await this.getUser(docSession);
     return this._getUserAttributes(docSession).override;
   }
 
@@ -815,6 +1150,36 @@ export class GranularAccess implements GranularAccessForBundle {
     await this._docClients.broadcastDocMessage(client, 'docUserAction',
                                                message,
                                                (_docSession) => this._filterDocUpdate(_docSession, message));
+  }
+
+  /**
+   * Called when uploads occur. We record the fact that the specified attachment
+   * ids originated in uploads by the current user, for a certain length of time.
+   * During that time, attempts by the user to use these attachment ids in an
+   * attachment column will be accepted. The user is identified by SessionID,
+   * which is a user id for logged in users, and a session-unique id for
+   * anonymous users accessing Grist from a browser.
+   *
+   * A remaining weakness of this protection could be if attachment ids were
+   * reused, and reused quickly. Attachments can be deleted after
+   * REMOVE_UNUSED_ATTACHMENTS_DELAY and on document shutdown. We keep
+   * UPLOADED_ATTACHMENT_OWNERSHIP_PERIOD less than REMOVE_UNUSED_ATTACHMENTS_DELAY,
+   * and wipe our records on document shutdown.
+   */
+  public async noteUploads(docSession: OptDocSession, attIds: number[]) {
+    const user = await this.getUser(docSession);
+    const id = user.SessionID;
+    if (!id) {
+      log.rawError('noteUploads needs a SessionID', {
+        docId: this._docId,
+        attIds,
+        userId: user.UserID,
+      });
+      return;
+    }
+    for (const attId of attIds) {
+      this._attachmentUploads.set(attId, id);
+    }
   }
 
   // Remove cached access information for a given session.
@@ -840,6 +1205,7 @@ export class GranularAccess implements GranularAccessForBundle {
   // If there is a Name column or an Access column, in the table, we use them.
   public async collectViewAsUsersFromUserAttributeTables(): Promise<Array<Partial<UserAccessData>>> {
     const result: Array<Partial<UserAccessData>> = [];
+    const seenEmails = new Set();
     for (const clause of this._ruler.ruleCollection.getUserAttributeRules().values()) {
       if (clause.charId !== 'Email') { continue; }
       try {
@@ -851,11 +1217,18 @@ export class GranularAccess implements GranularAccessForBundle {
         const count = users[2].length;
         for (let i = 0; i < count; i++) {
           user.index = i;
-          const email = user.get(clause.lookupColId);
-          const name = user.get('Name') || String(email).split('@')[0];
+          const emailRaw = user.get(clause.lookupColId);
+          if (!emailRaw) { continue; }
+          const email = String(emailRaw);
+          const emailLower = email.toLowerCase();
+          // Avoid adding multiple users that differ only in case of email, since later we match
+          // case-insensitively anyway.
+          if (seenEmails.has(emailLower)) { continue; }
+          seenEmails.add(emailLower);
+          const name = user.get('Name') || email.split('@')[0];
           const access = user.has('Access') ? String(user.get('Access')) : 'editors';
           result.push({
-            email: email ? String(email) : undefined,
+            email,
             name: name ? String(name) : undefined,
             access: isValidRole(access) ? access : null,  // 'null' -> null a bit circuitously
           });
@@ -878,10 +1251,125 @@ export class GranularAccess implements GranularAccessForBundle {
     const linkParameters = docSession.authorizer?.getLinkParameters() || {};
     const baseAccess = getDocSessionAccess(docSession);
     if ((linkParameters.aclAsUserId || linkParameters.aclAsUser) && baseAccess === 'owners') {
-      const info = await this._getUser(docSession);
+      const info = await this.getUser(docSession);
       return info.Access;
     }
     return baseAccess;
+  }
+
+  public async createSnapshotWithCells(docActions?: DocAction[]) {
+    if (!docActions) {
+      if (!this._activeBundle) { throw new Error('no active bundle'); }
+      if (this._activeBundle.applied) {
+        throw new Error("Can't calculate last state for cell metadata");
+      }
+      docActions = this._activeBundle.docActions;
+    }
+    const rows = new Map(getRelatedRows(docActions));
+    const cellData = new CellData(this._docData);
+    for(const action of docActions) {
+      for(const cell of cellData.convertToCells(action)) {
+        if (!rows.has(cell.tableId)) { rows.set(cell.tableId, new Set()); }
+        rows.get(cell.tableId)?.add(cell.rowId);
+      }
+    }
+    // Don't need to sync _grist_Cells table, since we already have it.
+    rows.delete('_grist_Cells');
+    // Populate a minimal in-memory version of the database with these rows.
+    const docData = new DocData(
+      async (tableId) => {
+        return {
+          tableData: await this._fetchQueryFromDB(
+            {tableId, filters: {id: [...rows.get(tableId)!]}})
+        };
+      }, {
+        _grist_Cells: this._docData.getMetaTable('_grist_Cells')!.getTableDataAction(),
+        // We need some basic table information to translate numeric ids to string ids (refs to ids).
+        _grist_Tables: this._docData.getMetaTable('_grist_Tables')!.getTableDataAction(),
+        _grist_Tables_column: this._docData.getMetaTable('_grist_Tables_column')!.getTableDataAction()
+      },
+    );
+    // Load pre-existing rows touched by the bundle.
+    await Promise.all([...rows.keys()].map(tableId => docData.syncTable(tableId)));
+    return docData;
+  }
+
+  // Return true if attachment info must be sent on a need-to-know basis.
+  public async needAttachmentControl(docSession: OptDocSession) {
+    return !await this.canScanData(docSession);
+  }
+
+  /**
+   * An optimization to catch obvious access problems for simple data
+   * actions (such as UpdateRecord, BulkAddRecord, etc) early. Checks
+   * actions one by one (nesting into ApplyUndoActions and
+   * ApplyDocActions as needed) until meeting one that isn't a simple
+   * data action. Checks are crude, and limited to the table access
+   * level. Returns true if all actions were checked, false if
+   * not. Returning true does not imply the actions in the bundle are
+   * permissible; returning false does not imply they should be
+   * denied. Throwing an error DOES imply that an action was
+   * encountered that should be denied.
+   */
+  private async _checkSimpleDataActions(docSession: OptDocSession, actions: UserAction[]): Promise<boolean> {
+    for (const action of actions) {
+      if (!await this._checkSimpleDataAction(docSession, action)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Throws an error for simple data actions that the user cannot perform.
+   * Checking is only at the table level. Returns true if the action clearly
+   * does not change the document schema or metadata, otherwise false if it might.
+   */
+  private async _checkSimpleDataAction(docSession: OptDocSession, a: UserAction|DocAction): Promise<boolean> {
+    const name = a[0] as string;
+    if (name === 'ApplyUndoActions') {
+      return this._checkSimpleDataActions(docSession, a[1] as UserAction[]);
+    } else if (name === 'ApplyDocActions') {
+      return this._checkSimpleDataActions(docSession, a[1] as UserAction[]);
+    } else if (isDataAction(a)) {
+      const tableId = getTableId(a);
+      if (tableId.startsWith('_grist_')) {
+        return false;
+      }
+      const tableAccess = await this.getTableAccess(docSession, tableId);
+      const accessCheck = await this._getAccessForActionType(docSession, a, 'fatal');
+      accessCheck.get(tableAccess);  // will throw if access denied.
+      return true;
+    } else {
+      // Any other action might change schema, so continuing could lead
+      // to false detections of failures. For example, renaming a column
+      // and then updating cells within it should be allowed.
+      return false;
+    }
+  }
+
+  private async _checkForSpecialOrSurprisingActions(docSession: OptDocSession,
+                                                    actions: UserAction[]) {
+    await applyToActionsRecursively(actions, async (a) => {
+      const name = String(a[0]);
+      if (SPECIAL_ACTIONS.has(name)) {
+        if (await this.hasNuancedAccess(docSession)) {
+          throw new ErrorWithCode('ACL_DENY', `Blocked by access rules: '${name}' actions need uncomplicated access`);
+        }
+      } else if (SURPRISING_ACTIONS.has(name)) {
+        if (!await this.hasFullAccess(docSession)) {
+          throw new ErrorWithCode('ACL_DENY', `Blocked by access rules: '${name}' actions need full access`);
+        }
+      } else if (OK_ACTIONS.has(name)) {
+        // fine, anyone can do these at any time, continue.
+      } else if (OTHER_RECOGNIZED_ACTIONS.has(name)) {
+        // these are known actions that have not been specifically classified.
+      } else {
+        // we've hit something unexpected - perhaps a UserAction has been added
+        // without considering access control.
+        throw new ErrorWithCode('ACL_DENY', `Blocked by access rules: '${name}' actions are not controlled`);
+      }
+    });
   }
 
   // AddOrUpdateRecord requires broad read access to a table.
@@ -902,24 +1390,19 @@ export class GranularAccess implements GranularAccessForBundle {
   // way to do that within the data engine as currently
   // formulated. Could perhaps be done for on-demand tables though.
   private async _checkAddOrUpdateAccess(docSession: OptDocSession, actions: UserAction[]) {
-    if (!scanActionsRecursively(actions, (a) => a[0] === 'AddOrUpdateRecord')) {
+    if (!scanActionsRecursively(actions, isAddOrUpdateRecordAction)) {
       // Don't need to apply this particular check.
       return;
     }
-    // Fail if being combined with anything fancy.
-    if (scanActionsRecursively(actions, (a) => {
-      const name = a[0];
-      return !['ApplyUndoActions', 'ApplyDocActions', 'AddOrUpdateRecord'].includes(String(name)) &&
-        !(isDataAction(a) && !getTableId(a).startsWith('_grist_'));
-    })) {
-      throw new Error('Can only combine AddOrUpdate with simple data changes');
-    }
+
+    await this._assertOnlyBundledWithSimpleDataActions(ADD_OR_UPDATE_RECORD_ACTIONS, actions);
     // Check for read access, and that we're not touching metadata.
     await applyToActionsRecursively(actions, async (a) => {
-      if (a[0] !== 'AddOrUpdateRecord') { return; }
+      if (!isAddOrUpdateRecordAction(a)) { return; }
+      const actionName = String(a[0]);
       const tableId = validTableIdString(a[1]);
       if (tableId.startsWith('_grist_')) {
-        throw new Error(`AddOrUpdate cannot yet be used on metadata tables`);
+        throw new Error(`${actionName} cannot yet be used on metadata tables`);
       }
       const tableAccess = await this.getTableAccess(docSession, tableId);
       accessChecks.fatal.read.throwIfNotFullyAllowed(tableAccess);
@@ -928,15 +1411,74 @@ export class GranularAccess implements GranularAccessForBundle {
     });
   }
 
-  private async _checkPossiblePythonFormulaModification(docSession: OptDocSession, actions: UserAction[]) {
+  /**
+   * Asserts that `actionNames` (if present in `actions`) are only bundled with simple data actions.
+   */
+  private async _assertOnlyBundledWithSimpleDataActions(actionNames: string | string[], actions: UserAction[]) {
+    const names = Array.isArray(actionNames) ? actionNames : [actionNames];
+    // Fail if being combined with anything that isn't a simple data action.
+    await applyToActionsRecursively(actions, async (a) => {
+      const name = String(a[0]);
+      if (!names.includes(name) && !(isDataAction(a) && !getTableId(a).startsWith('_grist_'))) {
+        throw new Error(`Can only combine ${names.join(' and ')} with simple data changes`);
+      }
+    });
+  }
+
+  private async _checkIfNeedsEarlySchemaPermission(docSession: OptDocSession, actions: UserAction[]) {
     // If changes could include Python formulas, then user must have
     // +S before we even consider passing these to the data engine.
     // Since we don't track rule or schema changes at this stage, we
     // approximate with the user's access rights at beginning of
     // bundle.
+    // We also check for +S in scenarios that are hard to break down
+    // in a more granular way, for example ConvertFromColumn and
+    // CopyFromColumn.
     if (scanActionsRecursively(actions, (a) => this.needEarlySchemaPermission(a))) {
       await this._assertSchemaAccess(docSession);
     }
+  }
+
+  /**
+   * Like `_checkAddOrUpdateAccess`, but for DuplicateTable actions.
+   *
+   * Permitted only when a user has full access, or full table read and schema edit
+   * access for the table being duplicated.
+   *
+   * Currently, DuplicateTable cannot be combined with other action types, including
+   * simple data actions. This may be relaxed in the future, but should only be done
+   * after careful consideration of its implications.
+   */
+  private async _checkDuplicateTableAccess(docSession: OptDocSession, actions: UserAction[]) {
+    if (!scanActionsRecursively(actions, ([actionName]) => String(actionName) === 'DuplicateTable')) {
+      // Don't need to apply this particular check.
+      return;
+    }
+
+    // Fail if being combined with another action.
+    await applyToActionsRecursively(actions, async ([actionName]) => {
+      if (String(actionName) !== 'DuplicateTable') {
+        throw new Error('DuplicateTable currently cannot be combined with other actions');
+      }
+    });
+
+    // Check for read and schema edit access, and that we're not duplicating metadata tables.
+    await applyToActionsRecursively(actions, async (a) => {
+      const tableId = validTableIdString(a[1]);
+      if (tableId.startsWith('_grist_')) {
+        throw new Error('DuplicateTable cannot be used on metadata tables');
+      }
+      if (await this.hasFullAccess(docSession)) { return; }
+
+      const tableAccess = await this.getTableAccess(docSession, tableId);
+      accessChecks.fatal.read.throwIfNotFullyAllowed(tableAccess);
+      accessChecks.fatal.schemaEdit.throwIfDenied(tableAccess);
+
+      const includeData = a[3];
+      if (includeData) {
+        accessChecks.fatal.create.throwIfDenied(tableAccess);
+      }
+    });
   }
 
   /**
@@ -987,7 +1529,15 @@ export class GranularAccess implements GranularAccessForBundle {
       await this.update();
       return;
     }
-    if (!this._ruler.haveRules()) { return; }
+    const shares = this._docData.getMetaTable('_grist_Shares');
+    if (shares.getRowIds().length > 0 &&
+        docActions.some(action => getTableId(action).startsWith('_grist'))) {
+      await this.update();
+      return;
+    }
+    if (!shares && !this._ruler.haveRules()) {
+      return;
+    }
     // If there is a schema change, redo from scratch for now.
     if (docActions.some(docAction => isSchemaAction(docAction))) {
       await this.update();
@@ -1000,6 +1550,7 @@ export class GranularAccess implements GranularAccessForBundle {
    */
   private _pruneColumns(a: DocAction, permInfo: IPermissionInfo, tableId: string,
                         accessCheck: IAccessCheck): DocAction|null {
+    permInfo = new TransformColumnPermissionInfo(permInfo);
     if (a[0] === 'RemoveRecord' || a[0] === 'BulkRemoveRecord') {
       return a;
     } else if (a[0] === 'AddRecord' || a[0] === 'BulkAddRecord' || a[0] === 'UpdateRecord' ||
@@ -1245,7 +1796,7 @@ export class GranularAccess implements GranularAccessForBundle {
 
     const rec = new RecordView(rowsRec, undefined);
     const newRec = new RecordView(rowsNewRec, undefined);
-    const input: AclMatchInput = {user: await this._getUser(docSession), rec, newRec};
+    const input: PredicateFormulaInput = {...await this.inputs(docSession), rec, newRec};
 
     const [, tableId, , colValues] = action;
     let filteredColValues: ColValues | BulkColValues | undefined | null = null;
@@ -1327,7 +1878,7 @@ export class GranularAccess implements GranularAccessForBundle {
                                   colId?: string): Promise<number[]> {
     const ruler = await this._getRuler(cursor);
     const rec = new RecordView(data, undefined);
-    const input: AclMatchInput = {user: await this._getUser(cursor.docSession), rec};
+    const input: PredicateFormulaInput = {...await this.inputs(cursor.docSession), rec};
 
     const [, tableId, rowIds] = data;
     const toRemove: number[] = [];
@@ -1421,89 +1972,6 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   /**
-   * Construct the UserInfo needed for evaluating rules. This also enriches the user with values
-   * created by user-attribute rules.
-   */
-  private async _getUser(docSession: OptDocSession): Promise<UserInfo> {
-    const linkParameters = docSession.authorizer?.getLinkParameters() || {};
-    let access: Role | null;
-    let fullUser: FullUser | null;
-    const attrs = this._getUserAttributes(docSession);
-    access = getDocSessionAccess(docSession);
-
-    if (docSession.forkingAsOwner) {
-      // For granular access purposes, we become an owner.
-      // It is a bit of a bluff, done on the understanding that this session will
-      // never be used to edit the document, and that any edits will be done on a
-      // fork.
-      access = 'owners';
-    }
-
-    // If aclAsUserId/aclAsUser is set, then override user for acl purposes.
-    if (linkParameters.aclAsUserId || linkParameters.aclAsUser) {
-      if (access !== 'owners') { throw new ErrorWithCode('ACL_DENY', 'only an owner can override user'); }
-      if (attrs.override) {
-        // Used cached properties.
-        access = attrs.override.access;
-        fullUser = attrs.override.user;
-      } else {
-        attrs.override = await this._getViewAsUser(linkParameters);
-        fullUser = attrs.override.user;
-      }
-    } else {
-      fullUser = getDocSessionUser(docSession);
-    }
-    const user = new User();
-    user.Access = access;
-    const isAnonymous = fullUser?.id === this._homeDbManager?.getAnonymousUserId() ||
-      fullUser?.id === null;
-    user.UserID = (!isAnonymous && fullUser?.id) || null;
-    user.Email = fullUser?.email || null;
-    user.Name = fullUser?.name || null;
-    // If viewed from a websocket, collect any link parameters included.
-    // TODO: could also get this from rest api access, just via a different route.
-    user.LinkKey = linkParameters;
-    // Include origin info if accessed via the rest api.
-    // TODO: could also get this for websocket access, just via a different route.
-    user.Origin = docSession.req?.get('origin') || null;
-    user.SessionID = isAnonymous ? `a${getDocSessionAltSessionId(docSession)}` : `u${user.UserID}`;
-    user.IsLoggedIn = !isAnonymous;
-
-    if (this._ruler.ruleCollection.ruleError && !this._recoveryMode) {
-      // It is important to signal that the doc is in an unexpected state,
-      // and prevent it opening.
-      throw this._ruler.ruleCollection.ruleError;
-    }
-
-    for (const clause of this._ruler.ruleCollection.getUserAttributeRules().values()) {
-      if (clause.name in user) {
-        log.warn(`User attribute ${clause.name} ignored; conflicts with an existing one`);
-        continue;
-      }
-      if (attrs.rows[clause.name]) {
-        user[clause.name] = attrs.rows[clause.name];
-        continue;
-      }
-      let rec = new EmptyRecordView();
-      let rows: TableDataAction|undefined;
-      try {
-        // Use lodash's get() that supports paths, e.g. charId of 'a.b' would look up `user.a.b`.
-        // TODO: add indexes to db.
-        rows = await this._fetchQueryFromDB({
-          tableId: clause.tableId,
-          filters: { [clause.lookupColId]: [get(user, clause.charId)] }
-        });
-      } catch (e) {
-        log.warn(`User attribute ${clause.name} failed`, e);
-      }
-      if (rows && rows[2].length > 0) { rec = new RecordView(rows, 0); }
-      user[clause.name] = rec;
-      attrs.rows[clause.name] = rec;
-    }
-    return user;
-  }
-
-  /**
    * Get the "View As" user specified in link parameters.
    * If aclAsUserId is set, we get the user with the specified id.
    * If aclAsUser is set, we get the user with the specified email,
@@ -1511,12 +1979,15 @@ export class GranularAccess implements GranularAccessForBundle {
    * tables or examples.
    */
   private async _getViewAsUser(linkParameters: Record<string, string>): Promise<UserOverride> {
-    // Look up user information in database.
-    if (!this._homeDbManager) { throw new Error('database required'); }
+    // Look up user information in database, if available
     const dbUser = linkParameters.aclAsUserId ?
-      (await this._homeDbManager.getUser(integerParam(linkParameters.aclAsUserId, 'aclAsUserId'))) :
-      (await this._homeDbManager.getExistingUserByLogin(linkParameters.aclAsUser));
-    if (!dbUser && linkParameters.aclAsUser) {
+      (await this._homeDbManager?.getUser(integerParam(linkParameters.aclAsUserId, 'aclAsUserId'))) :
+      (await this._homeDbManager?.getExistingUserByLogin(linkParameters.aclAsUser));
+    // If this is one of example users we will pretend that it doesn't exist, otherwise we would
+    // end up using permissions of the real user.
+    const isExampleUser = this.getExampleViewAsUsers().some(e => e.email === dbUser?.loginEmail);
+    const userExists = dbUser && !isExampleUser;
+    if (!userExists && linkParameters.aclAsUser) {
       // Look further for the user, in user attribute tables or examples.
       const otherUsers = (await this.collectViewAsUsersFromUserAttributeTables())
         .concat(this.getExampleViewAsUsers());
@@ -1533,13 +2004,13 @@ export class GranularAccess implements GranularAccessForBundle {
         };
       }
     }
-    const docAuth = dbUser && await this._homeDbManager.getDocAuthCached({
+    const docAuth = userExists ? await this._homeDbManager?.getDocAuthCached({
       urlId: this._docId,
       userId: dbUser.id
-    });
+    }) : null;
     const access = docAuth?.access || null;
-    const user = dbUser && this._homeDbManager.makeFullUser(dbUser) || null;
-    return { access, user };
+    const user = userExists ? this._homeDbManager?.makeFullUser(dbUser) : null;
+    return { access, user: user || null };
   }
 
   /**
@@ -1629,7 +2100,11 @@ export class GranularAccess implements GranularAccessForBundle {
     const rows = new Map(getRelatedRows(applied ? [...undo].reverse() : docActions));
     // Populate a minimal in-memory version of the database with these rows.
     const docData = new DocData(
-      (tableId) => this._fetchQueryFromDB({tableId, filters: {id: [...rows.get(tableId)!]}}),
+      async (tableId) => {
+        return {
+          tableData: await this._fetchQueryFromDB({tableId, filters: {id: [...rows.get(tableId)!]}})
+        };
+      },
       null,
     );
     // Load pre-existing rows touched by the bundle.
@@ -1672,13 +2147,15 @@ export class GranularAccess implements GranularAccessForBundle {
     const needMeta = docActions.some(a => isSchemaAction(a) || getTableId(a).startsWith('_grist_'));
     if (!needMeta) {
       // Sometimes, the intermediate states are trivial.
-      return docActions.map(action => ({action}));
+      // TODO: look into whether it would be worth caching attachment columns.
+      const attachmentColumns = getAttachmentColumns(this._docData);
+      return docActions.map(action => ({action, attachmentColumns}));
     }
     const metaDocData = new DocData(
       async (tableId) => {
         const result = this._docData.getTable(tableId)?.getTableDataAction();
         if (!result) { throw new Error('surprising load'); }
-        return result;
+        return {tableData: result};
       },
       null,
     );
@@ -1715,7 +2192,7 @@ export class GranularAccess implements GranularAccessForBundle {
       }
       step.metaAfter = meta;
       // replaceRuler logic avoids updating rules between paired changes of resources and rules.
-      if (isAclTable(tableId)) {
+      if (actionHasRuleChange(docAction)) {
         replaceRuler = true;
       } else if (replaceRuler) {
         ruler = new Ruler(this);
@@ -1723,6 +2200,7 @@ export class GranularAccess implements GranularAccessForBundle {
         replaceRuler = false;
       }
       step.ruler = ruler;
+      step.attachmentColumns = getAttachmentColumns(metaDocData);
       steps.push(step);
     }
     return steps;
@@ -1797,26 +2275,33 @@ export class GranularAccess implements GranularAccessForBundle {
    * TODO: I think that column rules controlling READ access using rec are not fully supported
    * yet.  They work on first load, but if READ access is lost/gained updates won't be made.
    */
-  private async _filterOutgoingDocAction(cursor: ActionCursor): Promise<DocAction[]> {
+  private async _filterOutgoingDocAction(cursor: ActionCursor): Promise<ActionCursor[]> {
     const {action} = cursor;
     const tableId = getTableId(action);
-    const permInfo = await this._getStepAccess(cursor);
-    const tableAccess = permInfo.getTableAccess(tableId);
-    const access = this.getReadPermission(tableAccess);
-    const readAccessCheck = this._readAccessCheck(cursor.docSession);
-    const results: DocAction[] = [];
-    if (access === 'deny') {
-      // filter out this data.
-    } else if (access === 'allow') {
-      results.push(action);
-    } else if (access === 'mixedColumns') {
-      const act = this._pruneColumns(action, permInfo, tableId, readAccessCheck);
-      if (act) { results.push(act); }
+
+    let results: DocAction[] = [];
+    if (tableId.startsWith('_grist')) {
+      // Granular access rules don't apply to metadata directly, instead there
+      // is a process of censorship (see later in this method).
+      results = [action];
     } else {
-      // The remainder is the mixed condition.
-      for (const act of await this._pruneRows(cursor)) {
-        const prunedAct = this._pruneColumns(act, permInfo, tableId, readAccessCheck);
-        if (prunedAct) { results.push(prunedAct); }
+      const permInfo = await this._getStepAccess(cursor);
+      const tableAccess = permInfo.getTableAccess(tableId);
+      const access = this.getReadPermission(tableAccess);
+      const readAccessCheck = this._readAccessCheck(cursor.docSession);
+      if (access === 'deny') {
+        // filter out this data.
+      } else if (access === 'allow') {
+        results.push(action);
+      } else if (access === 'mixedColumns') {
+        const act = this._pruneColumns(action, permInfo, tableId, readAccessCheck);
+        if (act) { results.push(act); }
+      } else {
+        // The remainder is the mixed condition.
+        for (const act of await this._pruneRows(cursor)) {
+          const prunedAct = this._pruneColumns(act, permInfo, tableId, readAccessCheck);
+          if (prunedAct) { results.push(prunedAct); }
+        }
       }
     }
     const secondPass: DocAction[] = [];
@@ -1827,7 +2312,7 @@ export class GranularAccess implements GranularAccessForBundle {
         secondPass.push(act);
       }
     }
-    return secondPass;
+    return secondPass.map(act => ({ ...cursor, action: act }));
   }
 
   private async _filterOutgoingStructuralTables(cursor: ActionCursor, act: DataAction, results: DocAction[]) {
@@ -1874,6 +2359,7 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   private async _checkIncomingDocAction(cursor: ActionCursor): Promise<void> {
+    await this._checkIncomingAttachmentChanges(cursor);
     const {action, docSession} = cursor;
     const accessCheck = await this._getAccessForActionType(docSession, action, 'fatal');
     const tableId = getTableId(action);
@@ -1888,6 +2374,97 @@ export class GranularAccess implements GranularAccessForBundle {
     // Somewhat abusing prune method by calling it with an access function that
     // throws on denial.
     this._pruneColumns(action, permInfo, tableId, accessCheck);
+  }
+
+  /**
+   * Take a look at the DocAction and see if it might allow the user to
+   * introduce attachment ids into a cell. If so, make sure the user
+   * has the right to access any attachments mentioned.
+   */
+  private async _checkIncomingAttachmentChanges(cursor: ActionCursor): Promise<void> {
+    const {docSession} = cursor;
+    const attIds = await this._gatherAttachmentChanges(cursor);
+    for (const attId of attIds) {
+      if (!await this.isAttachmentUploadedByUser(docSession, attId) &&
+        !await this.findAttachmentCellForUser(docSession, attId)) {
+        throw new ErrorWithCode('ACL_DENY', 'Cannot access attachment', {
+          status: 403,
+        });
+      }
+    }
+  }
+
+  /**
+   * If user doesn't have sufficient rights, rewrite any attachment information
+   * as follows:
+   *   - Remove data actions (other than [Bulk]RemoveRecord) on the _grist_Attachments table
+   *   - Gather any attachment ids mentioned in data actions
+   *   - Prepend a BulkAddRecord for _grist_Attachments giving metadata for the attachments
+   * This will result in metadata being sent to clients more than necessary,
+   * but saves us keeping track of which clients already know about which
+   * attachments.
+   * We don't make any particular effort to retract attachment metadata from
+   * clients if they lose access to it later. They won't have access to the
+   * content of the attachment, and will lose metadata on a document reload.
+   */
+  private async _filterOutgoingAttachments(cursors: ActionCursor[]) {
+    if (cursors.length === 0) { return []; }
+    const docSession = cursors[0].docSession;
+    if (!await this.needAttachmentControl(docSession)) {
+      return cursors;
+    }
+    const result = [] as ActionCursor[];
+    const attIds = new Set<number>();
+    for (const cursor of cursors) {
+      const changes = await this._gatherAttachmentChanges(cursor);
+      // We assume here that ACL rules were already applied and columns were
+      // either removed or censored.
+      // Gather all attachment ids stored in user tables.
+      for (const attId of changes) {
+        attIds.add(attId);
+      }
+      const {action} = cursor;
+      // Remove any additions or updates to the _grist_Attachments table.
+      if (!isDataAction(action) || isRemoveRecordAction(action) || getTableId(action) !== '_grist_Attachments') {
+        result.push(cursor);
+      }
+    }
+    // We removed all actions that created attachments, now send all attachments metadata
+    // we currently have that are related to actions being broadcast.
+    if (attIds.size > 0) {
+      const act = this._docData.getMetaTable('_grist_Attachments')
+        .getBulkAddRecord([...attIds]);
+      result.unshift({
+        action: act,
+        docSession,
+        // For access control purposes, this new action will be under the
+        // same access rules as the first DocAction.
+        actionIdx: cursors[0].actionIdx,
+      });
+    }
+    return result;
+  }
+
+  private async _gatherAttachmentChanges(cursor: ActionCursor): Promise<Set<number>> {
+    const empty = new Set<number>();
+    const options = this._activeBundle?.options;
+    if (options?.fromOwnHistory && options.oldestSource &&
+      Date.now() - options.oldestSource < HISTORICAL_ATTACHMENT_OWNERSHIP_PERIOD) {
+      return empty;
+    }
+    const {action, docSession} = cursor;
+    if (!isDataAction(action)) { return empty; }
+    if (isRemoveRecordAction(action)) { return empty; }
+    const tableId = getTableId(action);
+    const step = await this._getMetaStep(cursor);
+    const attachmentColumns = step.attachmentColumns;
+    if (!attachmentColumns) { return empty; }
+    const ac = attachmentColumns.get(tableId);
+    if (!ac) { return empty; }
+    const colIds = getColIdsFromDocAction(action) || [];
+    if (!colIds.some(colId => ac.has(colId))) { return empty; }
+    if (!await this.needAttachmentControl(docSession)) { return empty; }
+    return gatherAttachmentIds(attachmentColumns, action);
   }
 
   private async _getRuler(cursor: ActionCursor) {
@@ -1926,9 +2503,24 @@ export class GranularAccess implements GranularAccessForBundle {
       return dummyAccessCheck;
     }
     const tableId = getTableId(a);
-    if (tableId.startsWith('_grist') && tableId !== '_grist_Attachments') {
+    if (tableId.startsWith('_grist') && tableId !== '_grist_Cells') {
+      if (tableId === '_grist_Attachments') {
+        // If the back end is adding/removing an attachment, all
+        // necessary authentication has happened, and we can go ahead
+        // and do it. Perhaps the back end should just use an
+        // exceptional session for this, rather than a special
+        // flag. That would change attribution of the action in the
+        // log, so I stuck with a flag, but I'm not sure if
+        // attribution is particularly useful in this case.
+        if (this._activeBundle?.options?.attachment) {
+          return dummyAccessCheck;
+        }
+        // Users cannot take actions on _grist_Attachments through the regular
+        // action interface.
+        throw new Error('_grist_Attachments modification is not allowed');
+      }
       // Actions on any metadata table currently require the schemaEdit flag.
-      // Exception: the attachments table, which needs to be reworked to be compatible
+      // Exception: the cell info table, which needs to be reworked to be compatible
       // with granular access.
 
       // Another exception: ensure owners always have full access to ACL tables, so they
@@ -1946,6 +2538,105 @@ export class GranularAccess implements GranularAccessForBundle {
     } else {
       return accessChecks[severity].schemaEdit;
     }
+  }
+
+  /**
+   * Filter outgoing actions and include or remove cell information from _grist_Cells.
+   */
+  private async _filterOutgoingCellInfo(docSession: OptDocSession, before: DocAction[], after: DocAction[]) {
+    // Rewrite bundle, simplifying all actions that are touching cell metadata.
+    const cellView = new CellData(this._docData);
+    const patch = cellView.generatePatch(before);
+
+    // If there is nothing to do, just return after state.
+    if (!patch) { return after; }
+
+    // Now remove all action that modify cell metadata from after.
+    // We will use the patch to reconstruct the cell metadata.
+    const result = after.filter(action => !isCellDataAction(action));
+
+    // Prepare checker, we need to use checker from the last step.
+    const cursor = {
+      docSession,
+      action: before[before.length - 1],
+      actionIdx: before.length - 1
+    };
+    const ruler = await this._getRuler(cursor);
+    const permInfo = await ruler.getAccess(docSession);
+    const inputs = await this.inputs(docSession);
+    // Cache some data, as they are checked.
+    const readRows = memoize(this._fetchQueryFromDB.bind(this));
+    const hasAccess = async (cell: SingleCell) => {
+      // First check table access, maybe table is hidden.
+      const tableAccess = permInfo.getTableAccess(cell.tableId);
+      const access = this.getReadPermission(tableAccess);
+      if (access === 'deny') { return false; }
+
+      // Check, if table is fully allowed (no ACL column/rows rules).
+      if (access === 'allow') { return true; }
+
+      // Maybe there are only rules that hides this column completely.
+      if (access === 'mixedColumns') {
+        const collAccess = this.getReadPermission(permInfo.getColumnAccess(cell.tableId, cell.colId));
+        if (collAccess === 'deny') { return false; }
+        if (collAccess === 'allow') { return true; }
+      }
+
+      // Probably there are rules at the cell level, check them.
+      const rows = await readRows({
+        tableId: cell.tableId,
+        filters: { id: [cell.rowId] }
+      });
+      // Make sure we have row.
+      if (!rows || rows[2].length === 0) {
+        if (cell.rowId) {
+          return false;
+        }
+      }
+      const rec = rows ? new RecordView(rows, 0) : undefined;
+      const input: PredicateFormulaInput = {...inputs, rec, newRec: rec};
+      const rowPermInfo = new PermissionInfo(ruler.ruleCollection, input);
+      const rowAccess = rowPermInfo.getTableAccess(cell.tableId).perms.read;
+      if (rowAccess === 'deny') { return false; }
+      if (rowAccess !== 'allow') {
+        const colAccess = rowPermInfo.getColumnAccess(cell.tableId, cell.colId).perms.read;
+        if (colAccess === 'deny') { return false; }
+      }
+      return true;
+    };
+
+    // Now censor the patch, so it only contains cells content that user has access to.
+    await cellView.censorCells(patch, (cell) => hasAccess(cell));
+
+    // And append it to the result.
+    result.push(...patch);
+
+    return result;
+  }
+
+  /**
+   * Tests if the user can modify cell's data.
+   */
+  private async _canApplyCellActions(currentUser: User, userIsOwner: boolean) {
+    // Owner can modify all comments, without exceptions.
+    if (userIsOwner) {
+      return;
+    }
+    if (!this._activeBundle) { throw new Error('no active bundle'); }
+    const {docActions, docSession} = this._activeBundle;
+    const snapShot = await this.createSnapshotWithCells();
+    const cellView = new CellData(snapShot);
+    await cellView.applyAndCheck(
+      docActions,
+      userIsOwner,
+      this._ruler.haveRules(),
+      currentUser.UserRef || '',
+      (cell, state) => this.hasCellAccess(docSession, cell, state),
+    );
+  }
+
+  private _createCellAccess(docSession: OptDocSession, docData?: DocData) {
+    return new CellAccessHelper(this, this._ruler, docSession, this._fetchQueryFromDB, docData);
   }
 }
 
@@ -1966,7 +2657,7 @@ export class Ruler {
     // TODO The intent of caching is to avoid duplicating rule evaluations while processing a
     // single request. Caching based on docSession is riskier since those persist across requests.
     return getSetMapValue(this._permissionInfoMap as Map<OptDocSession, Promise<PermissionInfo>>, docSession,
-      async () => new PermissionInfo(this.ruleCollection, {user: await this._owner.getUser(docSession)}));
+      async () => new PermissionInfo(this.ruleCollection, await this._owner.inputs(docSession)));
   }
 
   public flushAccess(docSession: OptDocSession) {
@@ -1977,7 +2668,11 @@ export class Ruler {
    * Update granular access from DocData.
    */
   public async update(docData: DocData) {
-    await this.ruleCollection.update(docData, {log, compile: compileAclFormula});
+    await this.ruleCollection.update(docData, {
+      log,
+      compile: compilePredicateFormula,
+      enrichRulesForImplementation: true,
+    });
 
     // Also clear the per-docSession cache of rule evaluations.
     this.clearCache();
@@ -1993,7 +2688,8 @@ export class Ruler {
 }
 
 export interface RulerOwner {
-  getUser(docSession: OptDocSession): Promise<UserInfo>;
+  getUser(docSession: OptDocSession): Promise<User>;
+  inputs(docSession: OptDocSession): Promise<PredicateFormulaInput>;
 }
 
 /**
@@ -2011,6 +2707,7 @@ export interface MetaStep {
   metaBefore?: {[key: string]: TableDataAction};  // cached structural metadata before action
   metaAfter?: {[key: string]: TableDataAction};   // cached structural metadata after action
   ruler?: Ruler;                          // rules at this step
+  attachmentColumns?: AttachmentColumns;        // attachment columns after this step
 }
 
 /**
@@ -2019,37 +2716,10 @@ export interface MetaStep {
 interface ActionCursor {
   action: DocAction;
   docSession: OptDocSession;
-  actionIdx: number|null;
-}
-
-/**
- * A row-like view of TableDataAction, which is columnar in nature.  If index value
- * is undefined, acts as an EmptyRecordRow.
- */
-export class RecordView implements InfoView {
-  public constructor(public data: TableDataAction, public index: number|undefined) {
-  }
-
-  public get(colId: string): CellValue {
-    if (this.index === undefined) { return null; }
-    if (colId === 'id') {
-      return this.data[2][this.index];
-    }
-    return this.data[3][colId]?.[this.index];
-  }
-
-  public has(colId: string) {
-    return colId === 'id' || colId in this.data[3];
-  }
-
-  public toJSON() {
-    if (this.index === undefined) { return {}; }
-    const results: {[key: string]: any} = {};
-    for (const key of Object.keys(this.data[3])) {
-      results[key] = this.data[3][key]?.[this.index];
-    }
-    return results;
-  }
+  actionIdx: number|null;     // an index into where we are within the original
+                              // DocActions, for access control purposes.
+                              // Used for referencing a cache of intermediate
+                              // access control state.
 }
 
 /**
@@ -2097,11 +2767,6 @@ class RecordEditor implements InfoEditor {
     }
     return results;
   }
-}
-
-class EmptyRecordView implements InfoView {
-  public get(colId: string): CellValue { return null; }
-  public toJSON() { return {}; }
 }
 
 /**
@@ -2167,9 +2832,94 @@ const dummyAccessCheck: IAccessCheck = {
   throwIfNotFullyAllowed() {}
 };
 
+/**
+ * Helper class to calculate access for a set of cells in bulk. Used for initial
+ * access check for a whole _grist_Cell table. Each cell can belong to a different
+ * table and row, so here we will avoid loading rows multiple times and checking
+ * the table access multiple time.
+ */
+class CellAccessHelper {
+  private _tableAccess: Map<string, boolean> = new Map();
+  private _rowPermInfo: Map<string, Map<number, PermissionInfo>> = new Map();
+  private _rows: Map<string, TableDataAction> = new Map();
+  private _inputs!: PredicateFormulaInput;
+
+  constructor(
+    private _granular: GranularAccess,
+    private _ruler: Ruler,
+    private _docSession: OptDocSession,
+    private _fetchQueryFromDB?: (query: ServerQuery) => Promise<TableDataAction>,
+    private _state?: DocData,
+  ) { }
+
+  /**
+   * Resolves access for all cells, and save the results in the cache.
+   */
+  public async calculate(cells: SingleCell[]) {
+    this._inputs = await this._granular.inputs(this._docSession);
+    const tableIds = new Set(cells.map(cell => cell.tableId));
+    for (const tableId of tableIds) {
+      this._tableAccess.set(tableId, await this._granular.hasTableAccess(this._docSession, tableId));
+      if (this._tableAccess.get(tableId)) {
+        const rowIds = new Set(cells.filter(cell => cell.tableId === tableId).map(cell => cell.rowId));
+        const rows = await this._getRows(tableId, rowIds);
+        for(const [idx, rowId] of rows[2].entries()) {
+          if (rowIds.has(rowId) === false) { continue; }
+          const rec = new RecordView(rows, idx);
+          const input: PredicateFormulaInput = {...this._inputs, rec, newRec: rec};
+          const rowPermInfo = new PermissionInfo(this._ruler.ruleCollection, input);
+          if (!this._rowPermInfo.has(tableId)) {
+            this._rowPermInfo.set(tableId, new Map());
+          }
+          this._rowPermInfo.get(tableId)!.set(rows[2][idx], rowPermInfo);
+          this._rows.set(tableId, rows);
+        }
+      }
+    }
+  }
+
+  /**
+   * Checks if user has a read access to a particular cell. Needs to be called after calculate().
+   */
+  public hasAccess(cell: SingleCell) {
+    const rowPermInfo = this._rowPermInfo.get(cell.tableId)?.get(cell.rowId);
+    if (!rowPermInfo) { return true; }
+    const rowAccess = rowPermInfo.getTableAccess(cell.tableId).perms.read;
+    if (rowAccess === 'deny') { return true; }
+    if (rowAccess !== 'allow') {
+      const colAccess = rowPermInfo.getColumnAccess(cell.tableId, cell.colId).perms.read;
+      if (colAccess === 'deny') { return true; }
+    }
+    const colValues = this._rows.get(cell.tableId);
+    if (!colValues || !(cell.colId in colValues[3])) { return true; }
+    return false;
+  }
+
+  private async _getRows(tableId: string, rowIds: Set<number>) {
+    if (this._state) {
+      const rows = this._state.getTable(tableId)!.getTableDataAction();
+      return rows;
+    }
+    if (this._fetchQueryFromDB) {
+      return await this._fetchQueryFromDB({
+        tableId,
+        filters: { id: [...rowIds] }
+      });
+    }
+    return ['TableData', tableId, [], {}] as TableDataAction;
+  }
+}
+
 
 /**
  * Manage censoring metadata.
+ *
+ * For most metadata, censoring means blanking out certain fields, rather than removing rows,
+ * (because the latter was too big of a change). In particular, these changes are relied on by
+ * other code:
+ *
+ *  - Censored tables (from _grist_Tables) have cleared tableId field. To check for it, use the
+ *    isTableCensored() helper in app/common/isHiddenTable.ts. This is used by exports to Excel.
  */
 export class CensorshipInfo {
   public censoredTables = new Set<number>();
@@ -2177,22 +2927,27 @@ export class CensorshipInfo {
   public censoredViews = new Set<number>();
   public censoredColumns = new Set<number>();
   public censoredFields = new Set<number>();
+  public censoredComments = new Set<number>();
   public censored = {
     _grist_Tables: this.censoredTables,
     _grist_Tables_column: this.censoredColumns,
     _grist_Views: this.censoredViews,
     _grist_Views_section: this.censoredSections,
     _grist_Views_section_field: this.censoredFields,
+    _grist_Cells: this.censoredComments,
   };
 
   public constructor(permInfo: PermissionInfo,
                      ruleCollection: ACLRuleCollection,
                      tables: {[key: string]: TableDataAction},
-                     private _canViewACLs: boolean) {
+                     private _canViewACLs: boolean,
+                     cellAccessInfo?: CellAccessHelper) {
     // Collect a list of censored columns (by "<tableRef> <colId>").
     const columnCode = (tableRef: number, colId: string) => `${tableRef} ${colId}`;
     const censoredColumnCodes: Set<string> = new Set();
     const tableRefToTableId: Map<number, string> = new Map();
+    const tableRefToIndex: Map<number, number> = new Map();
+    const columnRefToColId: Map<number, string> = new Map();
     const uncensoredTables: Set<number> = new Set();
     // Scan for forbidden tables.
     let rec = new RecordView(tables._grist_Tables, undefined);
@@ -2202,6 +2957,7 @@ export class CensorshipInfo {
       const tableId = rec.get('tableId') as string;
       const tableRef = ids[idx];
       tableRefToTableId.set(tableRef, tableId);
+      tableRefToIndex.set(tableRef, idx);
       const tableAccess = permInfo.getTableAccess(tableId);
       if (tableAccess.perms.read === 'deny') {
         this.censoredTables.add(tableRef);
@@ -2215,12 +2971,17 @@ export class CensorshipInfo {
     for (let idx = 0; idx < ids.length; idx++) {
       rec.index = idx;
       const tableRef = rec.get('parentId') as number;
+      const colId = rec.get('colId') as string;
+      const colRef = ids[idx];
+      columnRefToColId.set(colRef, colId);
       if (uncensoredTables.has(tableRef)) { continue; }
       const tableId = tableRefToTableId.get(tableRef);
-      if (!tableId) { throw new Error('table not found'); }
-      const colId = rec.get('colId') as string;
+      if (!tableId) { throw new Error('table not found: ' + tableRef); }
       if (this.censoredTables.has(tableRef) ||
           (colId !== 'manualSort' && permInfo.getColumnAccess(tableId, colId).perms.read === 'deny')) {
+        censoredColumnCodes.add(columnCode(tableRef, colId));
+      }
+      if (isTransformColumn(colId) && permInfo.getColumnAccess(tableId, colId).perms.schemaEdit === 'deny') {
         censoredColumnCodes.add(columnCode(tableRef, colId));
       }
     }
@@ -2254,12 +3015,60 @@ export class CensorshipInfo {
           !this.censoredColumns.has(rec.get('colRef') as number)) { continue; }
       this.censoredFields.add(ids[idx]);
     }
+
+    // Now undo some of the above...
+    // Specifically, when a summary table is not censored, uncensor the source table's raw view section,
+    // so that the user can see the source table's title,
+    // which is used to construct the summary table's title. The section's fields remain censored.
+    // This would also be a sensible place to uncensor the source tableId, but that causes other problems.
+    rec = new RecordView(tables._grist_Tables, undefined);
+    ids = getRowIdsFromDocAction(tables._grist_Tables);
+    for (let idx = 0; idx < ids.length; idx++) {
+      rec.index = idx;
+      const tableRef = ids[idx];
+      const sourceTableRef = rec.get('summarySourceTable') as number;
+      const sourceTableIndex = tableRefToIndex.get(sourceTableRef);
+      if (
+        this.censoredTables.has(tableRef) ||
+        !sourceTableRef ||
+        sourceTableIndex === undefined ||
+        !this.censoredTables.has(sourceTableRef)
+      ) { continue; }
+      rec.index = sourceTableIndex;
+      const rawViewSectionRef = rec.get('rawViewSectionRef') as number;
+      this.censoredSections.delete(rawViewSectionRef);
+    }
+
+    // Collect a list of all cells metadata to which the user has no access.
+    rec = new RecordView(tables._grist_Cells, undefined);
+    ids = tables._grist_Cells ? getRowIdsFromDocAction(tables._grist_Cells) : [];
+    for (let idx = 0; idx < ids.length; idx++) {
+      rec.index = idx;
+      const isTableCensored = () => this.censoredTables.has(rec.get('tableRef') as number);
+      const isColumnCensored = () => this.censoredColumns.has(rec.get('colRef') as number);
+      const isCellCensored = () => {
+        if (!cellAccessInfo) { return false; }
+        const cell = {
+          tableId: tableRefToTableId.get(rec.get('tableRef') as number)!,
+          colId: columnRefToColId.get(rec.get('colRef') as number)!,
+          rowId: rec.get('rowId') as number
+        };
+        return !cell.tableId || !cell.colId || cellAccessInfo.hasAccess(cell);
+      };
+      if (isTableCensored() || isColumnCensored() || isCellCensored()) {
+        this.censoredComments.add(ids[idx]);
+      }
+    }
   }
 
   public apply(a: DataAction) {
     const tableId = getTableId(a);
-    const ids = getRowIdsFromDocAction(a);
     if (!STRUCTURAL_TABLES.has(tableId)) { return true; }
+    return this.filter(a);
+  }
+
+  public filter(a: DataAction) {
+    const tableId = getTableId(a);
     if (!(tableId in this.censored)) {
       if (!this._canViewACLs && a[0] === 'TableData') {
         a[2] = [];
@@ -2270,6 +3079,7 @@ export class CensorshipInfo {
     const rec = new RecordEditor(a, undefined, true);
     const method = getCensorMethod(getTableId(a));
     const censoredRows = (this.censored as any)[tableId] as Set<number>;
+    const ids = getRowIdsFromDocAction(a);
     for (const [index, id] of ids.entries()) {
       if (censoredRows.has(id)) {
         rec.index = index;
@@ -2297,16 +3107,20 @@ function getCensorMethod(tableId: string): (rec: RecordEditor) => void {
       return rec => rec;
     case '_grist_ACLRules':
       return rec => rec;
+    case '_grist_Shares':
+      return rec => rec;
+    case '_grist_Cells':
+        return rec => rec.set('content', [GristObjCode.Censored]).set('userRef', '');
     default:
       throw new Error(`cannot censor ${tableId}`);
   }
 }
 
-function scanActionsRecursively(actions: (DocAction|UserAction)[],
-                                check: (action: DocAction|UserAction) => boolean): boolean {
+function scanActionsRecursively<T extends DocAction|UserAction>(actions: T[],
+                                check: (action: T) => boolean): boolean {
   for (const a of actions) {
     if (a[0] === 'ApplyUndoActions' || a[0] === 'ApplyDocActions') {
-      return scanActionsRecursively(a[1] as UserAction[], check);
+      return scanActionsRecursively(a[1] as T[], check);
     }
     if (check(a)) { return true; }
   }
@@ -2412,45 +3226,521 @@ export function filterColValues(action: DataAction,
   return [action, ...[...parts.keys()].sort().map(key => parts.get(key)!)];
 }
 
-/**
- * Information about a user, including any user attributes.
- *
- * Serializes into a more compact JSON form that excludes full
- * row data, only keeping user info and table/row ids for any
- * user attributes.
- *
- * See `user.py` for the sandbox equivalent that deserializes objects of this class.
- */
-export class User implements UserInfo {
-  public Name: string | null = null;
-  public UserID: number | null = null;
-  public Access: Role | null = null;
-  public Origin: string | null = null;
-  public LinkKey: Record<string, string | undefined> = {};
-  public Email: string | null = null;
-  [attribute: string]: any;
-
-  constructor(_info: Record<string, unknown> = {}) {
-    Object.assign(this, _info);
-  }
-
-  public toJSON() {
-    const results: {[key: string]: any} = {};
-    for (const [key, value] of Object.entries(this)) {
-      if (value instanceof RecordView) {
-        // Only include the table id and first matching row id.
-        results[key] = [getTableId(value.data), value.get('id')];
-      } else if (value instanceof EmptyRecordView) {
-        results[key] = null;
-      } else {
-        results[key] = value;
-      }
-    }
-    return results;
-  }
-}
-
 export function validTableIdString(tableId: any): string {
   if (typeof tableId !== 'string') { throw new Error(`Expected tableId to be a string`); }
   return tableId;
+}
+
+function actionHasRuleChange(a: DocAction): boolean {
+  return isAclTable(getTableId(a)) || (
+    // Check if any helper columns have been specified while adding/updating a metadata record,
+    // as this will affect the result of `getHelperCols` in `ACLRuleCollection.ts` and thus the set of ACL resources.
+    // Note that removing a helper column doesn't directly trigger this code, but:
+    //  - It will typically be accompanied closely by unsetting the helper column on the metadata record.
+    //  - `getHelperCols` can handle non-existent helper columns and other similarly invalid metadata.
+    //  - Since the column is removed, ACL restrictions on it don't really matter.
+    isDataAction(a)
+    && ["_grist_Tables_column", "_grist_Views_section_field"].includes(getTableId(a))
+    && Boolean(
+      a[3]?.hasOwnProperty('rules') ||
+      a[3]?.hasOwnProperty('displayCol')
+    )
+  );
+}
+
+/**
+ * Wrapper around a permission info object that overrides permissions for transform columns.
+ */
+class TransformColumnPermissionInfo implements IPermissionInfo {
+  constructor(private _inner: IPermissionInfo) {
+
+  }
+  public getColumnAccess(tableId: string, colId: string): MixedPermissionSetWithContext {
+    const access = this._inner.getColumnAccess(tableId, colId);
+    const isSchemaDenied = access.perms.schemaEdit === 'deny';
+    // If this is a transform column, it's only accessible if the user has a schemaEdit access.
+    if (isSchemaDenied && isTransformColumn(colId)) {
+      return {
+        ...access,
+        perms: {
+          create: 'deny',
+          read: 'deny',
+          update: 'deny',
+          delete: 'deny',
+          schemaEdit: 'deny',
+        }
+      };
+    }
+    return access;
+  }
+  public getTableAccess(tableId: string): TablePermissionSetWithContext {
+    return this._inner.getTableAccess(tableId);
+  }
+  public getFullAccess(): MixedPermissionSetWithContext {
+    return this._inner.getFullAccess();
+  }
+  public getRuleCollection(): ACLRuleCollection {
+    return this._inner.getRuleCollection();
+  }
+}
+
+interface SingleCellInfo extends SingleCell {
+  userRef: string;
+  id: number;
+}
+
+/**
+ * Helper class that extends DocData with cell specific functions.
+ */
+export class CellData {
+  constructor(private _docData: DocData) {
+
+  }
+
+  public getCell(cellId: number) {
+    const row = this._docData.getMetaTable("_grist_Cells").getRecord(cellId);
+    return row ? this.convertToCellInfo(row) : null;
+  }
+
+  public getCellRecord(cellId: number) {
+    const row = this._docData.getMetaTable("_grist_Cells").getRecord(cellId);
+    return row || null;
+  }
+
+  /**
+   * Generates a patch for cell metadata. It assumes, that engine removes all
+   * cell metadata when cell (table/column/row) is removed and the bundle contains,
+   * all actions that are needed to remove the cell and cell metadata.
+   */
+  public generatePatch(actions: DocAction[]) {
+    const removedCells: Set<number> = new Set();
+    const addedCells: Set<number> = new Set();
+    const updatedCells: Set<number> = new Set();
+    function applyCellAction(action: DataAction) {
+      if (isAddRecordAction(action) || isBulkAddRecord(action)) {
+        for(const id of getRowIdsFromDocAction(action)) {
+          if (removedCells.has(id)) {
+            removedCells.delete(id);
+            updatedCells.add(id);
+          } else {
+            addedCells.add(id);
+          }
+        }
+      } else if (isRemoveRecordAction(action) || isBulkRemoveRecord(action)) {
+        for(const id of getRowIdsFromDocAction(action)) {
+          if (addedCells.has(id)) {
+            addedCells.delete(id);
+          } else {
+            removedCells.add(id);
+            updatedCells.delete(id);
+          }
+        }
+      } else {
+        for(const id of getRowIdsFromDocAction(action)) {
+          if (addedCells.has(id)) {
+            // ignore
+          } else {
+            updatedCells.add(id);
+          }
+        }
+      }
+    }
+
+    // Scan all actions and collect all cell ids that are added, removed or updated.
+    // When some rows are updated, include all cells for that row. Keep track of table
+    // renames.
+    const updatedRows: Map<string, Set<number>> = new Map();
+    for(const action of actions) {
+      if (action[0] === 'RenameTable') {
+        updatedRows.set(action[2], updatedRows.get(action[1]) || new Set());
+        continue;
+      }
+      if (action[0] === 'RemoveTable') {
+        updatedRows.delete(action[1]);
+        continue;
+      }
+      if (isDataAction(action) && isCellDataAction(action)) {
+        applyCellAction(action);
+        continue;
+      }
+      if (!isDataAction(action)) { continue; }
+      // We don't care about new rows, as they don't have meta data at this moment.
+      // If regular rows are removed, we also don't care about them, as they will
+      // produce metadata removal.
+      // We only care about updates, as it might change the metadata visibility.
+      if (isUpdateRecord(action) || isBulkUpdateRecord(action)) {
+        if (getTableId(action).startsWith("_grist")) { continue; }
+        // Updating a row, for us means that all metadata for this row should be refreshed.
+        for(const rowId of getRowIdsFromDocAction(action)) {
+          getSetMapValue(updatedRows, getTableId(action), () => new Set()).add(rowId);
+        }
+      }
+    }
+
+    for(const [tableId, rowIds] of updatedRows) {
+      for(const {id} of this.readCells(tableId, rowIds)) {
+        if (addedCells.has(id) || updatedCells.has(id) || removedCells.has(id)) {
+          // If we have this cell id in the list of added/updated/removed cells, ignore it.
+        } else {
+          updatedCells.add(id);
+        }
+      }
+    }
+
+    const insert = this.generateInsert([...addedCells]);
+    const update = this.generateUpdate([...updatedCells]);
+    const removes = this.generateRemovals([...removedCells]);
+    const patch: DocAction[] = [insert, update, removes].filter(Boolean) as DocAction[];
+    return patch.length ? patch : null;
+  }
+
+  public async censorCells(
+    docActions: DocAction[],
+    hasAccess: (cell: SingleCellInfo) => Promise<boolean>
+  ) {
+    for (const action of docActions) {
+      if (!isDataAction(action) || isRemoveRecordAction(action)) {
+        continue;
+      } else if (isDataAction(action) && getTableId(action) === '_grist_Cells') {
+        if (!isBulkAction(action)) {
+          const cell = this.getCell(action[2]);
+          if (!cell || !await hasAccess(cell)) {
+            action[3].content = [GristObjCode.Censored];
+            action[3].userRef = '';
+          }
+        } else {
+          for (let idx = 0; idx < action[2].length; idx++) {
+            const cell = this.getCell(action[2][idx]);
+            if (!cell || !await hasAccess(cell)) {
+              action[3].content[idx] = [GristObjCode.Censored];
+              action[3].userRef[idx] = '';
+            }
+          }
+        }
+      }
+    }
+    return docActions;
+  }
+
+  public convertToCellInfo(cell: MetaRowRecord<'_grist_Cells'>): SingleCellInfo {
+    const singleCell = {
+      tableId: this.getTableId(cell.tableRef) as string,
+      colId: this.getColId(cell.colRef) as string,
+      rowId: cell.rowId,
+      userRef: cell.userRef,
+      id: cell.id,
+    };
+    return singleCell;
+  }
+
+  public getColId(colRef: number) {
+    return this._docData.getMetaTable("_grist_Tables_column").getRecord(colRef)?.colId;
+  }
+
+  public getColRef(table: number|string, colId: string) {
+    const tableRef = typeof table === 'string' ? this.getTableRef(table) : table;
+    return this._docData.getMetaTable("_grist_Tables_column").filterRecords({colId})
+      .find(c => c.parentId === tableRef)?.id;
+  }
+
+  public getTableId(tableRef: number) {
+    return this._docData.getMetaTable("_grist_Tables").getRecord(tableRef)?.tableId;
+  }
+
+  public getTableRef(tableId: string) {
+    return this._docData.getMetaTable("_grist_Tables").findRow('tableId', tableId) || undefined;
+  }
+
+  /**
+   * Returns all cells for a given table and row ids.
+   */
+  public readCells(tableId: string, rowIds: Set<number>) {
+    const tableRef = this.getTableRef(tableId);
+    const cells =  this._docData.getMetaTable("_grist_Cells").filterRecords({
+      tableRef,
+    }).filter(r => rowIds.has(r.rowId));
+    return cells.map(this.convertToCellInfo.bind(this));
+  }
+
+  // Helper function that tells if a cell can be determined fully from the action itself.
+  // Otherwise we need to look in the docData.
+  public hasCellInfo(docAction: DocAction):
+      docAction is UpdateRecord|BulkUpdateRecord|AddRecord|BulkAddRecord {
+    if (!isDataAction(docAction)) { return false; }
+    if ((isAddRecordAction(docAction) || isUpdateRecord(docAction) || isBulkUpdateRecord(docAction))
+        && docAction[3].tableRef && docAction[3].colRef && docAction[3].rowId && docAction[3].userRef) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Checks if cell is 'attached', i.e. it has a tableRef, colRef, rowId and userRef.
+   */
+  public isAttached(cell: SingleCellInfo) {
+    return Boolean(cell.tableId && cell.rowId && cell.colId && cell.userRef);
+  }
+
+  /**
+   * Reads all SingleCellInfo from docActions or from docData if action doesn't have enough enough
+   * information.
+   */
+  public convertToCells(action: DocAction): SingleCellInfo[] {
+    if (!isDataAction(action)) { return []; }
+    if (getTableId(action) !== '_grist_Cells') { return []; }
+    const result: { tableId: string, rowId: number, colId: string, id: number, userRef: string}[] = [];
+    if (isBulkAction(action)) {
+      for (let idx = 0; idx < action[2].length; idx++) {
+        if (this.hasCellInfo(action)) {
+          result.push({
+            tableId: this.getTableId(action[3].tableRef[idx] as number) as string,
+            colId: this.getColId(action[3].colRef[idx] as number) as string,
+            rowId: action[3].rowId[idx] as number,
+            userRef: (action[3].userRef[idx] ?? '') as string,
+            id: action[2][idx],
+          });
+        } else {
+          const cellInfo = this.getCell(action[2][idx]);
+          if (cellInfo) {
+            result.push(cellInfo);
+          }
+        }
+      }
+    } else {
+      if (this.hasCellInfo(action)) {
+        result.push({
+          tableId: this.getTableId(action[3].tableRef as number) as string,
+          colId: this.getColId(action[3].colRef as number) as string,
+          rowId: action[3].rowId as number,
+          userRef: action[3].userRef as string,
+          id: action[2],
+        });
+      } else {
+        const cellInfo = this.getCell(action[2]);
+        if (cellInfo) {
+          result.push(cellInfo);
+        }
+      }
+    }
+    return result;
+  }
+
+  public generateInsert(ids: number[]): DataAction | null {
+    const action: BulkAddRecord = [
+      'BulkAddRecord',
+      '_grist_Cells',
+      [],
+      {
+        tableRef: [],
+        colRef: [],
+        type: [],
+        root: [],
+        content: [],
+        rowId: [],
+        userRef: [],
+      }
+    ];
+    for(const cell of ids) {
+      const dataCell = this.getCellRecord(cell);
+      if (!dataCell) { continue; }
+      action[2].push(dataCell.id);
+      action[3].content.push(dataCell.content);
+      action[3].userRef.push(dataCell.userRef);
+      action[3].tableRef.push(dataCell.tableRef);
+      action[3].colRef.push(dataCell.colRef);
+      action[3].type.push(dataCell.type);
+      action[3].root.push(dataCell.root);
+      action[3].rowId.push(dataCell.rowId);
+    }
+    return action[2].length > 1 ? action :
+           action[2].length == 1 ? [...getSingleAction(action)][0] : null;
+  }
+
+  public generateRemovals(ids: number[]) {
+    const action: BulkRemoveRecord = [
+      'BulkRemoveRecord',
+      '_grist_Cells',
+      ids
+    ];
+    return action[2].length > 1 ? action :
+          action[2].length == 1 ? [...getSingleAction(action)][0] : null;
+  }
+
+  public generateUpdate(ids: number[]) {
+    const action: BulkUpdateRecord = [
+      'BulkUpdateRecord',
+      '_grist_Cells',
+      [],
+      {
+        content: [],
+        userRef: [],
+      }
+    ];
+    for(const cell of ids) {
+      const dataCell = this.getCellRecord(cell);
+      if (!dataCell) { continue; }
+      action[2].push(dataCell.id);
+      action[3].content.push(dataCell.content);
+      action[3].userRef.push(dataCell.userRef);
+    }
+    return action[2].length > 1 ? action :
+          action[2].length == 1 ? [...getSingleAction(action)][0] : null;
+  }
+
+  /**
+   * Tests if the user can modify cell's data. Will modify
+   */
+  public async applyAndCheck(
+    docActions: DocAction[],
+    userIsOwner: boolean,
+    haveRules: boolean,
+    userRef: string,
+    hasAccess: (cell: SingleCellInfo, state: DocData) => Promise<boolean>
+  ) {
+    // Owner can modify all comments, without exceptions.
+    if (userIsOwner) {
+      return;
+    }
+    // First check if we even have actions that modify cell's data.
+    const cellsActions = docActions.filter(
+      docAction => getTableId(docAction) === '_grist_Cells' && isDataAction(docAction)
+      );
+
+    // If we don't have any actions, we are good to go.
+    if (cellsActions.length === 0) { return; }
+    const fail = () => { throw new ErrorWithCode('ACL_DENY', 'Cannot access cell'); };
+
+    // In nutshell we will just test action one by one, and see if user
+    // can apply it. To do it, we need to keep track of a database state after
+    // each action (just like regular access is done). Unfortunately, cells' info
+    // can be partially updated, so we won't be able to determine what cells they
+    // are attached to. We will assume that bundle has a complete set of information, and
+    // with this assumption we will skip such actions, and wait for the whole cell to form.
+
+    // Create a minimal snapshot of all tables that will be touched by this bundle,
+    // with all cells info that is needed to check access.
+    const lastState = this._docData;
+
+    // Create a view for current state.
+    const cellData = this;
+
+    // Some cells meta data will be added before rows (for example, when undoing). We will
+    // postpone checking of such actions until we have a full set of information.
+    let postponed: Array<number> = [];
+    // Now one by one apply all actions to the snapshot recording all changes
+    // to the cell table.
+    for(const docAction of docActions) {
+      if (!(getTableId(docAction) === '_grist_Cells' && isDataAction(docAction))) {
+        lastState.receiveAction(docAction);
+        continue;
+      }
+      // Convert any bulk actions to normal actions
+      for(const single of getSingleAction(docAction)) {
+        const id = getRowIdsFromDocAction(single)[0];
+        if (isAddRecordAction(docAction)) {
+          // Apply this action, as it might not have full information yet.
+          lastState.receiveAction(single);
+          if (haveRules) {
+            const cell = cellData.getCell(id);
+            if (cell && cellData.isAttached(cell)) {
+              // If this is undo, action cell might not yet exist, so we need to check for that.
+              const record = lastState.getTable(cell.tableId)?.getRecord(cell.rowId);
+              if (!record) {
+                postponed.push(id);
+              } else if (!await hasAccess(cell, lastState)) {
+                fail();
+              }
+            } else {
+              postponed.push(id);
+            }
+          }
+        } else if (isRemoveRecordAction(docAction)) {
+          // See if we can remove this cell.
+          const cell = cellData.getCell(id);
+          lastState.receiveAction(single);
+          if (cell) {
+            // We can remove cell information for any row/column that was removed already.
+            const record = lastState.getTable(cell.tableId)?.getRecord(cell.rowId);
+            if (!record || !cell.colId || !(cell.colId in record)) {
+              continue;
+            }
+            if (cell.userRef && cell.userRef !== (userRef || '')) {
+              fail();
+            }
+          }
+          postponed = postponed.filter((i) => i !== id);
+        } else {
+          // We are updating a cell metadata. We will need to check if we can update it.
+          let cell = cellData.getCell(id);
+          if (!cell) {
+            return fail();
+          }
+          // We can't update cells, that are not ours.
+          if (cell.userRef && cell.userRef !== (userRef || '')) {
+            fail();
+          }
+          // And if the cell was attached before, we will need to check if we can access it.
+          if (cellData.isAttached(cell) && haveRules && !await hasAccess(cell, lastState)) {
+            fail();
+          }
+          // Now receive the action, and test if we can still see the cell (as the info might be moved
+          // to a different cell).
+          lastState.receiveAction(single);
+          cell = cellData.getCell(id)!;
+          if (cellData.isAttached(cell) && haveRules && !await hasAccess(cell, lastState)) {
+            fail();
+          }
+        }
+      }
+    }
+    // Now test every cell that was added before row (so we added it, but without
+    // full information, like new rowId or tableId or colId).
+    for(const id of postponed) {
+      const cell = cellData.getCell(id);
+      if (cell && !this.isAttached(cell)) {
+        return fail();
+      }
+      if (haveRules && cell && !await hasAccess(cell, lastState)) {
+        fail();
+      }
+    }
+  }
+}
+
+/**
+ * Checks if the action is a data action that modifies a _grist_Cells table.
+ */
+export function isCellDataAction(a: DocAction) {
+  return getTableId(a) === '_grist_Cells' && isDataAction(a);
+}
+
+/**
+ * Converts a bulk like data action to its non-bulk equivalent. For actions like TableData or ReplaceTableData
+ * it will return a list of actions, one for each row.
+ */
+export function* getSingleAction(a: DataAction): Iterable<DataAction> {
+  if (isAddRecordAction(a) && isBulkAction(a)) {
+    for(let idx = 0; idx < a[2].length; idx++) {
+      yield ['AddRecord', a[1], a[2][idx], fromPairs(Object.keys(a[3]).map(key => [key, a[3][key][idx]]))];
+    }
+  } else if (isRemoveRecordAction(a) && isBulkAction(a)) {
+    for(const rowId of a[2]) {
+      yield ['RemoveRecord', a[1], rowId];
+    }
+  } else if (a[0] == 'BulkUpdateRecord') {
+    for(let idx = 0; idx < a[2].length; idx++) {
+      yield ['UpdateRecord', a[1], a[2][idx], fromPairs(Object.keys(a[3]).map(key => [key, a[3][key][idx]]))];
+    }
+  } else if (a[0] == 'TableData') {
+    for(let idx = 0; idx < a[2].length; idx++) {
+      yield ['TableData', a[1], [a[2][idx]],
+        fromPairs(Object.keys(a[3]).map(key => [key, [a[3][key][idx]]]))];
+    }
+  } else if (a[0] == 'ReplaceTableData') {
+    for(let idx = 0; idx < a[2].length; idx++) {
+      yield ['ReplaceTableData', a[1], [a[2][idx]], fromPairs(Object.keys(a[3]).map(key => [key, [a[3][key][idx]]]))];
+    }
+  } else {
+    yield a;
+  }
 }

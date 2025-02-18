@@ -1,7 +1,10 @@
+import ace, {Ace} from 'ace-builds';
 import {setupAceEditorCompletions} from 'app/client/components/AceEditorCompletions';
-import {colors} from 'app/client/ui2018/cssVars';
-import * as ace from 'brace';
+import {theme} from 'app/client/ui2018/cssVars';
+import {gristThemeObs} from 'app/client/ui2018/theme';
+import {Theme} from 'app/common/ThemePrefs';
 import {dom, DomArg, Observable, styled} from 'grainjs';
+import debounce from 'lodash/debounce';
 
 export interface ACLFormulaOptions {
   initialValue: string;
@@ -9,22 +12,30 @@ export interface ACLFormulaOptions {
   placeholder: DomArg;
   setValue: (value: string) => void;
   getSuggestions: (prefix: string) => string[];
-  customiseEditor?: (editor: ace.Editor) => void;
+  customiseEditor?: (editor: Ace.Editor) => void;
 }
 
 export function aclFormulaEditor(options: ACLFormulaOptions) {
   // Create an element and an editor within it.
   const editorElem = dom('div');
-  const editor: ace.Editor = ace.edit(editorElem);
+  const editor: Ace.Editor = ace.edit(editorElem);
 
   // Set various editor options.
-  editor.setTheme('ace/theme/chrome');
+  function setAceTheme(newTheme: Theme) {
+    const {appearance} = newTheme;
+    const aceTheme = appearance === 'dark' ? 'dracula' : 'chrome';
+    editor.setTheme(`ace/theme/${aceTheme}`);
+  }
+  setAceTheme(gristThemeObs().get());
+  const themeListener = gristThemeObs().addListener((newTheme) => {
+    setAceTheme(newTheme);
+  });
   // ACE editor resizes automatically when maxLines is set.
   editor.setOptions({enableLiveAutocompletion: true, maxLines: 10});
   editor.renderer.setShowGutter(false);       // Default line numbers to hidden
   editor.renderer.setPadding(5);
   editor.renderer.setScrollMargin(4, 4, 0, 0);
-  editor.$blockScrolling = Infinity;
+  (editor as any).$blockScrolling = Infinity;
   editor.setReadOnly(options.readOnly);
   editor.setFontSize('12');
   editor.setHighlightActiveLine(false);
@@ -41,7 +52,7 @@ export function aclFormulaEditor(options: ACLFormulaOptions) {
   );
   editor.on("change", () => showPlaceholder.set(!editor.getValue().length));
 
-  async function getSuggestions(prefix: string) {
+  async function getSuggestions(prefix: string): Promise<Array<[string, null]>> {
     return [
       // The few Python keywords and constants we support.
       'and', 'or', 'not', 'in', 'is', 'True', 'False', 'None',
@@ -51,12 +62,16 @@ export function aclFormulaEditor(options: ACLFormulaOptions) {
       'user', 'rec', 'newRec',
       // Other completions that depend on doc schema or other rules.
       ...options.getSuggestions(prefix),
-    ];
+    ].map(suggestion => [suggestion, null]);  // null means no example value
   }
   setupAceEditorCompletions(editor, {getSuggestions});
 
   // Save on blur.
   editor.on("blur", () => options.setValue(editor.getValue()));
+
+  // Save changes every 1 second
+  const save = debounce(() => options.setValue(editor.getValue()), 1000);
+  editor.on("change", save);
 
   // Blur (and save) on Enter key.
   editor.commands.addCommand({
@@ -75,12 +90,14 @@ export function aclFormulaEditor(options: ACLFormulaOptions) {
   }
 
   return cssConditionInputAce(
+    dom.autoDispose(themeListener ?? null),
     cssConditionInputAce.cls('-disabled', options.readOnly),
     // ACE editor calls preventDefault on clicks into the scrollbar area, which prevents focus
     // being set when the click happens to be into there. To ensure we can focus on such clicks
     // anyway, listen to the mousedown event in the capture phase.
     dom.on('mousedown', () => { editor.focus(); }, {useCapture: true}),
     dom.onDispose(() => editor.destroy()),
+    dom.onDispose(() => save.cancel()),
     editorElem,
   );
 }
@@ -94,22 +111,28 @@ const cssConditionInputAce = styled('div', `
   cursor: pointer;
 
   &:hover {
-    border: 1px solid ${colors.darkGrey};
+    border: 1px solid ${theme.accessRulesFormulaEditorBorderHover};
   }
   &:not(&-disabled):focus-within {
-    box-shadow: inset 0 0 0 1px ${colors.cursor};
-    border-color: ${colors.cursor};
+    box-shadow: inset 0 0 0 1px ${theme.accessRulesFormulaEditorFocus};
+    border-color: ${theme.accessRulesFormulaEditorFocus};
   }
   &:not(:focus-within) .ace_scroller, &-disabled .ace_scroller {
     cursor: unset;
   }
   &-disabled, &-disabled:hover {
-    background-color: ${colors.mediumGreyOpaque};
+    background-color: ${theme.accessRulesFormulaEditorBgDisabled};
     box-shadow: unset;
     border-color: transparent;
   }
-  &-disabled .ace-chrome {
-    background-color: ${colors.mediumGreyOpaque};
+  & .ace-chrome, & .ace-dracula {
+    background-color: ${theme.accessRulesFormulaEditorBg};
+  }
+  &:not(:focus-within) .ace_print-margin {
+    width: 0px;
+  }
+  &-disabled .ace-chrome, &-disabled .ace-dracula {
+    background-color: ${theme.accessRulesFormulaEditorBgDisabled};
   }
   & .ace_marker-layer, & .ace_cursor-layer {
     display: none;

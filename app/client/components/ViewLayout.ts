@@ -1,28 +1,50 @@
 import BaseView from 'app/client/components/BaseView';
+import {buildViewSectionDom} from 'app/client/components/buildViewSectionDom';
 import {ChartView} from 'app/client/components/ChartView';
 import * as commands from 'app/client/components/commands';
+import {CustomCalendarView} from "app/client/components/CustomCalendarView";
 import {CustomView} from 'app/client/components/CustomView';
 import * as DetailView from 'app/client/components/DetailView';
+import {FormView} from 'app/client/components/Forms/FormView';
 import * as GridView from 'app/client/components/GridView';
 import {GristDoc} from 'app/client/components/GristDoc';
 import {Layout} from 'app/client/components/Layout';
 import {LayoutEditor} from 'app/client/components/LayoutEditor';
+import {LayoutTray} from 'app/client/components/LayoutTray';
 import {printViewSection} from 'app/client/components/Printing';
+import {BoxSpec, purgeBoxSpec} from 'app/client/lib/BoxSpec';
 import {Delay} from 'app/client/lib/Delay';
 import {createObsArray} from 'app/client/lib/koArrayWrap';
+import {logTelemetryEvent} from 'app/client/lib/telemetry';
 import {ViewRec, ViewSectionRec} from 'app/client/models/DocModel';
 import {reportError} from 'app/client/models/errors';
-import {filterBar} from 'app/client/ui/FilterBar';
-import {viewSectionMenu} from 'app/client/ui/ViewSectionMenu';
-import {buildWidgetTitle} from 'app/client/ui/WidgetTitle';
-import {colors, mediaSmall, testId} from 'app/client/ui2018/cssVars';
+import {getTelemetryWidgetTypeFromVS} from 'app/client/ui/widgetTypesMap';
+import {isNarrowScreen, mediaSmall, testId, theme} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
+import {ISaveModalOptions, saveModal} from 'app/client/ui2018/modals';
 import {DisposableWithEvents} from 'app/common/DisposableWithEvents';
+import {makeT} from 'app/client/lib/localization';
+import {urlState} from 'app/client/models/gristUrlState';
+import {cssRadioCheckboxOptions, radioCheckboxOption} from 'app/client/ui2018/checkbox';
+import {cssLink} from 'app/client/ui2018/links';
 import {mod} from 'app/common/gutil';
-import {Observable} from 'grainjs';
+import {
+  Computed,
+  computedArray,
+  Disposable,
+  dom,
+  fromKo,
+  Holder,
+  IDomComponent,
+  MultiHolder,
+  Observable,
+  styled,
+  subscribe
+} from 'grainjs';
 import * as ko from 'knockout';
-import * as _ from 'underscore';
-import {computedArray, Disposable, dom, fromKo, Holder, IDomComponent, styled, subscribe} from 'grainjs';
+import debounce from 'lodash/debounce';
+
+const t = makeT('ViewLayout');
 
 // tslint:disable:no-console
 
@@ -32,6 +54,8 @@ const viewSectionTypes: {[key: string]: any} = {
   chart: ChartView,
   single: DetailView,
   custom: CustomView,
+  form: FormView,
+  'custom.calendar': CustomCalendarView,
 };
 
 function getInstanceConstructor(parentKey: string) {
@@ -69,16 +93,21 @@ export class ViewSectionHelper extends Disposable {
 export class ViewLayout extends DisposableWithEvents implements IDomComponent {
   public docModel = this.gristDoc.docModel;
   public viewModel: ViewRec;
-  public layoutSpec: ko.Computed<object>;
+  public layoutSpec: ko.Computed<BoxSpec>;
+  public maximized: Observable<number|null>;
+  public isResizing = Observable.create(this, false);
+  public layout: Layout;
+  public layoutEditor: LayoutEditor;
+  public layoutTray: LayoutTray;
+  public layoutSaveDelay = this.autoDispose(new Delay());
 
   private _freeze = false;
-  private _layout: any;
-  private _sectionIds: number[];
-  private _isResizing = Observable.create(this, false);
-
+  // Exposed for test to indicate that save has not yet been called.
+  private _savePending = Observable.create(this, false);
   constructor(public readonly gristDoc: GristDoc, viewId: number) {
     super();
     this.viewModel = this.docModel.views.getRowModel(viewId);
+
 
     // A Map from viewSection RowModels to corresponding View class instances.
     // TODO add a test that creating / deleting a section creates/destroys one instance, and
@@ -92,40 +121,34 @@ export class ViewLayout extends DisposableWithEvents implements IDomComponent {
       () => this._updateLayoutSpecWithSections(this.viewModel.layoutSpecObj()))
       .extend({rateLimit: 0}));
 
-    this._layout = this.autoDispose(Layout.create(this.layoutSpec(),
+    this.layout = this.autoDispose(Layout.create(this.layoutSpec(),
                                                  this._buildLeafContent.bind(this), true));
-    this._sectionIds = this._layout.getAllLeafIds();
+
 
     // When the layoutSpec changes by some means other than the layout editor, rebuild.
     // This includes adding/removing sections and undo/redo.
-    this.autoDispose(this.layoutSpec.subscribe((spec) => this._freeze || this._rebuildLayout(spec)));
+    this.autoDispose(this.layoutSpec.subscribe((spec) => this._freeze || this.rebuildLayout(spec)));
 
-    const layoutSaveDelay = this.autoDispose(new Delay());
-
-    this.listenTo(this._layout, 'layoutUserEditStop', () => {
-      this._isResizing.set(false);
-      layoutSaveDelay.schedule(1000, () => {
-        if (!this._layout) { return; }
-
-        // Only save layout changes when the document isn't read-only.
-        if (!this.gristDoc.isReadonly.get()) {
-          (this.viewModel.layoutSpecObj as any).setAndSave(this._layout.getLayoutSpec());
-        }
-        this._onResize();
+    this.listenTo(this.layout, 'layoutUserEditStop', () => {
+      this.isResizing.set(false);
+      this.layoutSaveDelay.schedule(1000, () => {
+        this.saveLayoutSpec().catch(reportError);
       });
     });
 
     // Do not save if the user has started editing again.
-    this.listenTo(this._layout, 'layoutUserEditStart', () => {
-      layoutSaveDelay.cancel();
-      this._isResizing.set(true);
+    this.listenTo(this.layout, 'layoutUserEditStart', () => {
+      this.layoutSaveDelay.cancel();
+      this._savePending.set(true);
+      this.isResizing.set(true);
     });
 
-    this.autoDispose(LayoutEditor.create(this._layout));
+    this.layoutEditor = this.autoDispose(LayoutEditor.create(this.layout));
+    this.layoutTray = LayoutTray.create(this, this);
 
     // Add disposal of this._layout after layoutEditor, so that it gets disposed first, and
     // layoutEditor doesn't attempt to update it in its own disposal logic.
-    this.onDispose(() => this._layout.dispose());
+    this.onDispose(() => this.layout.dispose());
 
     this.autoDispose(this.gristDoc.resizeEmitter.addListener(this._onResize, this));
 
@@ -133,34 +156,103 @@ export class ViewLayout extends DisposableWithEvents implements IDomComponent {
     // (See https://stackoverflow.com/questions/2381336/detect-click-into-iframe-using-javascript).
     this.listenTo(this.gristDoc.app, 'clipboard_blur', this._maybeFocusInSection);
 
+    // On narrow screens (e.g. mobile), we need to resize the section after a transition.
+    // There will two transition events (one from section one from row), so we debounce them after a tick.
+    const handler = debounce((e: TransitionEvent) => {
+      // We work only on the transition of the flex-grow property, and only on narrow screens.
+      if (e.propertyName !== 'flex-grow' || !isNarrowScreen()) { return; }
+      // Make sure the view is still active.
+      if (this.viewModel.isDisposed() || !this.viewModel.activeSection) { return; }
+      const section = this.viewModel.activeSection.peek();
+      if (!section || section.isDisposed()) { return; }
+      const view = section.viewInstance.peek();
+      if (!view || view.isDisposed()) { return; }
+      // Make resize.
+      view.onResize();
+    }, 0);
+    this.layout.rootElem.addEventListener('transitionend', handler);
+    // Don't need to dispose the listener, as the rootElem is disposed with the layout.
+
     const classActive = cssLayoutBox.className + '-active';
     const classInactive = cssLayoutBox.className + '-inactive';
     this.autoDispose(subscribe(fromKo(this.viewModel.activeSection), (use, section) => {
       const id = section.getRowId();
-      this._layout.forEachBox((box: {dom: Element}) => {
-        box.dom.classList.add(classInactive);
-        box.dom.classList.remove(classActive);
+      this.layout.forEachBox(box => {
+        box.dom!.classList.add(classInactive);
+        box.dom!.classList.remove(classActive);
+        box.dom!.classList.remove("transition");
       });
-      let elem: Element|null = this._layout.getLeafBox(id)?.dom;
+      let elem: Element|null = this.layout.getLeafBox(id)?.dom || null;
       while (elem?.matches('.layout_box')) {
         elem.classList.remove(classInactive);
         elem.classList.add(classActive);
         elem = elem.parentElement;
       }
-      section.viewInstance.peek()?.onResize();
+      if (!isNarrowScreen()) {
+        section.viewInstance.peek()?.onResize();
+      }
     }));
 
     const commandGroup = {
-      deleteSection: () => { this._removeViewSection(this.viewModel.activeSectionId()); },
+      deleteSection: () => { this.removeViewSection(this.viewModel.activeSectionId()).catch(reportError); },
       nextSection: () => { this._otherSection(+1); },
       prevSection: () => { this._otherSection(-1); },
-      printSection: () => { printViewSection(this._layout, this.viewModel.activeSection()).catch(reportError); },
+      printSection: () => { printViewSection(this.layout, this.viewModel.activeSection()).catch(reportError); },
+      sortFilterMenuOpen: (sectionId?: number) => { this._openSortFilterMenu(sectionId); },
+      expandSection: () => { this._expandSection(); },
+      cancel: () => {
+        if (this.maximized.get()) {
+          this.maximized.set(null);
+        }
+      }
     };
     this.autoDispose(commands.createGroup(commandGroup, this, true));
+
+    this.maximized = fromKo(this.layout.maximizedLeaf) as any;
+    this.autoDispose(this.maximized.addListener((sectionId, prev) => {
+      // If we are closing popup, resize all sections.
+      if (!sectionId) {
+        this._onResize();
+      } else {
+        // Otherwise resize only active one (the one in popup).
+        const section = this.viewModel.activeSection.peek();
+        if (!section.isDisposed() && section.id.peek()) {
+          section?.viewInstance.peek()?.onResize();
+        }
+      }
+    }));
   }
 
   public buildDom() {
-    return this._layout.rootElem;
+    const owner = MultiHolder.create(null);
+    const close = () => this.maximized.set(null);
+    const mainBoxInPopup = Computed.create(owner, use => this.layout.getAllLeafIds().includes(use(this.maximized)));
+    const miniBoxInPopup = Computed.create(owner, use => use(mainBoxInPopup) ? null : use(this.maximized));
+    return cssOverlay(
+      dom.autoDispose(owner),
+      cssOverlay.cls('-active', use => !!use(this.maximized)),
+      testId('viewLayout-overlay'),
+      cssVFull(
+        this.layoutTray.buildDom(),
+        cssLayoutWrapper(
+          cssLayoutWrapper.cls('-active', use => Boolean(use(this.maximized))),
+          dom.update(
+            this.layout.rootElem,
+            dom.hide(use => Boolean(use(miniBoxInPopup))),
+          ),
+          this.layoutTray.buildPopup(owner, miniBoxInPopup, close),
+        ),
+      ),
+      dom.maybe(use => !!use(this.maximized), () =>
+        cssCloseButton('CrossBig',
+          testId('close-button'),
+          dom.on('click', () => close())
+        )
+      ),
+      // Close the lightbox when user clicks exactly on the overlay.
+      dom.on('click', (ev, elem) => void (ev.target === elem && this.maximized.get() ? close() : null)),
+      dom.cls('test-viewLayout-save-pending', this._savePending)
+    );
   }
 
   // Freezes the layout until the passed in promise resolves. This is useful to achieve a single
@@ -172,21 +264,118 @@ export class ViewLayout extends DisposableWithEvents implements IDomComponent {
       return await promise;
     } finally {
       this._freeze = false;
-      this._rebuildLayout(this.layoutSpec.peek());
+      this.rebuildLayout(this.layoutSpec.peek());
     }
   }
 
-  // Removes a view section from the current view. Should only be called if there is
-  // more than one viewsection in the view.
-  private _removeViewSection(viewSectionRowId: number) {
-    this.gristDoc.docData.sendAction(['RemoveViewSection', viewSectionRowId]).catch(reportError);
+  public saveLayoutSpec(specs?: BoxSpec) {
+    this._savePending.set(false);
+    // Cancel the automatic delay.
+    this.layoutSaveDelay.cancel();
+    if (!this.layout) { return Promise.resolve(); }
+    // Only save layout changes when the document isn't read-only.
+    if (!this.gristDoc.isReadonly.get()) {
+      if (!specs) {
+        specs = this.layout.getLayoutSpec();
+        specs.collapsed = this.viewModel.activeCollapsedSections.peek().map((leaf)=> ({leaf}));
+      }
+      return this.viewModel.layoutSpecObj.setAndSave(specs).catch(reportError);
+    }
+    this._onResize();
+    return Promise.resolve();
+  }
+
+  /**
+   * Removes a view section from the current view. Should only be called if there is more than
+   * one viewsection in the view.
+   * @returns A promise that resolves with true when the view section is removed. If user was
+   * prompted and decided to cancel, the promise resolves with false.
+   */
+  public async removeViewSection(viewSectionRowId: number) {
+    this.maximized.set(null);
+    const viewSection = this.viewModel.viewSections().all().find(s => s.getRowId() === viewSectionRowId);
+    if (!viewSection) {
+      throw new Error(`Section not found: ${viewSectionRowId}`);
+    }
+    const tableId = viewSection.table.peek().tableId.peek();
+
+    // Check if this is a UserTable (not summary) and if so, if it is available on any other page
+    // we have access to (or even on this page but in different widget). If yes, then we are safe
+    // to remove it, otherwise we need to warn the user.
+
+    const logTelemetry = () => {
+      const widgetType = getTelemetryWidgetTypeFromVS(viewSection);
+      logTelemetryEvent('deletedWidget', {full: {docIdDigest: this.gristDoc.docId(), widgetType}});
+    };
+
+    const isUserTable = () => viewSection.table.peek().isSummary.peek() === false;
+
+    const notInAnyOtherSection = () => {
+      // Get all viewSection we have access to, and check if the table is used in any of them.
+      const others = this.gristDoc.docModel.viewSections.rowModels
+                      .filter(vs => !vs.isDisposed())
+                      .filter(vs => vs.id.peek() !== viewSectionRowId)
+                      .filter(vs => vs.isRaw.peek() === false)
+                      .filter(vs => vs.isRecordCard.peek() === false)
+                      .filter(vs => vs.tableId.peek() === viewSection.tableId.peek());
+      return others.length === 0;
+    };
+
+    const REMOVED = true, IGNORED = false;
+
+    const possibleActions = {
+      [DELETE_WIDGET]: async () => {
+        logTelemetry();
+        await this.gristDoc.docData.sendAction(['RemoveViewSection', viewSectionRowId]);
+        return REMOVED;
+      },
+      [DELETE_DATA]: async () => {
+        logTelemetry();
+        await this.gristDoc.docData.sendActions([
+          ['RemoveViewSection', viewSectionRowId],
+          ['RemoveTable', tableId],
+        ]);
+        return REMOVED;
+      },
+      [CANCEL]: async () => IGNORED,
+    };
+
+    const tableName = () => viewSection.table.peek().tableNameDef.peek();
+
+    const needPrompt = isUserTable() && notInAnyOtherSection();
+
+    const decision = needPrompt
+      ? widgetRemovalPrompt(tableName())
+      : Promise.resolve(DELETE_WIDGET as PromptAction);
+
+    return possibleActions[await decision]();
+  }
+
+  public rebuildLayout(layoutSpec: BoxSpec) {
+    // Rebuild the collapsed section layout. In return we will get all leaves that were
+    // removed from collapsed dom. Some of them will hold a view instance dom.
+    const oldTray = this.layoutTray.replaceLayout();
+    // Build the normal layout. While building, some leaves will grab the view instance dom
+    // and attach it to their dom (and detach them from the old layout in the process).
+    this.layout.buildLayout(layoutSpec, true);
+    this._onResize();
+    // Dispose the old layout. This will dispose the view instances that were not reused.
+    oldTray.dispose();
+  }
+
+  private _expandSection() {
+    const activeSection = this.viewModel.activeSection();
+    const activeSectionId = activeSection.getRowId();
+    const activeSectionBox = this.layout.getLeafBox(activeSectionId);
+    if (!activeSectionBox) { return; }
+    activeSectionBox.maximize();
   }
 
   private _buildLeafContent(sectionRowId: number) {
     return buildViewSectionDom({
        gristDoc: this.gristDoc,
        sectionRowId,
-       isResizing: this._isResizing,
+       isResizing: this.isResizing,
        viewModel: this.viewModel
     });
   }
@@ -195,48 +384,9 @@ export class ViewLayout extends DisposableWithEvents implements IDomComponent {
    * If there is no layout saved, we can create a default layout just from the list of fields for
    * this view section. By default we just arrange them into a list of rows, two fields per row.
    */
-  private _updateLayoutSpecWithSections(spec: object) {
-    // We use tmpLayout as a way to manipulate the layout before we get a final spec from it.
-    const tmpLayout = Layout.create(spec, (leafId: number) => dom('div'), true);
-
-    const specFieldIds = tmpLayout.getAllLeafIds();
+  private _updateLayoutSpecWithSections(spec: BoxSpec) {
     const viewSectionIds = this.viewModel.viewSections().all().map(function(f) { return f.getRowId(); });
-
-    function addToSpec(leafId: number) {
-      const newBox = tmpLayout.buildLayoutBox({ leaf: leafId });
-      const rows = tmpLayout.rootBox().childBoxes.peek();
-      const lastRow = rows[rows.length - 1];
-      if (rows.length >= 1 && lastRow.isLeaf()) {
-        // Add a new child to the last row.
-        lastRow.addChild(newBox, true);
-      } else {
-        // Add a new row.
-        tmpLayout.rootBox().addChild(newBox, true);
-      }
-      return newBox;
-    }
-
-    // For any stale fields (no longer among viewFields), remove them from tmpLayout.
-    _.difference(specFieldIds, viewSectionIds).forEach(function(leafId) {
-      tmpLayout.getLeafBox(leafId).dispose();
-    });
-
-    // For all fields that should be in the spec but aren't, add them to tmpLayout. We maintain a
-    // two-column layout, so add a new row, or a second box to the last row if it's a leaf.
-    _.difference(viewSectionIds, specFieldIds).forEach(function(leafId) {
-      // Only add the builder box if it hasn`t already been created
-      addToSpec(leafId);
-    });
-
-    spec = tmpLayout.getLayoutSpec();
-    tmpLayout.dispose();
-    return spec;
-  }
-
-  private _rebuildLayout(layoutSpec: object) {
-    this._layout.buildLayout(layoutSpec, true);
-    this._onResize();
-    this._sectionIds = this._layout.getAllLeafIds();
+    return purgeBoxSpec({spec, validLeafIds: viewSectionIds});
   }
 
   // Resizes the scrolly windows of all viewSection classes with a 'scrolly' property.
@@ -252,145 +402,82 @@ export class ViewLayout extends DisposableWithEvents implements IDomComponent {
   // Select another section in cyclic ordering of sections. Order is counter-clockwise if given a
   // positive `delta`, clockwise otherwise.
   private _otherSection(delta: number) {
+    const sectionIds = this.layout.getAllLeafIds();
     const sectionId = this.viewModel.activeSectionId.peek();
-    const currentIndex = this._sectionIds.indexOf(sectionId);
-    const index = mod(currentIndex + delta, this._sectionIds.length);
-
+    const currentIndex = sectionIds.indexOf(sectionId);
+    const index = mod(currentIndex + delta, sectionIds.length);
     // update the active section id
-    this.viewModel.activeSectionId(this._sectionIds[index]);
+    this.viewModel.activeSectionId(sectionIds[index]);
   }
 
   private _maybeFocusInSection()  {
     // If the focused element is inside a view section, make that section active.
-    const layoutBox = this._layout.getContainingBox(document.activeElement);
+    const layoutBox = this.layout.getContainingBox(document.activeElement);
     if (layoutBox && layoutBox.leafId) {
       this.gristDoc.viewModel.activeSectionId(layoutBox.leafId.peek());
     }
   }
+
+  /**
+   * Opens the sort and filter menu of the active view section.
+   *
+   * Optionally accepts a `sectionId` for opening a specific section's menu.
+   */
+  private _openSortFilterMenu(sectionId?: number)  {
+    const id = sectionId ?? this.viewModel.activeSectionId();
+    const leafBoxDom = this.layout.getLeafBox(id)?.dom;
+    if (!leafBoxDom) { return; }
+
+    const menu: HTMLElement | null = leafBoxDom.querySelector('.test-section-menu-sortAndFilter');
+    menu?.click();
+  }
 }
 
-export function buildViewSectionDom(options: {
-  gristDoc: GristDoc,
-  sectionRowId: number,
-  isResizing?: Observable<boolean>
-  viewModel?: ViewRec,
-  // Should show drag anchor.
-  draggable?: boolean, /* defaults to true */
-  // Should show green bar on the left (but preserves active-section class).
-  focusable?: boolean, /* defaults to true */
-  tableNameHidden?: boolean,
-  widgetNameHidden?: boolean,
-}) {
-  const isResizing = options.isResizing ?? Observable.create(null, false);
-  const {gristDoc, sectionRowId, viewModel, draggable = true, focusable = true} = options;
+const DELETE_WIDGET = 'deleteOnlyWidget';
+const DELETE_DATA = 'deleteDataAndWidget';
+const CANCEL = 'cancel';
+type PromptAction = typeof DELETE_WIDGET | typeof DELETE_DATA | typeof CANCEL;
 
-  // Creating normal section dom
-  const vs: ViewSectionRec = gristDoc.docModel.viewSections.getRowModel(sectionRowId);
-  return dom('div.view_leaf.viewsection_content.flexvbox.flexauto',
-    testId(`viewlayout-section-${sectionRowId}`),
-    !options.isResizing ? dom.autoDispose(isResizing) : null,
-    cssViewLeaf.cls(''),
-    cssViewLeafInactive.cls('', (use) => !vs.isDisposed() && !use(vs.hasFocus)),
-    dom.cls('active_section', vs.hasFocus),
-    dom.cls('active_section--no-indicator', !focusable),
-    dom.maybe<BaseView|null>((use) => use(vs.viewInstance), (viewInstance) => dom('div.viewsection_title.flexhbox',
-      dom('span.viewsection_drag_indicator.glyphicon.glyphicon-option-vertical',
-        // Makes element grabbable only if grist is not readonly.
-        dom.cls('layout_grabbable', (use) => !use(gristDoc.isReadonlyKo)),
-        !draggable ? dom.style("visibility", "hidden") : null
-      ),
-      dom.maybe((use) => use(use(viewInstance.viewSection.table).summarySourceTable), () =>
-        cssSigmaIcon('Pivot', testId('sigma'))),
-      buildWidgetTitle(vs, options, testId('viewsection-title'), cssTestClick(testId("viewsection-blank"))),
-      viewInstance.buildTitleControls(),
-      dom('span.viewsection_buttons',
-        dom.create(viewSectionMenu, gristDoc.docModel, vs, gristDoc.isReadonly)
-      )
-     )),
-    dom.maybe((use) => use(vs.activeFilterBar) || use(vs.isRaw) && use(vs.activeFilters).length,
-      () => dom.create(filterBar, vs)),
-    dom.maybe<BaseView|null>(vs.viewInstance, (viewInstance) =>
-      dom('div.view_data_pane_container.flexvbox',
-        cssResizing.cls('', isResizing),
-        dom.maybe(viewInstance.disableEditing, () =>
-          dom('div.disable_viewpane.flexvbox', 'No data')
+function widgetRemovalPrompt(tableName: string): Promise<PromptAction> {
+  return new Promise<PromptAction>((resolve) => {
+    saveModal((ctl, owner): ISaveModalOptions => {
+      const selected = Observable.create<PromptAction | ''>(owner, '');
+      const saveDisabled = Computed.create(owner, use => use(selected) === '');
+      const saveFunc = async () => selected.get() && resolve(selected.get() as PromptAction);
+      owner.onDispose(() => resolve(CANCEL));
+      return {
+        title: t('Table {{tableName}} will no longer be visible', { tableName }),
+        body: dom('div',
+          testId('removePopup'),
+          cssRadioCheckboxOptions(
+            radioCheckboxOption(selected, DELETE_DATA, t("Delete data and this widget.")),
+            radioCheckboxOption(selected, DELETE_WIDGET,
+              t(
+                `Keep data and delete widget. Table will remain available in {{rawDataLink}}`,
+                {
+                  rawDataLink: cssLink(
+                    t('raw data page'),
+                    urlState().setHref({docPage: 'data'}),
+                    {target: '_blank'},
+                  )
+                }
+              )
+            ),
+          ),
         ),
-        dom.maybe(viewInstance.isTruncated, () =>
-          dom('div.viewsection_truncated', 'Not all data is shown')
-        ),
-        dom.cls((use) => 'viewsection_type_' + use(vs.parentKey)),
-        viewInstance.viewPane
-      )
-    ),
-    dom.on('mousedown', () => { viewModel?.activeSectionId(sectionRowId); }),
-  );
+        saveDisabled,
+        saveLabel: t("Delete"),
+        saveFunc,
+        width: 'fixed-wide',
+      };
+    });
+  });
 }
-
-// With new widgetPopup it is hard to click on viewSection without a activating it, hence we
-// add a little blank space to use in test.
-const cssTestClick = styled(`div`, `
-  min-width: 2px;
-`);
-
-const cssSigmaIcon = styled(icon, `
-  bottom: 1px;
-  margin-right: 5px;
-  background-color: ${colors.slate}
-`);
-
-const cssViewLeaf = styled('div', `
-  @media ${mediaSmall} {
-    & {
-      margin: 4px;
-    }
-  }
-`);
-
-const cssViewLeafInactive = styled('div', `
-  @media screen and ${mediaSmall} {
-    & {
-      overflow: hidden;
-      background: repeating-linear-gradient(
-        -45deg,
-        ${colors.mediumGreyOpaque},
-        ${colors.mediumGreyOpaque} 10px,
-        ${colors.lightGrey} 10px,
-        ${colors.lightGrey} 20px
-      );
-      border: 1px solid ${colors.darkGrey};
-      border-radius: 4px;
-      padding: 0 2px;
-    }
-    &::after {
-      content: '';
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-    }
-    &.layout_vbox {
-      max-width: 32px;
-    }
-    &.layout_hbox {
-      max-height: 32px;
-    }
-    & > .viewsection_title.flexhbox {
-      position: absolute;
-    }
-    & > .view_data_pane_container,
-    & .viewsection_buttons,
-    & .grist-single-record__menu,
-    & > .filter_bar {
-      display: none;
-    }
-  }
-`);
 
 const cssLayoutBox = styled('div', `
   @media screen and ${mediaSmall} {
     &-active, &-inactive {
-      transition: flex-grow 0.4s;
+      transition: flex-grow var(--grist-layout-animation-duration, 0.4s); // Exposed for tests
     }
     &-active > &-inactive,
     &-active > &-inactive.layout_hbox .layout_hbox,
@@ -415,10 +502,78 @@ const cssLayoutBox = styled('div', `
   }
 `);
 
-// This class is added while sections are being resized (or otherwise edited), to ensure that the
-// content of the section (such as an iframe) doesn't interfere with mouse drag-related events.
-// (It assumes that contained elements do not set pointer-events to another value; if that were
-// important then we'd need to use an overlay element during dragging.)
-const cssResizing = styled('div', `
-  pointer-events: none;
+const cssLayoutWrapper = styled('div', `
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  flex-grow: 1;
+  @media not print {
+    &-active {
+      background: ${theme.mainPanelBg};
+      height: 100%;
+      width: 100%;
+      border-radius: 5px;
+      border-bottom-left-radius: 0px;
+      border-bottom-right-radius: 0px;
+      position: relative;
+    }
+    &-active .viewsection_content {
+      margin: 0px;
+      margin-top: 8px;
+    }
+    &-active .viewsection_title {
+      padding: 0px 12px;
+    }
+    &-active .filter_bar {
+      margin-left: 6px;
+    }
+  }
+`);
+
+const cssOverlay = styled('div', `
+  height: 100%;
+  @media screen {
+    &-active {
+      background-color: ${theme.modalBackdrop};
+      inset: 0px;
+      height: 100%;
+      width: 100%;
+      padding: 20px 56px 20px 56px;
+      position: absolute;
+    }
+    &-active .collapsed_layout {
+      display: none !important;
+    }
+  }
+  @media screen and ${mediaSmall} {
+    &-active {
+      padding: 22px;
+      padding-top: 30px;
+    }
+  }
+`);
+
+const cssCloseButton = styled(icon, `
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  height: 24px;
+  width: 24px;
+  cursor: pointer;
+  --icon-color: ${theme.modalBackdropCloseButtonFg};
+  &:hover {
+    --icon-color: ${theme.modalBackdropCloseButtonHoverFg};
+  }
+  @media ${mediaSmall} {
+    & {
+      top: 6px;
+      right: 6px;
+    }
+  }
+`);
+
+const cssVFull = styled('div', `
+  height: 100%;
+  display: flex;
+  flex-direction: column;
 `);

@@ -1,5 +1,6 @@
 import collections
 import itertools
+import logging
 import types
 
 import six
@@ -9,30 +10,13 @@ import column
 import depend
 import docmodel
 import functions
-import logger
 import lookup
-import records
+from records import adjust_record, Record as BaseRecord, RecordSet as BaseRecordSet
 import relation as relation_module    # "relation" is used too much as a variable name below.
 import usertypes
 
-log = logger.Logger(__name__, logger.INFO)
+log = logging.getLogger(__name__)
 
-
-def _make_sample_record(table_id, col_objs):
-  """
-  Helper to create a sample record for a table, used for auto-completions.
-  """
-  # This type gets created with a property for each column. We use property-methods rather than
-  # plain properties because this sample record is created before all tables have initialized, so
-  # reference values (using .sample_record for other tables) are not yet available.
-  RecType = type(table_id, (), {
-    # Note col=col to bind col at lambda-creation time; see
-    # https://stackoverflow.com/questions/10452770/python-lambdas-binding-to-local-values
-    col.col_id: property(lambda self, col=col: col.sample_value())
-    for col in col_objs
-    if column.is_user_column(col.col_id) or col.col_id == 'id'
-  })
-  return RecType()
 
 def get_default_func_name(col_id):
   return "_default_" + col_id
@@ -80,39 +64,77 @@ class UserTable(object):
     """
     Name: lookupRecords
     Usage: UserTable.__lookupRecords__(Field_In_Lookup_Table=value, ...)
-    Returns a [RecordSet](#recordset) matching the given field=value arguments. The value may be any expression,
+    Returns a [RecordSet](#recordset) matching the given field=value arguments. The value may be
+    any expression,
     most commonly a field in the current row (e.g. `$SomeField`) or a constant (e.g. a quoted string
     like `"Some Value"`) (examples below).
-    If `sort_by=field` is given, sort the results by that field.
 
     For example:
     ```
     People.lookupRecords(Email=$Work_Email)
     People.lookupRecords(First_Name="George", Last_Name="Washington")
-    People.lookupRecords(Last_Name="Johnson", sort_by="First_Name")
     ```
 
-    See [RecordSet](#recordset) for useful properties offered by the returned object.
+    You may set the optional `order_by` parameter to the column ID by which to sort the results.
+    You can prefix the column ID with "-" to reverse the order. You can also specify multiple
+    column IDs as a tuple (e.g. `order_by=("Account", "-Date")`).
+
+    For example:
+    ```
+    Transactions.lookupRecords(Account=$Account, order_by="Date")
+    Transactions.lookupRecords(Account=$Account, order_by="-Date")
+    Transactions.lookupRecords(Active=True, order_by=("Account", "-Date"))
+    ```
+
+    For records with equal `order_by` fields, the results are sorted according to how they appear
+    in views (which is determined by the special `manualSort` column). You may set `order_by=None`
+    to match the order of records in unsorted views.
+
+    By default, with no `order_by`, records are sorted by row ID, as if with `order_by="id"`.
+
+    For backward compatibility, `sort_by` may be used instead of `order_by`, but only allows a
+    single field, and falls back to row ID (rather than `manualSort`).
+
+    See [RecordSet](#recordset) for useful properties offered by the returned object. In
+    particular, methods like [`.find.le`](#find_) allow searching for nearest values.
 
     See [CONTAINS](#contains) for an example utilizing `UserTable.lookupRecords` to find records
     where a field of a list type (such as `Choice List` or `Reference List`) contains the given
     value.
+
+    Learn more about [lookupRecords](references-lookups.md#lookuprecords).
     """
     return self.table.lookup_records(**field_value_pairs)
 
   def lookupOne(self, **field_value_pairs):
+    # pylint: disable=line-too-long
     """
     Name: lookupOne
     Usage: UserTable.__lookupOne__(Field_In_Lookup_Table=value, ...)
-    Returns a [Record](#record) matching the given field=value arguments. The value may be any expression,
+    Returns a [Record](#record) matching the given field=value arguments. The value may be any
+    expression,
     most commonly a field in the current row (e.g. `$SomeField`) or a constant (e.g. a quoted string
-    like `"Some Value"`). If multiple records match, returns one of them. If none match, returns the
-    special empty record.
+    like `"Some Value"`).
 
     For example:
     ```
     People.lookupOne(First_Name="Lewis", Last_Name="Carroll")
     People.lookupOne(Email=$Work_Email)
+    ```
+
+    Learn more about [lookupOne](references-lookups.md#lookupone).
+
+    If multiple records are found, the first match is returned. You may set the optional `order_by`
+    parameter to the column ID by which to sort the matches, to determine which of them is
+    returned as the first one. By default, the record with the lowest row ID is returned.
+
+    See [`lookupRecords`](#lookuprecords) for details of all available options and behavior of
+    `order_by` (and of its legacy alternative, `sort_by`).
+
+    For example:
+    ```
+    Tasks.lookupOne(Project=$id, order_by="Priority")  # Task with the smallest Priority.
+    Rates.lookupOne(Person=$id, order_by="-Date")      # Rate with the latest Date.
     ```
     """
     return self.table.lookup_one_record(**field_value_pairs)
@@ -149,6 +171,20 @@ class UserTable(object):
     # the constructor.
     return []
 
+  def __getattr__(self, item):
+    if self.table.has_column(item):
+      raise AttributeError(
+        "To retrieve all values in a column, use `{table_id}.all.{item}`. "
+        "Tables have no attribute '{item}'".format(table_id=self.table.table_id, item=item)
+      )
+    super(UserTable, self).__getattribute__(item)
+
+  def __iter__(self):
+    raise TypeError(
+      "To iterate (loop) over all records in a table, use `{table_id}.all`. "
+      "Tables are not directly iterable.".format(table_id=self.table.table_id)
+    )
+
 
 class Table(object):
   """
@@ -163,7 +199,7 @@ class Table(object):
       self._id_column = id_column
 
     def __contains__(self, row_id):
-      return row_id < self._id_column.size() and self._id_column.raw_get(row_id) > 0
+      return 0 < row_id < self._id_column.size() and self._id_column.raw_get(row_id) > 0
 
     def __iter__(self):
       for row_id in xrange(self._id_column.size()):
@@ -192,6 +228,10 @@ class Table(object):
 
     # Set of ReferenceColumn objects that refer to this table
     self._back_references = set()
+
+    # Maps the depend.Node of the source column (possibly in a different table) to column(s) in
+    # this table that have that source column as reverseColRef: {Node: [Column, ...]}.
+    self._reverse_cols_by_source_node = {}
 
     # Store the constant Node for "new columns". Accessing invalid columns creates a dependency
     # on this node, and triggers recomputation when columns are added or renamed.
@@ -224,22 +264,23 @@ class Table(object):
     # which are 'flattened' so source records may appear in multiple groups
     self._summary_simple = None
 
+    # Add Record and RecordSet subclasses with correct `_table` attribute, which will also hold a
+    # field attribute for each column.
+    class Record(BaseRecord):
+      __slots__ = ()
+      _table = self
+
+    class RecordSet(BaseRecordSet):
+      __slots__ = ()
+      _table = self
+
+    self.Record = Record
+    self.RecordSet = RecordSet
+
     # For use in _num_rows. The attribute isn't strictly needed,
     # but it makes _num_rows slightly faster, and only creating the lookup map when _num_rows
     # is called seems to be too late, at least for unit tests.
     self._empty_lookup_column = self._get_lookup_map(())
-
-    # Add Record and RecordSet subclasses which fill in this table as the first argument
-    class Record(records.Record):
-      def __init__(inner_self, *args, **kwargs):  # pylint: disable=no-self-argument
-        super(Record, inner_self).__init__(self, *args, **kwargs)
-
-    class RecordSet(records.RecordSet):
-      def __init__(inner_self, *args, **kwargs):  # pylint: disable=no-self-argument
-        super(RecordSet, inner_self).__init__(self, *args, **kwargs)
-
-    self.Record = Record
-    self.RecordSet = RecordSet
 
   def _num_rows(self):
     """
@@ -252,10 +293,33 @@ class Table(object):
     """
     Used for auto-completion as a record with correct properties of correct types.
     """
-    return _make_sample_record(
-      self.table_id,
-      [col for col_id, col in self.all_columns.items() if col_id not in self._special_cols],
-    )
+    # Create a type with a property for each column. We use property-methods rather than
+    # plain attributes because this sample record is created before all tables have initialized, so
+    # reference values (using .sample_record for other tables) are not yet available.
+    props = {}
+    for col in self.all_columns.values():
+      if not (column.is_visible_column(col.col_id) or col.col_id == 'id'):
+        continue
+      # Note c=col to bind at lambda-creation time; see
+      # https://stackoverflow.com/questions/10452770/python-lambdas-binding-to-local-values
+      props[col.col_id] = property(lambda _self, c=col: c.sample_value())
+      if col.col_id == 'id':
+        # The column lookup below doesn't work for the id column
+        continue
+      # For columns with a visible column (i.e. most Reference/ReferenceList columns),
+      # we also want to show how to get that visible column instead of the 'raw' record
+      # returned by the reference column itself.
+      col_rec = self._engine.docmodel.get_column_rec(self.table_id, col.col_id)
+      visible_col_id = col_rec.visibleCol.colId
+      if visible_col_id:
+        # This creates a fake attribute like `RefCol.VisibleCol` which isn't valid syntax normally,
+        # to show the `.VisibleCol` part before the user has typed the `.`
+        props[col.col_id + "." + visible_col_id] = property(
+          lambda _self, c=col, v=visible_col_id: getattr(c.sample_value(), v)
+        )
+
+    RecType = type(self.table_id, (), props)
+    return RecType()
 
   def _rebuild_model(self, user_table):
     """
@@ -279,6 +343,8 @@ class Table(object):
     # Note that we reuse previous special columns like lookup maps, since those not affected by
     # column changes should stay the same. These get removed when unneeded using other means.
     new_cols.update(sorted(six.iteritems(self._special_cols)))
+
+    self._update_record_classes(self.all_columns, new_cols)
 
     # Set the new columns.
     self.all_columns = new_cols
@@ -390,8 +456,7 @@ class Table(object):
       if type(self.get_column(col_id).type_obj) != type(_updateSummary.grist_type):
         self.delete_column(self.get_column(col_id))
     col_obj = self._create_or_update_col(col_id, _updateSummary)
-    self._special_cols[col_id] = col_obj
-    self.all_columns[col_id] = col_obj
+    self._add_special_col(col_obj)
 
   def get_helper_columns(self):
     """
@@ -462,6 +527,7 @@ class Table(object):
     """
     # The tuple of keys used determines the LookupMap we need.
     sort_by = kwargs.pop('sort_by', None)
+    order_by = kwargs.pop('order_by', 'id')   # For backward compatibility
     key = []
     col_ids = []
     for col_id in sorted(kwargs):
@@ -482,13 +548,15 @@ class Table(object):
     key = tuple(key)
 
     lookup_map = self._get_lookup_map(col_ids)
-    row_id_set, rel = lookup_map.do_lookup(key)
-    if sort_by:
-      row_ids = sorted(row_id_set,
-                       key=lambda r: column.SafeSortKey(self._get_col_value(sort_by, r, rel)))
+    sort_spec = make_sort_spec(order_by, sort_by, self.has_column('manualSort'))
+    if sort_spec:
+      sorted_lookup_map = self._get_sorted_lookup_map(lookup_map, sort_spec)
     else:
-      row_ids = sorted(row_id_set)
-    return self.RecordSet(row_ids, rel, group_by=kwargs, sort_by=sort_by)
+      sorted_lookup_map = lookup_map
+
+    row_ids, rel = sorted_lookup_map.do_lookup(key)
+    return self.RecordSet(row_ids, rel, group_by=kwargs, sort_by=sort_by,
+        sort_key=sorted_lookup_map.sort_key)
 
   def lookup_one_record(self, **kwargs):
     return self.lookup_records(**kwargs).get_one()
@@ -509,19 +577,30 @@ class Table(object):
         c = lookup.extract_column_id(c)
         if not self.has_column(c):
           raise KeyError("Table %s has no column %s" % (self.table_id, c))
-      if any(isinstance(col_id, lookup._Contains) for col_id in col_ids_tuple):
-        column_class = lookup.ContainsLookupMapColumn
-      else:
-        column_class = lookup.SimpleLookupMapColumn
-      lmap = column_class(self, lookup_col_id, col_ids_tuple)
-      self._special_cols[lookup_col_id] = lmap
-      self.all_columns[lookup_col_id] = lmap
+      lmap = lookup.LookupMapColumn(self, lookup_col_id, col_ids_tuple)
+      self._add_special_col(lmap)
     return lmap
+
+  def _get_sorted_lookup_map(self, lookup_map, sort_spec):
+    helper_col_id = lookup_map.col_id + "#" + ":".join(sort_spec)
+    # Find or create a helper col for the given sort_spec.
+    helper_col = self._special_cols.get(helper_col_id)
+    if not helper_col:
+      helper_col = lookup.SortedLookupMapColumn(self, helper_col_id, lookup_map, sort_spec)
+      self._add_special_col(helper_col)
+    return helper_col
 
   def delete_column(self, col_obj):
     assert col_obj.table_id == self.table_id
     self._special_cols.pop(col_obj.col_id, None)
     self.all_columns.pop(col_obj.col_id, None)
+    self._remove_field_from_record_classes(col_obj.col_id)
+
+  def _add_special_col(self, col_obj):
+    assert col_obj.table_id == self.table_id
+    self._special_cols[col_obj.col_id] = col_obj
+    self.all_columns[col_obj.col_id] = col_obj
+    self._add_field_to_record_classes(col_obj)
 
   def lookupOrAddDerived(self, **kwargs):
     record = self.lookup_one_record(**kwargs)
@@ -542,10 +621,6 @@ class Table(object):
 
       # Remove rows with empty groups
       self._engine.docmodel.setAutoRemove(rec, not result)
-      if not result:
-        # The group is empty, tell the engine that this record will be deleted
-        raise EmptySummaryRow()
-
       return result
     else:
       return None
@@ -605,46 +680,106 @@ class Table(object):
 
   # TODO: document everything here.
 
-  # Called when record.foo is accessed
-  def _get_col_value(self, col_id, row_id, relation):
-    [value] = self._get_col_subset_raw(col_id, [row_id], relation)
-    return records.adjust_record(relation, value)
+  # Equivalent to accessing record.foo, but only used in very limited cases now (field accessor is
+  # more optimized).
+  def _get_col_obj_value(self, col_obj, row_id, relation):
+    # creates a dependency and brings formula columns up-to-date.
+    self._engine._use_node(col_obj.node, relation, (row_id,))
+    value = col_obj.get_cell_value(row_id)
+    return adjust_record(relation, value)
 
   def _attribute_error(self, col_id, relation):
     self._engine._use_node(self._new_columns_node, relation)
     raise AttributeError("Table '%s' has no column '%s'" % (self.table_id, col_id))
 
   # Called when record_set.foo is accessed
-  def _get_col_subset(self, col_id, row_ids, relation):
-    values = self._get_col_subset_raw(col_id, row_ids, relation)
+  def _get_col_obj_subset(self, col_obj, row_ids, relation):
+    self._engine._use_node(col_obj.node, relation, row_ids)
+    values = [col_obj.get_cell_value(row_id) for row_id in row_ids]
 
     # When all the values are the same type of Record (i.e. all references to the same table)
     # combine them into a single RecordSet for that table instead of a list
     # so that more attribute accesses can be chained,
     # e.g. record_set.foo.bar where `foo` is a Reference column.
     value_types = list(set(map(type, values)))
-    if len(value_types) == 1 and issubclass(value_types[0], records.Record):
-      return records.RecordSet(
-        values[0]._table,
+    if len(value_types) == 1 and issubclass(value_types[0], BaseRecord):
+      return values[0]._table.RecordSet(
         # This is different from row_ids: these are the row IDs referenced by these Records,
         # whereas row_ids are where the values were being stored.
         [val._row_id for val in values],
         relation.compose(values[0]._source_relation),
       )
     else:
-      return [records.adjust_record(relation, value) for value in values]
+      return [adjust_record(relation, value) for value in values]
 
-  # Internal helper to optimise _get_col_value
-  # so that it doesn't make a singleton RecordSet just to immediately unpack it
-  def _get_col_subset_raw(self, col_id, row_ids, relation):
-    col = self.all_columns[col_id]
-    # creates a dependency and brings formula columns up-to-date.
-    self._engine._use_node(col.node, relation, row_ids)
-    return [col.get_cell_value(row_id) for row_id in row_ids]
+  #----------------------------------------
+
+  def _update_record_classes(self, old_columns, new_columns):
+    for col_id in old_columns:
+      if col_id not in new_columns:
+        self._remove_field_from_record_classes(col_id)
+
+    for col_id, col_obj in six.iteritems(new_columns):
+      if col_obj != old_columns.get(col_id):
+        self._add_field_to_record_classes(col_obj)
+
+  def _add_field_to_record_classes(self, col_obj):
+    node = col_obj.node
+    use_node = self._engine._use_node
+
+    @property
+    def record_field(rec):
+      # This is equivalent to _get_col_obj_value(), but is extra-optimized with _get_col_obj_value()
+      # and adjust_record() inlined, since this is particularly hot code, called on every access of
+      # any data field in a formula.
+      use_node(node, rec._source_relation, (rec._row_id,))
+      value = col_obj.get_cell_value(rec._row_id)
+      if isinstance(value, (BaseRecord, BaseRecordSet)):
+        return value._clone_with_relation(rec._source_relation)
+      return value
+
+    @property
+    def recordset_field(recset):
+      return self._get_col_obj_subset(col_obj, recset._row_ids, recset._source_relation)
+
+    setattr(self.Record, col_obj.col_id, record_field)
+    setattr(self.RecordSet, col_obj.col_id, recordset_field)
+
+  def _remove_field_from_record_classes(self, col_id):
+    # Check if col_id is in the immediate dictionary of self.Record[Set]; if missing, or inherited
+    # from the base class (e.g. "find"), there is nothing to delete.
+    if col_id in self.Record.__dict__:
+      delattr(self.Record, col_id)
+    if col_id in self.RecordSet.__dict__:
+      delattr(self.RecordSet, col_id)
 
 
-class EmptySummaryRow(Exception):
-  """
-  Special exception indicating that the summary group is empty and the row should be removed.
-  """
-  pass
+def make_sort_spec(order_by, sort_by, has_manual_sort):
+  # Note that rowId is always an automatic fallback.
+  if sort_by:
+    if not isinstance(sort_by, six.string_types):
+      # pylint: disable=line-too-long
+      raise TypeError("sort_by must be a string column ID, with optional '-'; use order_by for tuples")
+    # No fallback to 'manualSort' here, for backward compatibility.
+    return (sort_by,)
+
+  if not isinstance(order_by, tuple):
+    # Suppot None and single-string specs (for a single column)
+    if isinstance(order_by, six.string_types):
+      order_by = (order_by,)
+    elif order_by is None:
+      order_by = ()
+    else:
+      raise TypeError("order_by must be a string column ID, with optional '-', or a tuple of them")
+
+  # Check if 'id' is mentioned explicitly. If so, then no fallback to 'manualSort', or anything
+  # else, since row IDs are unique. Also, drop the 'id' column itself because the row ID fallback
+  # is mandatory and automatic.
+  if 'id' in order_by:
+    return order_by[:order_by.index('id')]
+
+  # Fall back to manualSort, but only if it exists in the table and not yet mentioned in order_by.
+  if has_manual_sort and 'manualSort' not in order_by:
+    return order_by + ('manualSort',)
+
+  return order_by

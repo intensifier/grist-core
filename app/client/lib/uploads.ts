@@ -14,7 +14,6 @@ import {GristLoadConfig} from 'app/common/gristUrls';
 import {byteString, safeJsonParse} from 'app/common/gutil';
 import {FetchUrlOptions, UPLOAD_URL_PATH, UploadResult} from 'app/common/uploads';
 import {docUrl} from 'app/common/urlUtils';
-import {OpenDialogOptions} from 'electron';
 import noop = require('lodash/noop');
 import trimStart = require('lodash/trimStart');
 import {basename} from 'path';      // made available by webpack using path-browserify module.
@@ -32,7 +31,7 @@ export interface SelectFileOptions extends UploadOptions {
                           // e.g. [".jpg", ".png"]
 }
 
-export const IMPORTABLE_EXTENSIONS = [".grist", ".csv", ".tsv", ".txt", ".xlsx", ".xlsm"];
+export const IMPORTABLE_EXTENSIONS = [".grist", ".csv", ".tsv", ".dsv", ".txt", ".xlsx", ".xlsm"];
 
 /**
  * Shows the file-picker dialog with the given options, and uploads the selected files. If under
@@ -49,12 +48,17 @@ export async function selectFiles(options: SelectFileOptions,
   if (typeof electronSelectFiles === 'function') {
     result = await electronSelectFiles(getElectronOptions(options));
   } else {
-    const files: File[] = await openFilePicker(getFileDialogOptions(options));
-    result = await uploadFiles(files, options, onProgress);
+    result = await uploadFiles(await selectPicker(options), options, onProgress);
   }
   onProgress(100);
   return result;
 }
+
+export async function selectPicker(options: SelectFileOptions) {
+  const files: File[] = await openFilePicker(getFileDialogOptions(options));
+  return files;
+}
+
 
 // Helper to convert SelectFileOptions to the browser's FileDialogOptions.
 function getFileDialogOptions(options: SelectFileOptions): FileDialogOptions {
@@ -69,18 +73,18 @@ function getFileDialogOptions(options: SelectFileOptions): FileDialogOptions {
 }
 
 // Helper to convert SelectFileOptions to electron's OpenDialogOptions.
-function getElectronOptions(options: SelectFileOptions): OpenDialogOptions {
-  const resOptions: OpenDialogOptions = {
-    filters: [],
+function getElectronOptions(options: SelectFileOptions) /*: OpenDialogOptions */ {
+  const resOptions /*: OpenDialogOptions*/ = {
+    filters: [] as Array<{name: string, extensions: any}>,
     properties: ['openFile'],
   };
   if (options.extensions) {
     // Electron does not expect leading period.
     const extensions = options.extensions.map(e => trimStart(e, '.'));
-    resOptions.filters!.push({name: 'Select files', extensions});
+    resOptions.filters.push({name: 'Select files', extensions});
   }
   if (options.multiple) {
-    resOptions.properties!.push('multiSelections');
+    resOptions.properties.push('multiSelections');
   }
   return resOptions;
 }
